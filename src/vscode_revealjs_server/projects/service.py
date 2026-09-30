@@ -17,6 +17,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from vscode_revealjs_server.presentation.render import default_index_html
+
 # Sibling of collaboration blobs under .data/
 _PROJECTS_DIR = Path(
     os.environ.get(
@@ -71,19 +73,7 @@ def _default_template(title: str) -> dict[str, str]:
         "  controls: true\n"
         "  progress: true\n"
     )
-    index = (
-        "<!DOCTYPE html>\n"
-        "<html lang=\"en\">\n"
-        "<head>\n"
-        f"  <meta charset=\"utf-8\" />\n"
-        f"  <title>{title}</title>\n"
-        "  <!-- Preview/Publish fill reveal.js runtime later (M2). -->\n"
-        "</head>\n"
-        "<body>\n"
-        "  <div class=\"reveal\"><div class=\"slides\"><!-- chapters --></div></div>\n"
-        "</body>\n"
-        "</html>\n"
-    )
+    index = default_index_html(title)
     slide = f"# {title}\n\nFirst slide.\n"
     return {
         "deck.yaml": deck,

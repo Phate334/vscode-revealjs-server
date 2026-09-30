@@ -5,7 +5,10 @@ from pydantic import BaseModel, Field
 
 from vscode_revealjs_server.collaboration.manager import manager
 from vscode_revealjs_server.presentation import preview as preview_service
-from vscode_revealjs_server.presentation.runtime import resolve_runtime_file
+from vscode_revealjs_server.presentation.runtime import (
+    is_supported_runtime,
+    resolve_runtime_file,
+)
 from vscode_revealjs_server.projects import project_service
 from vscode_revealjs_server.projects.service import FsRejected
 
@@ -104,7 +107,9 @@ async def collaboration_ws(websocket: WebSocket, project_id: str) -> None:
 
 @app.get("/runtimes/{runtime_name}/{runtime_path:path}")
 def get_runtime(runtime_name: str, runtime_path: str) -> Response:
-    """Shared reveal runtime files (Preview + future Publish)."""
+    """Shared reveal runtime files (Preview + future Publish). Registry only."""
+    if not is_supported_runtime(runtime_name):
+        raise HTTPException(status_code=404, detail="unknown runtime")
     path = resolve_runtime_file(runtime_path, name=runtime_name)
     if path is None:
         raise HTTPException(status_code=404, detail="runtime file not found")
