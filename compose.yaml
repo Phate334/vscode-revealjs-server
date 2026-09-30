@@ -4,10 +4,11 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      # Optional persistence for CRDT blobs across container restarts
+      # Optional persistence for CRDT blobs + project workspaces across restarts
       - ./.data:/app/.data
     environment:
       COLLAB_DATA_DIR: /app/.data/collaboration
+      PROJECTS_DATA_DIR: /app/.data/projects
     healthcheck:
       test:
         [

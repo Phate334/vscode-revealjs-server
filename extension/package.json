@@ -1,7 +1,7 @@
 {
   "name": "vscode-revealjs-collaboration",
   "displayName": "RevealJS Collaboration (PoC)",
-  "description": "M0 PoC: bind slide.md to FastAPI + Yjs collaboration WebSocket",
+  "description": "Collaborative Reveal.js presentations: CRDT slide sync + project snapshot",
   "version": "0.0.1",
   "publisher": "phate334",
   "engines": {
@@ -12,7 +12,9 @@
   ],
   "activationEvents": [
     "onCommand:revealjsCollab.connect",
-    "workspaceContains:.presentation/workspace.json"
+    "workspaceContains:.presentation/workspace.json",
+    "onCommand:presentation.createProject",
+    "onCommand:presentation.openProject"
   ],
   "main": "./out/extension.js",
   "contributes": {
@@ -32,6 +34,14 @@
       {
         "command": "presentation.redo",
         "title": "Presentation: Redo"
+      },
+      {
+        "command": "presentation.createProject",
+        "title": "Presentation: Create Project"
+      },
+      {
+        "command": "presentation.openProject",
+        "title": "Presentation: Open Project"
       }
     ],
     "keybindings": [

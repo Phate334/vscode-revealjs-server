@@ -168,8 +168,12 @@ export async function bindSlideDocument(client: CollaborationClient): Promise<Sl
 
   let watchTimer: ReturnType<typeof setTimeout> | undefined;
   const folder = vscode.workspace.getWorkspaceFolder(uri);
+  // Watch the bound file path (root or chapter/slide.md), not only workspace-root slide.md.
+  const rel = folder
+    ? uri.fsPath.slice(folder.uri.fsPath.length).replace(/^[/\\]/, "")
+    : SLIDE_NAME;
   const pattern = folder
-    ? new vscode.RelativePattern(folder, SLIDE_NAME)
+    ? new vscode.RelativePattern(folder, rel)
     : new vscode.RelativePattern(vscode.Uri.joinPath(uri, ".."), SLIDE_NAME);
   const watcher = vscode.workspace.createFileSystemWatcher(pattern);
 
