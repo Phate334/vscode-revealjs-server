@@ -1,0 +1,22 @@
+services:
+  server:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      # Optional persistence for CRDT blobs across container restarts
+      - ./.data:/app/.data
+    environment:
+      COLLAB_DATA_DIR: /app/.data/collaboration
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s

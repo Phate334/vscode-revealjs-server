@@ -1,23 +1,25 @@
 # vscode-revealjs-server
 
-FastAPI app managed with [uv](https://github.com/astral-sh/uv).
+FastAPI collaboration server (uv) + VS Code extension PoC.
 
-## Setup
-
-```bash
-uv sync
-```
-
-## Run
+## Server (Docker Compose)
 
 ```bash
-uv run vscode-revealjs-server
+docker compose up -d --build
+./scripts/compose-smoke.sh   # GET http://127.0.0.1:8000/health → {"status":"ok"}
 ```
 
-Or:
+Published port: `8000`. WS: `ws://127.0.0.1:8000/api/projects/{project_id}/collaboration`
+
+## Unit tests (in-process)
 
 ```bash
-uv run uvicorn vscode_revealjs_server.app:app --reload
+uv sync --group dev
+uv run pytest
 ```
 
-Health check: `GET http://127.0.0.1:8000/health`
+Live-server checks must use the compose published port, not host uvicorn.
+
+## Extension
+
+See `extension/README.md` (default WS assumes compose is up).

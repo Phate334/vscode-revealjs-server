@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from fastapi import WebSocket
@@ -12,7 +13,8 @@ from vscode_revealjs_server.collaboration import protocol as proto
 
 # ponytail: in-memory rooms (+ optional .data blob). Ceiling: lost on process wipe / no multi-instance.
 # Upgrade: shared store (postgres update log or snapshot; open decision #6).
-_DATA_DIR = Path(__file__).resolve().parents[3] / ".data" / "collaboration"
+# COLLAB_DATA_DIR for containers; else cwd/.data (repo root when started via compose/uv).
+_DATA_DIR = Path(os.environ.get("COLLAB_DATA_DIR", str(Path.cwd() / ".data" / "collaboration")))
 
 
 class CollaborationRoom:
