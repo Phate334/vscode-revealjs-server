@@ -1,7 +1,7 @@
-"""Filesystem-backed project create/list/get + workspace snapshot + fs ops + assets.
+"""Filesystem-backed project create/list/get + workspace snapshot + fs ops + assets + members.
 
-ponytail: local dir store (no Postgres). Ceiling: single-node, no members/auth.
-Upgrade: §18.1 project tables + membership (M3).
+ponytail: local dir store (no Postgres). Ceiling: single-node members in meta.json.
+Upgrade: §18.1 project tables + membership DB (post-MVP).
 """
 
 from __future__ import annotations
@@ -45,6 +45,13 @@ _BINARY_EXT = frozenset({
     ".woff",
     ".woff2",
 })
+
+# MVP roles (§18.1 project_members.role)
+ROLE_OWNER = "owner"
+ROLE_EDITOR = "editor"
+ROLE_VIEWER = "viewer"
+ROLES = frozenset({ROLE_OWNER, ROLE_EDITOR, ROLE_VIEWER})
+WRITE_ROLES = frozenset({ROLE_OWNER, ROLE_EDITOR})
 
 
 def is_binary_rel(rel: str) -> bool:
@@ -139,7 +146,8 @@ class ProjectService:
             return None
         return int(meta.get("revision", 0))
 
-    def list_projects(self) -> list[dict[str, Any]]:
+    def list_projects(self, *, user_id: str | None = None) -> list[dict[str, Any]]:
+        """List projects; when user_id set, only membership (or legacy open) projects."""
         if not self.root.is_dir():
             return []
         out: list[dict[str, Any]] = []
@@ -147,18 +155,23 @@ class ProjectService:
             if not child.is_dir():
                 continue
             meta = self._read_meta(child.name)
-            if meta:
-                out.append(self._public(meta))
+            if not meta:
+                continue
+            if user_id is not None and self._role_in_meta(meta, user_id) is None:
+                continue
+            out.append(self._public(meta))
         return out
 
     def get(self, project_id: str) -> dict[str, Any] | None:
         meta = self._read_meta(project_id)
         return self._public(meta) if meta else None
 
-    def create(self, *, name: str) -> dict[str, Any]:
+    def create(self, *, name: str, owner_id: str, owner_username: str) -> dict[str, Any]:
         name = name.strip()
         if not name or not _SAFE_NAME.match(name):
             raise ValueError("invalid project name")
+        if not owner_id or not owner_username:
+            raise ValueError("owner required")
         project_id = f"prj_{uuid.uuid4().hex[:12]}"
         ws = self._workspace(project_id)
         ws.mkdir(parents=True, exist_ok=True)
@@ -173,6 +186,14 @@ class ProjectService:
             "name": name,
             "created_at": _now(),
             "revision": 0,
+            "owner_id": owner_id,
+            "members": [
+                {
+                    "user_id": owner_id,
+                    "username": owner_username,
+                    "role": ROLE_OWNER,
+                }
+            ],
         }
         self._write_meta(meta)
         return self._public(meta)
@@ -489,13 +510,119 @@ class ProjectService:
         }
 
     @staticmethod
+    def _role_in_meta(meta: dict[str, Any], user_id: str) -> str | None:
+        """Role for user, or None if not a member.
+
+        ponytail: pre-M3 meta without members → any authenticated caller is editor.
+        """
+        members = meta.get("members")
+        if members is None:
+            return ROLE_EDITOR
+        if not isinstance(members, list):
+            return None
+        for row in members:
+            if isinstance(row, dict) and row.get("user_id") == user_id:
+                role = row.get("role")
+                return role if isinstance(role, str) else None
+        return None
+
+    def member_role(self, project_id: str, user_id: str) -> str | None:
+        meta = self._read_meta(project_id)
+        if meta is None:
+            return None
+        return self._role_in_meta(meta, user_id)
+
+    def can_read(self, project_id: str, user_id: str) -> bool:
+        return self.member_role(project_id, user_id) is not None
+
+    def can_write(self, project_id: str, user_id: str) -> bool:
+        role = self.member_role(project_id, user_id)
+        return role in WRITE_ROLES if role else False
+
+    def can_manage_members(self, project_id: str, user_id: str) -> bool:
+        return self.member_role(project_id, user_id) == ROLE_OWNER
+
+    def list_members(self, project_id: str) -> list[dict[str, str]] | None:
+        meta = self._read_meta(project_id)
+        if meta is None:
+            return None
+        members = meta.get("members")
+        if members is None:
+            # Legacy: synthesize owner-less empty list (callers still need membership via legacy role)
+            return []
+        out: list[dict[str, str]] = []
+        for row in members:
+            if not isinstance(row, dict):
+                continue
+            uid, uname, role = row.get("user_id"), row.get("username"), row.get("role")
+            if isinstance(uid, str) and isinstance(uname, str) and isinstance(role, str):
+                out.append({"user_id": uid, "username": uname, "role": role})
+        return out
+
+    def add_member(
+        self,
+        project_id: str,
+        *,
+        user_id: str,
+        username: str,
+        role: str,
+    ) -> list[dict[str, str]]:
+        if role not in ROLES:
+            raise ValueError(f"invalid role: {role}")
+        if role == ROLE_OWNER:
+            raise ValueError("cannot add another owner; transfer not supported")
+        with self._mut:
+            meta = self._read_meta(project_id)
+            if meta is None:
+                raise FsRejected("project not found")
+            members = meta.get("members")
+            if members is None:
+                members = []
+                meta["members"] = members
+            if not isinstance(members, list):
+                raise ValueError("corrupt members")
+            for row in members:
+                if isinstance(row, dict) and row.get("user_id") == user_id:
+                    raise ValueError("already a member")
+            members.append({"user_id": user_id, "username": username, "role": role})
+            self._write_meta(meta)
+            return self.list_members(project_id) or []
+
+    def remove_member(self, project_id: str, user_id: str) -> list[dict[str, str]]:
+        with self._mut:
+            meta = self._read_meta(project_id)
+            if meta is None:
+                raise FsRejected("project not found")
+            members = meta.get("members")
+            if not isinstance(members, list):
+                raise ValueError("no members to remove")
+            target = None
+            for row in members:
+                if isinstance(row, dict) and row.get("user_id") == user_id:
+                    target = row
+                    break
+            if target is None:
+                raise ValueError("member not found")
+            if target.get("role") == ROLE_OWNER:
+                owners = [r for r in members if isinstance(r, dict) and r.get("role") == ROLE_OWNER]
+                if len(owners) <= 1:
+                    raise ValueError("cannot remove the last owner")
+            meta["members"] = [r for r in members if not (isinstance(r, dict) and r.get("user_id") == user_id)]
+            self._write_meta(meta)
+            return self.list_members(project_id) or []
+
+    @staticmethod
     def _public(meta: dict[str, Any]) -> dict[str, Any]:
-        return {
+        out = {
             "id": meta["id"],
             "name": meta["name"],
             "created_at": meta["created_at"],
             "revision": meta.get("revision", 0),
         }
+        owner_id = meta.get("owner_id")
+        if isinstance(owner_id, str):
+            out["owner_id"] = owner_id
+        return out
 
 
 project_service = ProjectService()

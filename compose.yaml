@@ -9,6 +9,9 @@ services:
     environment:
       COLLAB_DATA_DIR: /app/.data/collaboration
       PROJECTS_DATA_DIR: /app/.data/projects
+      # Optional auth (defaults: demo/demo + alice/alice; see README)
+      # AUTH_JWT_SECRET: change-me
+      # AUTH_DEMO_USER: bob:bobpass
     healthcheck:
       test:
         [

@@ -1,17 +1,19 @@
 import mimetypes
+from typing import Annotated
 
-from fastapi import FastAPI, HTTPException, Query, Request, Response, WebSocket
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, WebSocket
 from pydantic import BaseModel, Field
 
+from vscode_revealjs_server.auth import service as auth_service
+from vscode_revealjs_server.auth.deps import require_user, user_from_websocket
 from vscode_revealjs_server.collaboration.manager import manager
 from vscode_revealjs_server.presentation import preview as preview_service
 from vscode_revealjs_server.presentation.runtime import (
     is_supported_runtime,
     resolve_runtime_file,
 )
-from vscode_revealjs_server.auth import service as auth_service
 from vscode_revealjs_server.projects import project_service
-from vscode_revealjs_server.projects.service import FsRejected
+from vscode_revealjs_server.projects.service import ROLE_EDITOR, ROLE_VIEWER, FsRejected
 
 app = FastAPI(title="vscode-revealjs-server")
 
@@ -29,6 +31,27 @@ class RefreshBody(BaseModel):
     refresh_token: str = Field(min_length=1)
 
 
+class AddMemberBody(BaseModel):
+    """Add by username (demo store) or user_id; role editor|viewer."""
+
+    username: str | None = Field(default=None, min_length=1, max_length=120)
+    user_id: str | None = Field(default=None, min_length=1, max_length=120)
+    role: str = Field(default=ROLE_EDITOR, min_length=1, max_length=32)
+
+
+def _forbid_unless_member(project_id: str, user_id: str) -> None:
+    if project_service.get(project_id) is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    if not project_service.can_read(project_id, user_id):
+        raise HTTPException(status_code=403, detail="not a project member")
+
+
+def _forbid_unless_writer(project_id: str, user_id: str) -> None:
+    _forbid_unless_member(project_id, user_id)
+    if not project_service.can_write(project_id, user_id):
+        raise HTTPException(status_code=403, detail="write permission required")
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -36,7 +59,7 @@ def health() -> dict[str, str]:
 
 @app.post("/api/auth/login")
 def auth_login(body: LoginBody) -> dict:
-    """M3 auth stub: demo users (default demo/demo). Enforcement on routes = next slice."""
+    """Demo users: demo/demo, alice/alice (+ AUTH_DEMO_USER)."""
     got = auth_service.login(body.username, body.password)
     if got is None:
         raise HTTPException(status_code=401, detail="invalid credentials")
@@ -52,44 +75,109 @@ def auth_refresh(body: RefreshBody) -> dict:
 
 
 @app.get("/api/auth/me")
-def auth_me(request: Request) -> dict:
-    token = auth_service.bearer_token(request.headers.get("authorization"))
-    if token is None:
-        raise HTTPException(status_code=401, detail="missing bearer token")
-    user = auth_service.me_from_access(token)
-    if user is None:
-        raise HTTPException(status_code=401, detail="invalid access token")
+def auth_me(user: Annotated[dict[str, str], Depends(require_user)]) -> dict:
     return user
 
 
 @app.post("/api/projects")
-def create_project(body: CreateProjectBody) -> dict:
-    # ponytail: no auth; upgrade token + owner (M3).
+def create_project(
+    body: CreateProjectBody,
+    user: Annotated[dict[str, str], Depends(require_user)],
+) -> dict:
     try:
-        return project_service.create(name=body.name)
+        return project_service.create(
+            name=body.name,
+            owner_id=user["id"],
+            owner_username=user["username"],
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
 
 
 @app.get("/api/projects")
-def list_projects() -> list[dict]:
-    return project_service.list_projects()
+def list_projects(user: Annotated[dict[str, str], Depends(require_user)]) -> list[dict]:
+    return project_service.list_projects(user_id=user["id"])
 
 
 @app.get("/api/projects/{project_id}")
-def get_project(project_id: str) -> dict:
+def get_project(
+    project_id: str,
+    user: Annotated[dict[str, str], Depends(require_user)],
+) -> dict:
+    _forbid_unless_member(project_id, user["id"])
     meta = project_service.get(project_id)
-    if meta is None:
-        raise HTTPException(status_code=404, detail="project not found")
+    assert meta is not None
     return meta
 
 
 @app.get("/api/projects/{project_id}/snapshot")
-def get_snapshot(project_id: str) -> dict:
+def get_snapshot(
+    project_id: str,
+    user: Annotated[dict[str, str], Depends(require_user)],
+) -> dict:
+    _forbid_unless_member(project_id, user["id"])
     snap = project_service.snapshot(project_id)
     if snap is None:
         raise HTTPException(status_code=404, detail="project not found")
     return snap
+
+
+@app.get("/api/projects/{project_id}/members")
+def get_members(
+    project_id: str,
+    user: Annotated[dict[str, str], Depends(require_user)],
+) -> list[dict]:
+    _forbid_unless_member(project_id, user["id"])
+    members = project_service.list_members(project_id)
+    if members is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    return members
+
+
+@app.post("/api/projects/{project_id}/members")
+def post_member(
+    project_id: str,
+    body: AddMemberBody,
+    user: Annotated[dict[str, str], Depends(require_user)],
+) -> list[dict]:
+    _forbid_unless_member(project_id, user["id"])
+    if not project_service.can_manage_members(project_id, user["id"]):
+        raise HTTPException(status_code=403, detail="owner permission required")
+    if body.role not in (ROLE_EDITOR, ROLE_VIEWER):
+        raise HTTPException(status_code=400, detail="role must be editor or viewer")
+    if not body.username and not body.user_id:
+        raise HTTPException(status_code=400, detail="username or user_id required")
+    target = auth_service.find_user(username=body.username, user_id=body.user_id)
+    if target is None:
+        raise HTTPException(status_code=404, detail="user not found")
+    try:
+        return project_service.add_member(
+            project_id,
+            user_id=target["id"],
+            username=target["username"],
+            role=body.role,
+        )
+    except FsRejected as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
+@app.delete("/api/projects/{project_id}/members/{member_user_id}")
+def delete_member(
+    project_id: str,
+    member_user_id: str,
+    user: Annotated[dict[str, str], Depends(require_user)],
+) -> list[dict]:
+    _forbid_unless_member(project_id, user["id"])
+    if not project_service.can_manage_members(project_id, user["id"]):
+        raise HTTPException(status_code=403, detail="owner permission required")
+    try:
+        return project_service.remove_member(project_id, member_user_id)
+    except FsRejected as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
 
 @app.put("/api/projects/{project_id}/assets/{asset_path:path}")
@@ -97,9 +185,11 @@ async def put_asset(
     project_id: str,
     asset_path: str,
     request: Request,
+    user: Annotated[dict[str, str], Depends(require_user)],
     client_id: str | None = Query(default=None),
 ) -> dict:
     """Upload / replace a binary asset; bump revision; notify WS peers."""
+    _forbid_unless_writer(project_id, user["id"])
     body = await request.body()
     try:
         rev, info = project_service.put_asset(project_id, asset_path, body)
@@ -117,7 +207,12 @@ async def put_asset(
 
 
 @app.get("/api/projects/{project_id}/assets/{asset_path:path}")
-def get_asset(project_id: str, asset_path: str) -> Response:
+def get_asset(
+    project_id: str,
+    asset_path: str,
+    user: Annotated[dict[str, str], Depends(require_user)],
+) -> Response:
+    _forbid_unless_member(project_id, user["id"])
     try:
         got = project_service.get_asset(project_id, asset_path)
     except FsRejected as e:
@@ -138,9 +233,27 @@ def get_asset(project_id: str, asset_path: str) -> Response:
 
 
 @app.websocket("/api/projects/{project_id}/collaboration")
-async def collaboration_ws(websocket: WebSocket, project_id: str) -> None:
-    # ponytail: fixed PoC project_id path only; no auth. Upgrade: token + membership (M3).
-    await manager.handle(websocket, project_id)
+async def collaboration_ws(
+    websocket: WebSocket,
+    project_id: str,
+    access_token: str | None = Query(default=None),
+) -> None:
+    """Collaboration WS — require Bearer via ?access_token= or Authorization header."""
+    user = user_from_websocket(websocket, access_token=access_token)
+    if user is None:
+        await websocket.accept()
+        await websocket.close(code=4401, reason="missing or invalid access token")
+        return
+    # Real projects require membership; unknown id (e.g. fixture "poc") allows any authed user.
+    if project_service.get(project_id) is not None:
+        if not project_service.can_read(project_id, user["id"]):
+            await websocket.accept()
+            await websocket.close(code=4403, reason="not a project member")
+            return
+        can_write = project_service.can_write(project_id, user["id"])
+    else:
+        can_write = True
+    await manager.handle(websocket, project_id, user_id=user["id"], can_write=can_write)
 
 
 @app.get("/runtimes/{runtime_name}/{runtime_path:path}")
@@ -157,8 +270,7 @@ def get_runtime(runtime_name: str, runtime_path: str) -> Response:
 
 @app.get("/p/{project_id}/preview")
 def preview_index(project_id: str) -> Response:
-    """Server Preview HTML composed from collaborative state (§19)."""
-    # Trailing-slash alias keeps relative fetches consistent for clients that append /.
+    """Server Preview HTML — open for demo (browser Open Preview has no Bearer)."""
     got = preview_service.compose_index(project_id)
     if got is None:
         raise HTTPException(status_code=404, detail="project not found")

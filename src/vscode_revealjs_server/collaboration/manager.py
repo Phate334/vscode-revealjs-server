@@ -156,7 +156,15 @@ class CollaborationManager:
         # Fixtures may use synthetic project_id (e.g. "poc") without meta → 0.
         return 0 if rev is None else rev
 
-    async def handle(self, ws: WebSocket, project_id: str) -> None:
+    async def handle(
+        self,
+        ws: WebSocket,
+        project_id: str,
+        *,
+        user_id: str = "",
+        can_write: bool = True,
+    ) -> None:
+        _ = user_id  # reserved for presence / actor_id
         await ws.accept()
         room = self.room(project_id)
         try:
@@ -217,6 +225,11 @@ class CollaborationManager:
                 if message["type"] == "websocket.disconnect":
                     break
                 if "bytes" in message and message["bytes"] is not None:
+                    if not can_write:
+                        await ws.send_text(
+                            proto.encode(proto.error("forbidden", "write permission required"))
+                        )
+                        continue
                     await room.apply_and_broadcast(message["bytes"], sender=ws)
                     continue
                 text = message.get("text")
@@ -233,6 +246,11 @@ class CollaborationManager:
                 elif ctype == proto.HELLO:
                     await ws.send_text(proto.encode(proto.error("already_joined", "hello already sent")))
                 elif ctype == proto.FS_OPERATION:
+                    if not can_write:
+                        await ws.send_text(
+                            proto.encode(proto.error("forbidden", "write permission required"))
+                        )
+                        continue
                     await self._handle_fs_operation(ws, room, project_id, control)
                 else:
                     await ws.send_text(

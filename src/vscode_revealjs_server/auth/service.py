@@ -16,10 +16,11 @@ from vscode_revealjs_server.auth.tokens import decode_jwt, issue_tokens
 def _demo_users() -> dict[str, dict[str, str]]:
     """username → {id, password}.
 
-    AUTH_DEMO_USER=alice:alicepass (optional). Always includes demo/demo.
+    Built-ins: demo/demo, alice/alice. Optional AUTH_DEMO_USER=name:pass.
     """
     users = {
         "demo": {"id": "usr_demo", "password": "demo"},
+        "alice": {"id": "usr_alice", "password": "alice"},
     }
     extra = os.environ.get("AUTH_DEMO_USER", "").strip()
     if extra and ":" in extra:
@@ -29,6 +30,23 @@ def _demo_users() -> dict[str, dict[str, str]]:
             uid = "usr_" + hashlib.sha256(name.encode()).hexdigest()[:12]
             users[name] = {"id": uid, "password": pw}
     return users
+
+
+def find_user(*, username: str | None = None, user_id: str | None = None) -> dict[str, str] | None:
+    """Return {id, username} from demo store, or None."""
+    users = _demo_users()
+    if username is not None:
+        name = username.strip()
+        row = users.get(name)
+        if row is None:
+            return None
+        return {"id": row["id"], "username": name}
+    if user_id is not None:
+        for name, row in users.items():
+            if row["id"] == user_id:
+                return {"id": row["id"], "username": name}
+        return None
+    return None
 
 
 def login(username: str, password: str) -> dict[str, Any] | None:
