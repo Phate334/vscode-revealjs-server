@@ -17,6 +17,36 @@ Acceptance and live checks use the compose endpoint (`localhost:8000`), not host
 
 See `extension/README.md`. Connect URL comes from `.presentation/workspace.json` (`server` + `projectId`); fixtures already include that file.
 
+
+## Install from a release (tag)
+
+Tagged releases (`vX.Y.Z`, matching `pyproject.toml` version) publish:
+
+1. **VS Code extension VSIX** on the [GitHub Release](https://github.com/Phate334/vscode-revealjs-server/releases) for that tag.
+2. **Server image** to GHCR: `ghcr.io/phate334/vscode-revealjs-server:<version>` (also `:latest`).
+
+### Extension (Install from VSIX)
+
+Download the `.vsix` from the release assets, then:
+
+```bash
+code --install-extension path/to/vscode-revealjs-collaboration-0.1.0.vsix
+```
+
+Or in VS Code: **Extensions → … → Install from VSIX…**
+
+### Server image (GHCR)
+
+```bash
+docker pull ghcr.io/phate334/vscode-revealjs-server:0.1.0
+# or
+docker pull ghcr.io/phate334/vscode-revealjs-server:latest
+```
+
+For a private package, authenticate first (`gh auth token | docker login ghcr.io -u USER --password-stdin`) and ensure you have package read access.
+
+Local compose still builds from the Dockerfile (`docker compose up -d --build`).
+
 ## Collaborative text (multi-doc)
 
 CRDT model: `path → Y.Text` inside a Yjs/pycrdt `documents` map (not a single slide blob). Bound extensions: `.md`, `.css`, `.html`, `.yaml`/`.yml`, `.json`. Each file has its own UndoManager. Preview/Publish prefer live CRDT text for those paths.

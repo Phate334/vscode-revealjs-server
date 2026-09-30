@@ -1,0 +1,99 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  verify-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: ver
+        name: Fail unless tag vX.Y.Z matches pyproject.toml
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          case "$TAG" in
+            v[0-9]*) ;;
+            *) echo "Unexpected tag format: $TAG (expected vX.Y.Z)"; exit 1 ;;
+          esac
+          EXPECTED="${TAG#v}"
+          PY_VERSION=$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          if [ "$EXPECTED" != "$PY_VERSION" ]; then
+            echo "::error::Tag $TAG does not match pyproject.toml version $PY_VERSION (expected v$PY_VERSION)"
+            exit 1
+          fi
+          echo "version=$PY_VERSION" >> "$GITHUB_OUTPUT"
+          echo "OK: tag $TAG matches pyproject.toml $PY_VERSION"
+
+  package-vsix:
+    needs: verify-version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: extension/package-lock.json
+      - name: Sync extension/package.json version
+        env:
+          VERSION: ${{ needs.verify-version.outputs.version }}
+        run: |
+          python3 -c "
+          import json, os
+          path = 'extension/package.json'
+          with open(path) as f:
+              pkg = json.load(f)
+          pkg['version'] = os.environ['VERSION']
+          with open(path, 'w') as f:
+              json.dump(pkg, f, indent=2)
+              f.write('\n')
+          print(f\"extension/package.json version -> {pkg['version']}\")
+          "
+      - name: Build VSIX
+        working-directory: extension
+        run: |
+          npm ci
+          npm run compile
+          npx --yes @vscode/vsce package --out "vscode-revealjs-collaboration-${{ needs.verify-version.outputs.version }}.vsix"
+      - name: Create GitHub Release and upload VSIX
+        uses: softprops/action-gh-release@v2
+        with:
+          files: extension/vscode-revealjs-collaboration-${{ needs.verify-version.outputs.version }}.vsix
+          generate_release_notes: true
+
+  docker:
+    needs: verify-version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push multi-arch image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            ghcr.io/phate334/vscode-revealjs-server:${{ needs.verify-version.outputs.version }}
+            ghcr.io/phate334/vscode-revealjs-server:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
