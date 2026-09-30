@@ -1,0 +1,43 @@
+{
+  "name": "vscode-revealjs-collaboration",
+  "displayName": "RevealJS Collaboration (PoC)",
+  "description": "M0 PoC: bind slide.md to FastAPI + Yjs collaboration WebSocket",
+  "version": "0.0.1",
+  "publisher": "phate334",
+  "engines": {
+    "vscode": "^1.139.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onCommand:revealjsCollab.connect",
+    "workspaceContains:.presentation/workspace.json"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "revealjsCollab.connect",
+        "title": "RevealJS Collab: Connect"
+      },
+      {
+        "command": "revealjsCollab.disconnect",
+        "title": "RevealJS Collab: Disconnect"
+      }
+    ]
+  },
+  "scripts": {
+    "compile": "tsc -p .",
+    "watch": "tsc -watch -p .",
+    "test": "npm run compile && node --test out/originTracker.test.js"
+  },
+  "dependencies": {
+    "yjs": "^13.6.27"
+  },
+  "devDependencies": {
+    "@types/node": "^20.17.0",
+    "@types/vscode": "^1.138.0",
+    "typescript": "^5.8.2"
+  }
+}
