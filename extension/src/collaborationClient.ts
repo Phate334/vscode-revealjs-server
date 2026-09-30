@@ -29,7 +29,6 @@ export type AssetChangedEvent = {
   size: number;
 };
 
-const DEFAULT_URL = "ws://127.0.0.1:8000/api/projects/poc/collaboration";
 const PROTOCOL_VERSION = 1;
 // ponytail: exp backoff capped at 30s; upgrade to jittered shared retry policy if many clients stampede.
 const BACKOFF_MS = [1000, 2000, 4000, 8000, 16000, 30000];
@@ -72,7 +71,8 @@ export class CollaborationClient {
 
   constructor(
     readonly clientId: string,
-    readonly url: string = DEFAULT_URL,
+    /** WS URL from .presentation/workspace.json (server + projectId). No /poc fallback. */
+    readonly url: string,
   ) {
     // Match server/pycrdt key used in tests: Doc.get("content", type=Text)
     this.ytext = this.doc.getText("content");

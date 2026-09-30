@@ -1,7 +1,8 @@
-# RevealJS Collaboration (M0 PoC)
+# RevealJS Collaboration (M0/M1 PoC)
 
-Minimal VS Code extension: bind workspace `slide.md` to the compose server at
-`ws://127.0.0.1:8000/api/projects/poc/collaboration` via Yjs.
+Minimal VS Code extension: bind workspace `slide.md` (root or nested chapter path) to the
+compose collaboration server via Yjs. The WebSocket URL is built **only** from
+`.presentation/workspace.json` (`server` + `projectId`) — there is no `/poc` fallback.
 
 ## Build
 
@@ -20,7 +21,7 @@ docker compose up -d --build
 ./scripts/compose-smoke.sh    # curl http://127.0.0.1:8000/health
 ```
 
-published compose port (`localhost:8000`), not host `uv run uvicorn`.
+Use the published compose port (`localhost:8000`), not host `uv run uvicorn`.
 
 ## Load in VS Code 1.139+
 
@@ -35,23 +36,28 @@ code --extensionDevelopmentPath=$PWD \
 
 Or open `extension/` and press F5 (`.vscode/launch.json` → Alice fixture).
 
-Each window auto-connects when `.presentation/workspace.json` is present, or run
-**RevealJS Collab: Connect**. Edit `slide.md` on either side; the other should converge.
+Each window auto-connects when `.presentation/workspace.json` is present (fixtures ship with
+`server` + `projectId`), or run **RevealJS Collab: Connect** / **Presentation: Create Project** /
+**Presentation: Open Project**. Missing metadata fails clearly — create or open a project first.
+
+Edit `slide.md` on either side; the other should converge.
 
 ## Protocol (matches server)
 
-- First text frame: `{"type":"hello","client_id":"...","protocol_version":1}`
-- Server: `ready` JSON, then optional binary Yjs snapshot
+- First text frame: `{"type":"hello","client_id":"...","protocol_version":1,"last_known_revision":N}`
+- Server: `ready` JSON (`revision`, `has_snapshot`), then optional binary Yjs snapshot when `has_snapshot`
+- Optional: `workspace.reconcile_required` when revision gap / stale base
 - Further binary frames: Yjs updates (`Y.Doc` text key `content`)
 
-## M0 sync notes
+## Sync notes
 
-- **External rewrite:** `FileSystemWatcher` on workspace `slide.md` reads disk, prefix/suffix-diffs into local Y.Text (skips OriginTracker remote applies + equal content; 150ms debounce).
-- **Reconnect:** WS drop → status `offline`, exp backoff retry → `syncing` → hello again → merge (apply server snapshot + push full local Yjs state).
+- **Init order:** connect → ready/snapshot barrier → Document Binding → SyncController local watchers.
+- **External rewrite:** `FileSystemWatcher` on bound `**/slide.md` reads disk, prefix/suffix-diffs into Y.Text (`FS_RECONCILE`).
+- **Reconnect:** WS drop → backoff → hello again → barrier → merge (apply server snapshot + push full local Yjs state).
+- **Reconciliation:** revision gap / bulk local topology / stale base → snapshot pull (`FS_RECONCILE`, not UndoManager).
 
 ## Undo (Yjs UndoManager)
 
 - Local typing uses origin `LOCAL_EDITOR` → tracked by per-doc `Y.UndoManager`.
-- Remote applies use `REMOTE_SYNC`; FileSystemWatcher diffs use `FS_RECONCILE` (not undo-tracked).
+- Remote applies use `REMOTE_SYNC`; FileSystemWatcher / reconcile diffs use `FS_RECONCILE` (not undo-tracked).
 - Keybindings: Ctrl/Cmd+Z / redo → `presentation.undo` / `presentation.redo` when `presentation.collaborativeEditor && editorTextFocus`.
-- If native Undo/Redo still fires (`TextDocumentChangeReason`), binding skips pushing into Yjs and routes to UndoManager, then reconciles the editor to `ytext`.
