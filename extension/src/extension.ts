@@ -109,6 +109,32 @@ function disconnect(): void {
   setStatus("offline");
 }
 
+async function pickLocalFolder(openLabel: string): Promise<vscode.Uri | undefined> {
+  const current = vscode.workspace.workspaceFolders?.[0]?.uri;
+  const items: { label: string; description?: string; uri?: vscode.Uri; pick?: "dialog" }[] = [];
+  if (current) {
+    items.push({
+      label: "Use current folder",
+      description: current.fsPath,
+      uri: current,
+    });
+  }
+  items.push({ label: "Choose folder…", pick: "dialog" });
+  const chosen = await vscode.window.showQuickPick(items, {
+    title: openLabel,
+    placeHolder: "Where should local files go?",
+  });
+  if (!chosen) return undefined;
+  if (chosen.uri) return chosen.uri;
+  const picked = await vscode.window.showOpenDialog({
+    canSelectFiles: false,
+    canSelectFolders: true,
+    canSelectMany: false,
+    openLabel,
+  });
+  return picked?.[0];
+}
+
 async function cmdCreateProject(): Promise<void> {
   const name = await vscode.window.showInputBox({
     title: "Presentation: Create Project",
@@ -117,13 +143,9 @@ async function cmdCreateProject(): Promise<void> {
   });
   if (!name) return;
 
-  const parent = await vscode.window.showOpenDialog({
-    canSelectFiles: false,
-    canSelectFolders: true,
-    canSelectMany: false,
-    openLabel: "Select parent folder",
-  });
-  if (!parent?.[0]) return;
+  const parentUri = await pickLocalFolder("Select parent folder");
+  if (!parentUri) return;
+  const parent = [parentUri];
 
   if (!(await requireAccess())) return;
   const server = DEFAULT_SERVER;
@@ -207,23 +229,18 @@ async function openListedProject(title: string, scope: "owned" | "shared"): Prom
     { title },
   );
   if (!picked) return;
-  const parent = await vscode.window.showOpenDialog({
-    canSelectFiles: false,
-    canSelectFolders: true,
-    canSelectMany: false,
-    openLabel: "Select local folder for snapshot",
-  });
-  if (!parent?.[0]) return;
+  const folder = await pickLocalFolder("Select local folder for snapshot");
+  if (!folder) return;
   try {
     const snap = await fetchSnapshot(server, picked.project.id);
-    await extractSnapshot(parent[0], snap, server);
-    await writeWorkspaceMeta(parent[0], {
+    await extractSnapshot(folder, snap, server);
+    await writeWorkspaceMeta(folder, {
       version: 1,
       server,
       projectId: picked.project.id,
       lastKnownRevision: snap.revision,
     });
-    await vscode.commands.executeCommand("vscode.openFolder", parent[0], {
+    await vscode.commands.executeCommand("vscode.openFolder", folder, {
       forceNewWindow: false,
     });
   } catch (err) {
