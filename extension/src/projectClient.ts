@@ -26,7 +26,7 @@ export type Snapshot = {
   content_hash?: string;
   directories: string[];
   files: { path: string; content: string }[];
-  assets: { path: string; content_hash: string; size: number }[];
+  assets: { path: string; content_hash: string; size: number; revision?: number }[];
 };
 
 let accessTokenGetter: () => Promise<string | undefined> = async () => undefined;
@@ -109,15 +109,43 @@ export type AssetPutResult = {
   revision: number;
 };
 
+/** Server 409 AssetConflict payload (#9). */
+export class AssetConflictError extends Error {
+  readonly path: string;
+  readonly contentHash: string;
+  readonly revision: number;
+  readonly size: number;
+
+  constructor(detail: {
+    path: string;
+    content_hash: string;
+    revision: number;
+    size: number;
+  }) {
+    super(`AssetConflict: ${detail.path} revision=${detail.revision}`);
+    this.name = "AssetConflictError";
+    this.path = detail.path;
+    this.contentHash = detail.content_hash;
+    this.revision = detail.revision;
+    this.size = detail.size;
+  }
+}
+
 export async function putAsset(
   server: string,
   projectId: string,
   relPath: string,
   data: Uint8Array,
   clientId?: string,
+  baseRevision?: number,
+  force?: boolean,
 ): Promise<AssetPutResult> {
   const base = server.replace(/\/$/, "");
-  const q = clientId ? `?client_id=${encodeURIComponent(clientId)}` : "";
+  const params = new URLSearchParams();
+  if (clientId) params.set("client_id", clientId);
+  if (typeof baseRevision === "number") params.set("base_revision", String(baseRevision));
+  if (force) params.set("force", "true");
+  const q = params.toString() ? `?${params.toString()}` : "";
   const url = `${base}/api/projects/${encodeURIComponent(projectId)}/assets/${relPath
     .split("/")
     .map(encodeURIComponent)
@@ -127,6 +155,25 @@ export async function putAsset(
     headers: await authHeaders({ "Content-Type": "application/octet-stream" }),
     body: Buffer.from(data),
   });
+  if (res.status === 409) {
+    const raw = await res.text().catch(() => "");
+    let detail: { error?: string; path?: string; content_hash?: string; revision?: number; size?: number } = {};
+    try {
+      const parsed = JSON.parse(raw) as { detail?: typeof detail } & typeof detail;
+      detail = (parsed.detail && typeof parsed.detail === "object" ? parsed.detail : parsed) as typeof detail;
+    } catch {
+      /* plain text */
+    }
+    if (detail.error === "AssetConflict" || typeof detail.revision === "number") {
+      throw new AssetConflictError({
+        path: detail.path || relPath,
+        content_hash: detail.content_hash || "",
+        revision: Number(detail.revision) || 0,
+        size: Number(detail.size) || 0,
+      });
+    }
+    throw new Error(`HTTP 409 PUT asset: ${raw || res.statusText}`);
+  }
   if (!res.ok) {
     const detail = await res.text().catch(() => "");
     throw new Error(`HTTP ${res.status} PUT asset: ${detail || res.statusText}`);

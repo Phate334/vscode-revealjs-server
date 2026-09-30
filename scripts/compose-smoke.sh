@@ -126,12 +126,32 @@ CODE="$(curl -sS -o /dev/null -w '%{http_code}' -X PUT \
 [[ "${CODE}" == "401" ]] || fail "expected 401 put asset no token, got ${CODE}"
 
 echo "PUT /api/projects/${PID}/assets/${ASSET_PATH}"
+PUT1="$(echo "${PNG_B64}" | base64 -d | curl -sfS -X PUT \
+  "${BASE}/api/projects/${PID}/assets/${ASSET_PATH}?base_revision=0" \
+  --data-binary @- -H 'Content-Type: application/octet-stream' \
+  -H "$(auth_hdr)")" \
+  || fail "put asset"
+ASSET_REV="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["revision"])' <<<"${PUT1}")"
+[[ -n "${ASSET_REV}" ]] || fail "put asset missing revision: ${PUT1}"
+pass "put binary asset with Bearer rev=${ASSET_REV}"
+
+echo "PUT same asset without matching base_revision → 409 AssetConflict"
+CODE="$(echo "${PNG_B64}" | base64 -d | curl -sS -o /tmp/smoke-asset-conflict.json -w '%{http_code}' -X PUT \
+  "${BASE}/api/projects/${PID}/assets/${ASSET_PATH}?base_revision=0" \
+  --data-binary @- -H 'Content-Type: application/octet-stream' \
+  -H "$(auth_hdr)" || true)"
+[[ "${CODE}" == "409" ]] || fail "expected 409 asset conflict, got ${CODE}"
+python3 -c 'import json; d=json.load(open("/tmp/smoke-asset-conflict.json")); detail=d.get("detail", d); assert detail.get("error")=="AssetConflict", detail' \
+  || fail "409 body not AssetConflict"
+pass "asset optimistic concurrency 409"
+
+echo "PUT force overwrite after conflict"
 echo "${PNG_B64}" | base64 -d | curl -sfS -X PUT \
-  "${BASE}/api/projects/${PID}/assets/${ASSET_PATH}" \
+  "${BASE}/api/projects/${PID}/assets/${ASSET_PATH}?force=true" \
   --data-binary @- -H 'Content-Type: application/octet-stream' \
   -H "$(auth_hdr)" >/dev/null \
-  || fail "put asset"
-pass "put binary asset with Bearer"
+  || fail "force put asset"
+pass "asset force overwrite"
 
 echo "GET preview asset /p/${PID}/preview/${ASSET_PATH}"
 curl -sfS -o /tmp/smoke-hero.png "${BASE}/p/${PID}/preview/${ASSET_PATH}" || fail "preview asset"
@@ -280,12 +300,19 @@ SLUG_PATH="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["public_pat
 REL1_PATH="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["release_path"])' <<<"${REL1_JSON}")"
 [[ "${REL1}" == rel_* ]] || fail "bad release id ${REL1}"
 HTML1="$(curl -sfS "${BASE}${REL1_PATH}")" || fail "GET release 1"
-echo "${HTML1}" | grep -q "/release/${REL1}/runtime/reveal.js" || fail "release html runtime url"
+echo "${HTML1}" | grep -q "/runtimes/reveal-v1/reveal.js" || fail "release html should use shared /runtimes/reveal-v1/"
+if echo "${HTML1}" | grep -q "/release/${REL1}/runtime/"; then
+  fail "release html still embeds per-release runtime copy"
+fi
 echo "${HTML1}" | grep -q "/release/${REL1}/01-introduction/slide.md" || fail "release html slide url"
 if echo "${HTML1}" | grep -q "/p/${PID}/preview"; then
   fail "release html still points at live preview"
 fi
-curl -sfS -o /dev/null "${BASE}/release/${REL1}/runtime/reveal.js" || fail "frozen runtime file"
+curl -sfS -o /dev/null "${BASE}/runtimes/reveal-v1/reveal.js" || fail "shared runtime file"
+# Content-addressed asset still served at release path
+curl -sfS -o /tmp/smoke-rel-hero.png "${BASE}/release/${REL1}/${ASSET_PATH}" || fail "release asset via blob map"
+python3 -c 'import pathlib; b=pathlib.Path("/tmp/smoke-rel-hero.png").read_bytes(); assert b[:8]==b"\x89PNG\r\n\x1a\n", b[:16]' \
+  || fail "release asset not PNG"
 SLUG_HTML="$(curl -sfS "${BASE}${SLUG_PATH}")" || fail "GET slug"
 echo "${SLUG_HTML}" | grep -q "/release/${REL1}/" || fail "slug did not serve release 1"
 pass "publish release ${REL1} slug ${SLUG_PATH}"

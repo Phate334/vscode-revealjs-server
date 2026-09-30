@@ -13,8 +13,9 @@ from starlette.websockets import WebSocketDisconnect, WebSocketState
 from vscode_revealjs_server.collaboration import protocol as proto
 from vscode_revealjs_server.projects.service import FsRejected, project_service
 
-# ponytail: in-memory rooms (+ optional .data blob). Ceiling: lost on process wipe / no multi-instance.
-# Upgrade: shared store (postgres update log or snapshot; open decision #6).
+# #6: one merged Y.Doc state blob per project (documents Map); no permanent update log.
+# Optional future compaction OK. Per-path Y.Docs / per-path blob table deferred (would break Map CRDT).
+# Ceiling: single-node process; lost on wipe without .data volume.
 # COLLAB_DATA_DIR for containers; else cwd/.data (repo root when started via compose/uv).
 _DATA_DIR = Path(os.environ.get("COLLAB_DATA_DIR", str(Path.cwd() / ".data" / "collaboration")))
 
@@ -98,7 +99,7 @@ class CollaborationRoom:
         self._persist()
 
     def _persist(self) -> None:
-        """Atomic ydoc write (temp + replace) so crash mid-write keeps prior blob (H6)."""
+        """Atomic merged-state blob (encodeStateAsUpdate / get_update); no update log (#6)."""
         _DATA_DIR.mkdir(parents=True, exist_ok=True)
         path = self._blob_path()
         payload = self.doc.get_update()

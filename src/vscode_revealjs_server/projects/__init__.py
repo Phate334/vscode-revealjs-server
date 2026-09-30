@@ -1,5 +1,5 @@
-"""Project metadata + on-disk collaborative workspace (M1)."""
+"""Project create / snapshot / fs / assets / members / releases."""
 
-from vscode_revealjs_server.projects.service import FsRejected, project_service
+from vscode_revealjs_server.projects.service import AssetConflict, FsRejected, project_service
 
-__all__ = ["FsRejected", "project_service"]
+__all__ = ["AssetConflict", "FsRejected", "project_service"]

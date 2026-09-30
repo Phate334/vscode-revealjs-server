@@ -27,6 +27,13 @@ _PROJECTS_DIR = Path(
         str(Path(os.environ.get("COLLAB_DATA_DIR", str(Path.cwd() / ".data" / "collaboration"))).parent / "projects"),
     )
 )
+# Content-addressed asset blobs for Publish (#10); shared across projects/releases.
+_BLOBS_DIR = Path(
+    os.environ.get(
+        "BLOBS_DATA_DIR",
+        str(_PROJECTS_DIR.parent / "blobs"),
+    )
+)
 
 _SAFE_NAME = re.compile(r"^[\w\s.\-]{1,120}$")
 # §3.1 two-level layout: root file or chapter/file
@@ -113,6 +120,33 @@ def is_collaborative_text_rel(rel: str) -> bool:
 
 class FsRejected(ValueError):
     """Path / op validation failure for fs.operation."""
+
+
+class AssetConflict(Exception):
+    """Optimistic concurrency failure on binary asset PUT (#9)."""
+
+    def __init__(
+        self,
+        *,
+        path: str,
+        content_hash: str,
+        revision: int,
+        size: int,
+    ) -> None:
+        self.path = path
+        self.content_hash = content_hash
+        self.revision = revision
+        self.size = size
+        super().__init__(f"AssetConflict: {path} revision={revision}")
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "error": "AssetConflict",
+            "path": self.path,
+            "content_hash": self.content_hash,
+            "revision": self.revision,
+            "size": self.size,
+        }
 
 
 def _now() -> str:
@@ -340,11 +374,19 @@ class ProjectService:
                 if is_binary_rel(rel):
                     raw = path.read_bytes()
                     digest = hashlib.sha256(raw).hexdigest()
+                    amap = meta.get("assets") if isinstance(meta.get("assets"), dict) else {}
+                    arow = amap.get(rel) if isinstance(amap, dict) else None
+                    arev = (
+                        int(arow["revision"])
+                        if isinstance(arow, dict) and "revision" in arow
+                        else int(meta.get("revision", 0))
+                    )
                     assets.append(
                         {
                             "path": rel,
                             "content_hash": digest,
                             "size": len(raw),
+                            "revision": arev,
                         }
                     )
                     hash_parts.append(f"a:{rel}:{digest}")
@@ -490,11 +532,17 @@ class ProjectService:
                 if not dest.is_file():
                     raise FsRejected(f"not a file: {rel}")
                 dest.unlink()
+                assets = self._asset_meta_map(meta)
+                assets.pop(rel, None)
             elif _SAFE_DIR.match(rel):
                 dest = self._resolve_rel(project_id, rel)
                 if not dest.is_dir():
                     raise FsRejected(f"not a directory: {rel}")
                 shutil.rmtree(dest)
+                assets = self._asset_meta_map(meta)
+                prefix = rel + "/"
+                for key in [k for k in assets if k == rel or str(k).startswith(prefix)]:
+                    assets.pop(key, None)
             else:
                 raise FsRejected(f"invalid delete path: {rel!r}")
             normalized["path"] = rel
@@ -520,6 +568,13 @@ class ProjectService:
                 else:
                     raise FsRejected(f"invalid target parent: {dst_rel}")
             src.rename(dst)
+            assets = self._asset_meta_map(meta)
+            if src_rel in assets:
+                assets[dst_rel] = assets.pop(src_rel)
+            else:
+                prefix = src_rel + "/"
+                for key in [k for k in list(assets) if str(k).startswith(prefix)]:
+                    assets[dst_rel + str(key)[len(src_rel) :]] = assets.pop(key)
             normalized["from"] = src_rel
             normalized["to"] = dst_rel
 
@@ -534,20 +589,59 @@ class ProjectService:
         project_id: str,
         rel: str,
         data: bytes,
+        *,
+        base_revision: int | None = None,
+        force: bool = False,
     ) -> tuple[int, dict[str, Any]]:
-        """Store binary at workspace-relative path; bump revision (last-write-wins).
+        """Store binary at workspace-relative path; optimistic concurrency (#9).
 
-        ponytail: bytes live under workspace/ + _mut (B4). Ceiling: dedup / CDN.
-        Upgrade: §18.2 assets/{hash} (M3).
+        Asset metadata = path + content_hash + revision. PUT requires base_revision
+        matching the stored revision when the path already exists (unless force).
+        Mismatch → AssetConflict (HTTP 409). Workspace file kept for live Preview.
         """
         with self._mut:
-            return self._put_asset_unlocked(project_id, rel, data)
+            return self._put_asset_unlocked(
+                project_id, rel, data, base_revision=base_revision, force=force
+            )
+
+    def _asset_meta_map(self, meta: dict[str, Any]) -> dict[str, Any]:
+        raw = meta.get("assets")
+        if not isinstance(raw, dict):
+            raw = {}
+            meta["assets"] = raw
+        return raw
+
+    def _existing_asset_info(
+        self, project_id: str, meta: dict[str, Any], rel: str, dest: Path
+    ) -> dict[str, Any] | None:
+        """Return stored or synthesized asset info if the path already exists."""
+        assets = self._asset_meta_map(meta)
+        row = assets.get(rel)
+        if isinstance(row, dict) and "content_hash" in row:
+            return {
+                "path": rel,
+                "content_hash": str(row["content_hash"]),
+                "revision": int(row.get("revision", meta.get("revision", 0))),
+                "size": int(row.get("size", 0)),
+            }
+        if dest.is_file():
+            payload = dest.read_bytes()
+            return {
+                "path": rel,
+                "content_hash": hashlib.sha256(payload).hexdigest(),
+                "revision": int(meta.get("revision", 0)),
+                "size": len(payload),
+            }
+        return None
 
     def _put_asset_unlocked(
         self,
         project_id: str,
         rel: str,
         data: bytes,
+        *,
+        base_revision: int | None = None,
+        force: bool = False,
     ) -> tuple[int, dict[str, Any]]:
         meta = self._read_meta(project_id)
         if meta is None:
@@ -569,14 +663,33 @@ class ProjectService:
                 raise FsRejected(f"invalid parent for asset: {rel}")
             parent.mkdir(parents=False, exist_ok=True)
 
+        existing = self._existing_asset_info(project_id, meta, rel, dest)
+        if existing is not None and not force:
+            current_rev = int(existing["revision"])
+            if base_revision is None or int(base_revision) != current_rev:
+                raise AssetConflict(
+                    path=rel,
+                    content_hash=str(existing["content_hash"]),
+                    revision=current_rev,
+                    size=int(existing["size"]),
+                )
+
         payload = bytes(data)
         _atomic_write_bytes(dest, payload)
         digest = hashlib.sha256(payload).hexdigest()
+        assets = self._asset_meta_map(meta)
+        next_rev = int(meta.get("revision", 0)) + 1
+        assets[rel] = {
+            "content_hash": digest,
+            "revision": next_rev,
+            "size": len(payload),
+        }
         rev = self._bump_revision(meta)
         return rev, {
             "path": rel,
             "content_hash": digest,
             "size": len(payload),
+            "revision": rev,
         }
 
     def get_asset(self, project_id: str, rel: str) -> tuple[bytes, dict[str, Any]] | None:
@@ -591,11 +704,44 @@ class ProjectService:
         if not dest.is_file():
             return None
         payload = dest.read_bytes()
-        return payload, {
+        info = self._existing_asset_info(project_id, meta, rel, dest) or {
             "path": rel,
             "content_hash": hashlib.sha256(payload).hexdigest(),
+            "revision": int(meta.get("revision", 0)),
             "size": len(payload),
         }
+        return payload, {
+            "path": rel,
+            "content_hash": str(info["content_hash"]),
+            "size": int(info["size"]),
+            "revision": int(info["revision"]),
+        }
+
+    @staticmethod
+    def blob_path(content_hash: str) -> Path:
+        """Content-addressed blob path (sha256 hex)."""
+        if not isinstance(content_hash, str) or len(content_hash) != 64:
+            raise FsRejected(f"invalid content hash: {content_hash!r}")
+        if any(c not in "0123456789abcdef" for c in content_hash.lower()):
+            raise FsRejected(f"invalid content hash: {content_hash!r}")
+        return _BLOBS_DIR / f"sha256-{content_hash.lower()}"
+
+    def store_blob(self, data: bytes) -> str:
+        """Write bytes into shared blob store; return sha256 hex. Idempotent."""
+        digest = hashlib.sha256(data).hexdigest()
+        dest = self.blob_path(digest)
+        if not dest.is_file():
+            _BLOBS_DIR.mkdir(parents=True, exist_ok=True)
+            tmp = dest.with_name(dest.name + ".tmp")
+            tmp.write_bytes(data)
+            tmp.replace(dest)
+        return digest
+
+    def read_blob(self, content_hash: str) -> bytes | None:
+        dest = self.blob_path(content_hash)
+        if not dest.is_file():
+            return None
+        return dest.read_bytes()
 
     @staticmethod
     def _role_in_meta(meta: dict[str, Any], user_id: str) -> str | None:

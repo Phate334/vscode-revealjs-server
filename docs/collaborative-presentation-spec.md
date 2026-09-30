@@ -799,7 +799,7 @@ WS asset.changed
 other clients download
 ```
 
-MVP 可先使用 last-write-wins 處理 binary concurrent replacement。
+Binary concurrent replacement：**optimistic concurrency**（path + content_hash + revision；PUT `base_revision`；不符 → 409 AssetConflict）。Extension 提示「使用我的／保留遠端」。不再 silent LWW（決策 #9，2026-10-01）。
 
 ---
 
@@ -1122,14 +1122,21 @@ Server 產生：
 ```text
 releases/
 ├─ rel_abc123/
-│  ├─ index.html
+│  ├─ index.html          # runtime URLs → /runtimes/reveal-v1/
 │  ├─ theme.css
-│  ├─ runtime/
-│  ├─ 01-introduction/
+│  ├─ assets.json         # path → sha256 content hash
+│  ├─ 01-introduction/    # text snapshot only
 │  └─ ...
 │
 └─ rel_def456/
+
+blobs/
+└─ sha256-{hex}           # content-addressed assets (shared)
+runtimes/
+└─ reveal-v1/             # shared by version (Preview + Publish)
 ```
+
+（決策 #10，2026-10-01：不每版複製 runtime；無 tar/zip。）
 
 Release 建立後內容不可修改。
 
@@ -1759,13 +1766,12 @@ last-write-wins whole text file
 
 ### Binary
 
-MVP：
-
 ```text
-last-write-wins
+optimistic concurrency
+(path + content_hash + revision; base_revision on PUT; 409 AssetConflict)
 ```
 
-但需記錄 revision / hash，以利偵測 concurrent replacement。
+Extension UX：使用我的／保留遠端（決策 #9，2026-10-01）。
 
 ### File topology
 
@@ -2040,18 +2046,18 @@ MVP 不需要：
 
 # Part VIII — Decisions Still Requiring PoC Validation
 
-以下項目不應在實測前鎖死：
+狀態追蹤見本機 `docs/open-decisions.md`（gitignored）。截至 2026-10-01：
 
-1. Python Server 使用哪一個 Yjs-compatible CRDT binding / websocket implementation。
-2. VS Code native undo stack 與 CRDT UndoManager 的整合方式。
-3. local external rewrite 如何轉成最穩定的 CRDT diff。
-4. filesystem watcher 在各平台的 debounce 策略。
-5. Git checkout / merge 的 bulk-change detection threshold。
-6. text CRDT persistence 採 update log、snapshot，或兩者混合。
-7. WebSocket binary protocol 的最終 framing。
-8. presence 是否在 MVP 顯示 cursor。
-9. binary concurrent replacement 的 UX。
-10. snapshot archive format 與大型 asset 的下載策略。
+1. **已決** — pycrdt + FastAPI WS。
+2. **已決** — Yjs UndoManager + conditional keybindings。
+3. **已決** — prefix/suffix 單次 patch；oldText = last projected known state。
+4. **已決** — FILE_SETTLE_MS=150 trailing per-path；無 OS-specific。
+5. **已決（heuristic）** — ≥8 unique paths / 1000ms；非正式架構條款。
+6. **已決** — merged Y.Doc state blob／project；無 update log；不拆 per-path Docs。
+7. **已決（PoC framing）** — JSON control + opaque Yjs binary。
+8. **可排除／MVP deferred** — presence cursor UI。
+9. **已決** — 409 AssetConflict + 使用我的／保留遠端（停止 silent LWW）。
+10. **已決** — shared `/runtimes/{pin}/` + content-addressed blobs；release 存 text + hash map + runtime pin；無 tar/zip。
 
 ---
 

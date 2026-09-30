@@ -21,8 +21,7 @@ function shouldIgnore(rel: string): boolean {
  * - delete local files/dirs not present on server (except ignore prefixes)
  * - CRDT-bound text converges via disk watcher → FS_RECONCILE (not LOCAL_EDITOR)
  *
- * ponytail: open-decision #10 — JSON manifest + per-asset GET (no archive).
- * Ceiling: large asset fan-out. Upgrade: tar/zip bundle (M3).
+ * #10: JSON manifest + per-asset GET; publish uses content-addressed blobs + shared runtime (no tar/zip).
  */
 export async function pullAndApplySnapshot(
   folder: vscode.Uri,
@@ -122,9 +121,9 @@ async function listLocalRelPaths(folder: vscode.Uri): Promise<string[]> {
 }
 
 /**
- * ponytail: open-decision #5 — temporary bulk-change detection.
- * ≥ BULK_EVENT_THRESHOLD local topology events inside BULK_WINDOW_MS → reconcile
+ * Sync Controller heuristic only (#5) — NOT architecture/spec.
+ * ≥ BULK_EVENT_THRESHOLD unique-path events inside BULK_WINDOW_MS → reconcile
  * (Git checkout / merge / mass rewrite). Not LOCAL_EDITOR — use FS_RECONCILE path.
  */
 export const BULK_EVENT_THRESHOLD = 8;
-export const BULK_WINDOW_MS = 2000;
+export const BULK_WINDOW_MS = 1000;

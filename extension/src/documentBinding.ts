@@ -6,8 +6,8 @@ import { FS_RECONCILE, LOCAL_EDITOR } from "./origins";
 import { COLLAB_TEXT_GLOB, isCollaborativeTextPath } from "./textPaths";
 
 const CONTEXT_KEY = "presentation.collaborativeEditor";
-// ponytail: single-file PoC debounce; raise / coalesce if bulk rewrite loops (open decision #4).
-const WATCHER_DEBOUNCE_MS = 150;
+// #4: trailing debounce per path (per FileBinding); no OS-specific strategy.
+const FILE_SETTLE_MS = 150;
 // ponytail: ~500ms groups keystrokes into one undo step; tune if users want finer/coarser undo.
 const UNDO_CAPTURE_TIMEOUT_MS = 500;
 
@@ -57,7 +57,8 @@ function diffSpan(
 }
 
 /**
- * Apply external file text onto Y.Text via prefix/suffix diff (keeps CRDT merge on unchanged spans).
+ * External reconcile (#3): single prefix/suffix patch onto Y.Text.
+ * oldText = last projected known state (current Y.Text); interface stays reconcileText→patches.
  * Do not replace the whole string in one shot — that bypasses concurrent merge.
  */
 function applyTextDiff(doc: Y.Doc, ytext: Y.Text, oldText: string, newText: string): void {
@@ -225,7 +226,7 @@ function bindOneFile(
           // deleted / unreadable
         }
       })();
-    }, WATCHER_DEBOUNCE_MS);
+    }, FILE_SETTLE_MS);
   };
 
   return {

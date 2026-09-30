@@ -12,7 +12,13 @@ import {
   loadJournal,
   type JournalEntry,
 } from "./offlineJournal";
-import { getAsset, isBinaryPath, putAsset, type WorkspaceMeta } from "./projectClient";
+import {
+  AssetConflictError,
+  getAsset,
+  isBinaryPath,
+  putAsset,
+  type WorkspaceMeta,
+} from "./projectClient";
 import {
   BULK_EVENT_THRESHOLD,
   BULK_WINDOW_MS,
@@ -49,6 +55,8 @@ function relPath(folder: vscode.Uri, uri: vscode.Uri): string | undefined {
  */
 export class SyncController {
   private readonly origin = new OriginTracker();
+  /** Per-path asset revision for optimistic concurrency (#9). */
+  private readonly assetRevisions = new Map<string, number>();
   /** Paths suppressed while / shortly after remote apply (async FS event echo). */
   private readonly suppressPaths = new Set<string>();
   /** Paths recently handled by VS Code workspace FS events (dedupe external watcher). */
@@ -59,8 +67,8 @@ export class SyncController {
   /** Pause local→server emission during snapshot reconcile. */
   private reconciling = false;
   private reconcileQueued = false;
-  /** Timestamps of recent local topology events for bulk detection (#5). */
-  private bulkTimestamps: number[] = [];
+  /** path → last event time for bulk detection (#5: ≥8 unique paths / window). */
+  private bulkPathTimes = new Map<string, number>();
   private meta: WorkspaceMeta | undefined;
   private localStarted = false;
 
@@ -156,7 +164,7 @@ export class SyncController {
     );
 
     // External FS (shell/git): VS Code onDidCreateFiles does not fire — watch create/delete.
-    // B5: single create/delete sync; bulk (≥8/2s) still → FS_RECONCILE.
+    // B5: single create/delete sync; bulk (≥8 unique paths / 1s) still → FS_RECONCILE.
     const topo = vscode.workspace.createFileSystemWatcher(
       new vscode.RelativePattern(this.folder, "**/*"),
     );
@@ -165,7 +173,7 @@ export class SyncController {
       const rel = relPath(this.folder, uri);
       if (!rel || shouldIgnore(rel) || this.suppressPaths.has(rel)) return;
       if (this.wasApiPath(rel)) return;
-      this.noteLocalTopologyEvent();
+      this.noteLocalTopologyEvent(rel);
       if (this.reconciling) return;
       void this.onLocalCreate(uri);
     };
@@ -174,7 +182,7 @@ export class SyncController {
       const rel = relPath(this.folder, uri);
       if (!rel || shouldIgnore(rel) || this.suppressPaths.has(rel)) return;
       if (this.wasApiPath(rel)) return;
-      this.noteLocalTopologyEvent();
+      this.noteLocalTopologyEvent(rel);
       if (this.reconciling) return;
       void this.onLocalDelete(uri);
     };
@@ -223,6 +231,11 @@ export class SyncController {
       this.lastAppliedRemoteRev = snap.revision;
       this.client.lastKnownRevision = snap.revision;
       this.client.workspaceRevision = snap.revision;
+      this.assetRevisions.clear();
+      for (const a of snap.assets ?? []) {
+        if (typeof a.revision === "number") this.assetRevisions.set(a.path, a.revision);
+        else this.assetRevisions.set(a.path, snap.revision);
+      }
       if (this.meta) {
         this.meta = { ...this.meta, lastKnownRevision: snap.revision };
       }
@@ -246,15 +259,18 @@ export class SyncController {
     void this.runReconcile(msg.reason || "reconcile_required");
   }
 
-  /** Record a local topology event; trigger reconcile on bulk burst. */
-  private noteLocalTopologyEvent(): void {
+  /** Record a local topology event; trigger reconcile on bulk burst (#5). */
+  private noteLocalTopologyEvent(rel?: string): void {
     // Offline: journal only — bulk snapshot reconcile would delete unsynced local ops (B2).
     if (!this.clientIsOpen()) return;
     const now = Date.now();
-    this.bulkTimestamps.push(now);
-    this.bulkTimestamps = this.bulkTimestamps.filter((t) => now - t <= BULK_WINDOW_MS);
-    if (this.bulkTimestamps.length >= BULK_EVENT_THRESHOLD) {
-      this.bulkTimestamps = [];
+    const key = rel && rel.length > 0 ? rel : `__anon_${now}_${this.bulkPathTimes.size}`;
+    this.bulkPathTimes.set(key, now);
+    for (const [p, t] of [...this.bulkPathTimes.entries()]) {
+      if (now - t > BULK_WINDOW_MS) this.bulkPathTimes.delete(p);
+    }
+    if (this.bulkPathTimes.size >= BULK_EVENT_THRESHOLD) {
+      this.bulkPathTimes.clear();
       void this.runReconcile("bulk_local_change");
     }
   }
@@ -285,7 +301,7 @@ export class SyncController {
   private async onLocalCreate(uri: vscode.Uri): Promise<void> {
     const rel = relPath(this.folder, uri);
     if (!rel || shouldIgnore(rel) || this.suppressPaths.has(rel)) return;
-    this.noteLocalTopologyEvent();
+    this.noteLocalTopologyEvent(rel);
     if (this.reconciling) return;
     this.enqueueSend(async () => {
       if (this.disposed || this.reconciling) return;
@@ -335,21 +351,47 @@ export class SyncController {
     await this.uploadAsset(uri, rel);
   }
 
-  private async uploadAsset(uri: vscode.Uri, rel: string): Promise<void> {
+  private async uploadAsset(uri: vscode.Uri, rel: string, force = false): Promise<void> {
     if (this.disposed || this.reconciling) return;
     const bytes = await vscode.workspace.fs.readFile(uri);
     this.suppressPaths.add(rel);
     try {
-      const result = await putAsset(
-        this.server,
-        this.projectId,
-        rel,
-        bytes,
-        this.client.clientId,
-      );
-      this.workspaceRevision = result.revision;
-      this.client.lastKnownRevision = result.revision;
-      this.lastAppliedRemoteRev = Math.max(this.lastAppliedRemoteRev, result.revision);
+      const baseRevision = this.assetRevisions.has(rel) ? this.assetRevisions.get(rel) : 0;
+      try {
+        const result = await putAsset(
+          this.server,
+          this.projectId,
+          rel,
+          bytes,
+          this.client.clientId,
+          force ? undefined : baseRevision,
+          force,
+        );
+        this.assetRevisions.set(rel, result.revision);
+        this.workspaceRevision = result.revision;
+        this.client.lastKnownRevision = result.revision;
+        this.lastAppliedRemoteRev = Math.max(this.lastAppliedRemoteRev, result.revision);
+      } catch (err) {
+        if (!(err instanceof AssetConflictError) || force) throw err;
+        const choice = await vscode.window.showWarningMessage(
+          `資源衝突：${rel}（遠端 revision ${err.revision}）`,
+          { modal: true },
+          "使用我的",
+          "保留遠端",
+        );
+        if (choice === "使用我的") {
+          this.assetRevisions.set(rel, err.revision);
+          await this.uploadAsset(uri, rel, true);
+        } else if (choice === "保留遠端") {
+          await this.applyRemoteAsset({
+            path: rel,
+            revision: err.revision,
+            content_hash: err.contentHash,
+            size: err.size,
+          });
+        }
+        // dismiss → leave local as-is; next upload will conflict again
+      }
     } finally {
       await new Promise((r) => setTimeout(r, 250));
       this.suppressPaths.delete(rel);
@@ -359,7 +401,7 @@ export class SyncController {
   private async onLocalDelete(uri: vscode.Uri): Promise<void> {
     const rel = relPath(this.folder, uri);
     if (!rel || shouldIgnore(rel) || this.suppressPaths.has(rel)) return;
-    this.noteLocalTopologyEvent();
+    this.noteLocalTopologyEvent(rel);
     if (this.reconciling) return;
     this.enqueueSend(async () => {
       if (this.disposed || this.reconciling) return;
@@ -376,7 +418,8 @@ export class SyncController {
     const to = relPath(this.folder, newUri);
     if (!from || !to || shouldIgnore(from) || shouldIgnore(to)) return;
     if (this.suppressPaths.has(from) || this.suppressPaths.has(to)) return;
-    this.noteLocalTopologyEvent();
+    this.noteLocalTopologyEvent(from);
+    this.noteLocalTopologyEvent(to);
     if (this.reconciling) return;
     const kind =
       from.includes("/") !== to.includes("/") || from.split("/")[0] !== to.split("/")[0]
@@ -499,9 +542,10 @@ export class SyncController {
         await vscode.workspace.fs.createDirectory(vscode.Uri.joinPath(uri, ".."));
         await vscode.workspace.fs.writeFile(uri, bytes);
       });
+      this.assetRevisions.set(rel, msg.revision);
       await new Promise((r) => setTimeout(r, 250));
     } catch (err) {
-      void vscode.window.showWarningMessage(`Collab asset download failed: ${String(err)}`);
+      void vscode.window.showWarningMessage(`資源下載失敗：${String(err)}`);
     } finally {
       this.suppressPaths.delete(rel);
     }

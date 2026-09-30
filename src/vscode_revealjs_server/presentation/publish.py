@@ -1,11 +1,17 @@
 """Publish an immutable release from server collaborative state (§21–22).
 
 Reuses presentation.render and the runtime registry. Does not read a client disk.
+
+Storage (#10):
+- Runtime shared by version at /runtimes/{name}/ (not copied into each release).
+- Assets content-addressed under shared blobs/sha256-...; release keeps path→hash map.
+- Release dir holds text snapshot + assets.json + runtime pin — no tar/zip, no ~3MB runtime copy.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 import mimetypes
 import shutil
 import uuid
@@ -27,6 +33,7 @@ from vscode_revealjs_server.projects.service import (
     project_service,
 )
 
+_ASSETS_MANIFEST = "assets.json"
 
 
 def _chapter_of(rel: str) -> str:
@@ -62,12 +69,10 @@ def _overlay_crdt(project_id: str, cap: dict[str, Any]) -> None:
             by_path[rel] = row
 
 
-
 def publish(project_id: str) -> dict[str, Any]:
     """Snapshot collaborative state, write a new release dir, point the slug at it.
 
-    ponytail: copies the whole vendored runtime into each release (~3MB).
-    Ceiling: disk per publish. Upgrade: content-addressed runtime shared by pin.
+    Decision #10: pin runtime version; store asset blobs by hash; text inline in release.
     """
     cap = project_service.capture_workspace(project_id)
     if cap is None:
@@ -90,10 +95,13 @@ def publish(project_id: str) -> dict[str, Any]:
     staging.mkdir(parents=True, exist_ok=False)
 
     asset_base = f"/release/{release_id}"
+    # Shared runtime URL — same registry Preview uses (#10).
+    runtime_base = f"/runtimes/{runtime_name}"
+    asset_map: dict[str, str] = {}
     try:
         for row in cap["files"]:
             rel = row["path"]
-            if rel == "index.html":
+            if rel == "index.html" or rel == _ASSETS_MANIFEST:
                 continue
             content = row["content"]
             if rel.endswith(".md"):
@@ -107,19 +115,26 @@ def publish(project_id: str) -> dict[str, Any]:
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_text(content, encoding="utf-8")
         for row in cap["assets"]:
-            dest = staging / row["path"]
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.write_bytes(row["data"])
+            digest = project_service.store_blob(row["data"])
+            asset_map[row["path"]] = digest
+        (staging / _ASSETS_MANIFEST).write_text(
+            json.dumps(
+                {"runtime": runtime_name, "assets": asset_map},
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
         html = render_presentation_html(
             project_id=project_id,
             index_html=index_html,
             deck_yaml=deck,
             fallback_chapters=fallback_chapters_for(deck, cap.get("slide_path")),
             asset_base=asset_base,
-            runtime_base=f"{asset_base}/runtime",
+            runtime_base=runtime_base,
         )
         (staging / "index.html").write_text(html, encoding="utf-8")
-        shutil.copytree(rt_src, staging / "runtime")
         staging.rename(final)
     except Exception:
         if staging.exists():
@@ -132,6 +147,7 @@ def publish(project_id: str) -> dict[str, Any]:
         "revision": int(cap["revision"]),
         "content_hash": _content_hash(cap["files"], cap["assets"]),
         "runtime": runtime_name,
+        "assets": asset_map,
     }
     try:
         return project_service.commit_release(project_id, record)
@@ -140,8 +156,26 @@ def publish(project_id: str) -> dict[str, Any]:
         raise
 
 
+def _load_asset_map(root: Path) -> dict[str, str]:
+    manifest = root / _ASSETS_MANIFEST
+    if not manifest.is_file():
+        return {}
+    try:
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    assets = data.get("assets") if isinstance(data, dict) else None
+    if not isinstance(assets, dict):
+        return {}
+    out: dict[str, str] = {}
+    for k, v in assets.items():
+        if isinstance(k, str) and isinstance(v, str):
+            out[k] = v
+    return out
+
+
 def read_published(root: Path, rel: str) -> tuple[bytes, str] | None:
-    """Read one file inside a release directory. None if missing."""
+    """Read one file inside a release directory (text) or via content-addressed blob."""
     rel = (rel or "").strip().lstrip("/")
     if rel in ("", "."):
         rel = "index.html"
@@ -153,15 +187,24 @@ def read_published(root: Path, rel: str) -> tuple[bytes, str] | None:
         dest.relative_to(root_r)
     except ValueError as e:
         raise FsRejected(f"invalid release path: {rel!r}") from e
-    if not dest.is_file():
-        return None
-    media, _enc = mimetypes.guess_type(str(dest))
-    if dest.suffix == ".html":
-        media = "text/html; charset=utf-8"
-    elif dest.suffix == ".md":
-        media = "text/markdown; charset=utf-8"
-    elif dest.suffix in (".css",):
-        media = "text/css; charset=utf-8"
-    elif dest.suffix == ".js":
-        media = "text/javascript; charset=utf-8"
-    return dest.read_bytes(), media or "application/octet-stream"
+
+    if dest.is_file():
+        media, _enc = mimetypes.guess_type(str(dest))
+        if dest.suffix == ".html":
+            media = "text/html; charset=utf-8"
+        elif dest.suffix == ".md":
+            media = "text/markdown; charset=utf-8"
+        elif dest.suffix in (".css",):
+            media = "text/css; charset=utf-8"
+        elif dest.suffix == ".js":
+            media = "text/javascript; charset=utf-8"
+        return dest.read_bytes(), media or "application/octet-stream"
+
+    # Content-addressed asset (#10): path → sha256 in assets.json → shared blob store.
+    digest = _load_asset_map(root_r).get(rel)
+    if digest:
+        blob = project_service.read_blob(digest)
+        if blob is not None:
+            media, _enc = mimetypes.guess_type(rel)
+            return blob, media or "application/octet-stream"
+    return None

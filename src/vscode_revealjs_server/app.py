@@ -15,7 +15,12 @@ from vscode_revealjs_server.presentation.runtime import (
     resolve_runtime_file,
 )
 from vscode_revealjs_server.projects import project_service
-from vscode_revealjs_server.projects.service import ROLE_EDITOR, ROLE_VIEWER, FsRejected
+from vscode_revealjs_server.projects.service import (
+    ROLE_EDITOR,
+    ROLE_VIEWER,
+    AssetConflict,
+    FsRejected,
+)
 
 app = FastAPI(title="vscode-revealjs-server")
 
@@ -203,12 +208,26 @@ async def put_asset(
     request: Request,
     user: Annotated[dict[str, str], Depends(require_user)],
     client_id: str | None = Query(default=None),
+    base_revision: int | None = Query(default=None),
+    force: bool = Query(default=False),
 ) -> dict:
-    """Upload / replace a binary asset; bump revision; notify WS peers."""
+    """Upload / replace a binary asset with optimistic concurrency (#9).
+
+    When the path already exists, base_revision must match stored asset revision
+    unless force=true. Mismatch → 409 AssetConflict.
+    """
     _forbid_unless_writer(project_id, user["id"])
     body = await request.body()
     try:
-        rev, info = project_service.put_asset(project_id, asset_path, body)
+        rev, info = project_service.put_asset(
+            project_id,
+            asset_path,
+            body,
+            base_revision=base_revision,
+            force=force,
+        )
+    except AssetConflict as e:
+        raise HTTPException(status_code=409, detail=e.as_dict()) from e
     except FsRejected as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     await manager.notify_asset_changed(
@@ -244,6 +263,7 @@ def get_asset(
         headers={
             "X-Content-Hash": info["content_hash"],
             "X-Asset-Size": str(info["size"]),
+            "X-Asset-Revision": str(info.get("revision", 0)),
         },
     )
 
