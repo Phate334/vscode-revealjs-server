@@ -3,14 +3,34 @@ import { REMOTE_SYNC } from "./origins";
 
 export type CollabStatus = "offline" | "connecting" | "syncing" | "connected";
 
+export type FsOperation = {
+  kind: "create" | "delete" | "rename" | "move" | "mkdir";
+  path?: string;
+  from?: string;
+  to?: string;
+  content?: string;
+};
+
+export type FsOperationEvent = {
+  operation_id: string;
+  revision: number;
+  operation: FsOperation;
+};
+
+export type FsOperationAck = {
+  operation_id: string;
+  revision: number;
+};
+
 const DEFAULT_URL = "ws://127.0.0.1:8000/api/projects/poc/collaboration";
 const PROTOCOL_VERSION = 1;
 // ponytail: exp backoff capped at 30s; upgrade to jittered shared retry policy if many clients stampede.
 const BACKOFF_MS = [1000, 2000, 4000, 8000, 16000, 30000];
+const FS_ACK_TIMEOUT_MS = 10_000;
 
 /**
  * Yjs client over the PoC collaboration WebSocket.
- * Text JSON = hello/ready/ping/pong; binary = opaque Yjs updates.
+ * Text JSON = hello/ready/ping/pong/fs.*; binary = opaque Yjs updates.
  * Dropped sockets auto-reconnect with backoff; hello again + merge on ready.
  */
 export class CollaborationClient {
@@ -29,9 +49,18 @@ export class CollaborationClient {
     resolve: () => void;
     reject: (e: Error) => void;
   }[] = [];
+  private fsAckWaiters = new Map<
+    string,
+    { resolve: (a: FsOperationAck) => void; reject: (e: Error) => void }
+  >();
+  private opSeq = 0;
+  /** Last workspace topology revision from ready / ack / broadcast. */
+  workspaceRevision = 0;
 
   onStatus: ((s: CollabStatus) => void) | undefined;
   onReady: (() => void) | undefined;
+  onFsOperation: ((msg: FsOperationEvent) => void) | undefined;
+  onWorkspaceRevision: ((revision: number) => void) | undefined;
 
   constructor(
     readonly clientId: string,
@@ -107,15 +136,26 @@ export class CollaborationClient {
 
     ws.onmessage = (ev) => {
       if (typeof ev.data === "string") {
-        let msg: { type?: string };
+        let msg: {
+          type?: string;
+          revision?: number;
+          operation_id?: string;
+          operation?: FsOperation;
+          code?: string;
+          message?: string;
+        };
         try {
-          msg = JSON.parse(ev.data) as { type?: string };
+          msg = JSON.parse(ev.data) as typeof msg;
         } catch {
           return;
         }
         if (msg.type === "ready") {
           this.reconnectAttempt = 0;
           this.readyFlushed = false;
+          if (typeof msg.revision === "number") {
+            this.workspaceRevision = msg.revision;
+            this.onWorkspaceRevision?.(msg.revision);
+          }
           this.setStatus("connected");
           this.wireOutgoing();
           // Snapshot binary follows ready. Flush after it, or in 50ms if none
@@ -124,8 +164,49 @@ export class CollaborationClient {
           this.readyFlushTimer = setTimeout(() => this.flushReady(), 50);
         } else if (msg.type === "pong") {
           // ignore
+        } else if (msg.type === "fs.operation_ack") {
+          const id = msg.operation_id;
+          if (id && typeof msg.revision === "number") {
+            const w = this.fsAckWaiters.get(id);
+            if (w) {
+              this.fsAckWaiters.delete(id);
+              this.workspaceRevision = msg.revision;
+              w.resolve({ operation_id: id, revision: msg.revision });
+            }
+          }
+        } else if (msg.type === "fs.operation") {
+          if (
+            msg.operation_id &&
+            typeof msg.revision === "number" &&
+            msg.operation &&
+            typeof msg.operation.kind === "string"
+          ) {
+            this.workspaceRevision = msg.revision;
+            this.onFsOperation?.({
+              operation_id: msg.operation_id,
+              revision: msg.revision,
+              operation: msg.operation,
+            });
+          }
+        } else if (msg.type === "workspace.revision") {
+          if (typeof msg.revision === "number") {
+            this.workspaceRevision = msg.revision;
+            this.onWorkspaceRevision?.(msg.revision);
+          }
         } else if (msg.type === "error") {
-          this.settleConnect(new Error(ev.data));
+          const code = msg.code ?? "";
+          // Reject pending fs ack if server rejected an op (no operation_id on error — fail all? only settle connect).
+          if (code === "fs_rejected" || code === "fs_error" || code === "bad_fs_op") {
+            // Fail oldest waiter — ponytail: errors lack operation_id; single in-flight op assumed.
+            const first = this.fsAckWaiters.keys().next().value;
+            if (first) {
+              const w = this.fsAckWaiters.get(first);
+              this.fsAckWaiters.delete(first);
+              w?.reject(new Error(msg.message ?? ev.data));
+            }
+          } else {
+            this.settleConnect(new Error(ev.data));
+          }
         }
         return;
       }
@@ -152,6 +233,10 @@ export class CollaborationClient {
       this.unsubUpdate = undefined;
       this.ws = undefined;
       this.setStatus("offline");
+      for (const [id, w] of this.fsAckWaiters) {
+        w.reject(new Error("websocket closed"));
+        this.fsAckWaiters.delete(id);
+      }
       if (this.intentionalClose) {
         this.settleConnect(new Error("disconnected"));
         return;
@@ -195,6 +280,44 @@ export class CollaborationClient {
     this.ws.send(update);
   }
 
+  /** Queue an authoritative fs.operation; resolves on fs.operation_ack. */
+  sendFsOperation(
+    operation: FsOperation,
+    baseRevision?: number,
+  ): Promise<FsOperationAck> {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      return Promise.reject(new Error("not connected"));
+    }
+    this.opSeq += 1;
+    const operation_id = `op_${this.clientId}_${this.opSeq}`;
+    const base =
+      typeof baseRevision === "number" ? baseRevision : this.workspaceRevision;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.fsAckWaiters.delete(operation_id);
+        reject(new Error(`fs.operation_ack timeout for ${operation_id}`));
+      }, FS_ACK_TIMEOUT_MS);
+      this.fsAckWaiters.set(operation_id, {
+        resolve: (a) => {
+          clearTimeout(timer);
+          resolve(a);
+        },
+        reject: (e) => {
+          clearTimeout(timer);
+          reject(e);
+        },
+      });
+      this.ws!.send(
+        JSON.stringify({
+          type: "fs.operation",
+          operation_id,
+          base_revision: base,
+          operation,
+        }),
+      );
+    });
+  }
+
   ping(): void {
     if (this.ws?.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify({ type: "ping" }));
@@ -214,6 +337,10 @@ export class CollaborationClient {
     this.readyFlushed = false;
     this.unsubUpdate?.();
     this.unsubUpdate = undefined;
+    for (const [id, w] of this.fsAckWaiters) {
+      w.reject(new Error("disconnected"));
+      this.fsAckWaiters.delete(id);
+    }
     this.ws?.close();
     this.ws = undefined;
     this.reconnectAttempt = 0;

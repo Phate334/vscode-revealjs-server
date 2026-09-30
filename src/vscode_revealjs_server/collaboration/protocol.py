@@ -12,8 +12,13 @@ READY = "ready"
 ERROR = "error"
 PING = "ping"
 PONG = "pong"
+FS_OPERATION = "fs.operation"
+FS_OPERATION_ACK = "fs.operation_ack"
+WORKSPACE_REVISION = "workspace.revision"
 
-CONTROL_TYPES = frozenset({HELLO, READY, ERROR, PING, PONG})
+CONTROL_TYPES = frozenset(
+    {HELLO, READY, ERROR, PING, PONG, FS_OPERATION, FS_OPERATION_ACK, WORKSPACE_REVISION}
+)
 
 
 def encode(msg: dict[str, Any]) -> str:
@@ -28,6 +33,7 @@ def decode(raw: str) -> dict[str, Any]:
 
 
 def ready(*, revision: int, protocol_version: int = PROTOCOL_VERSION) -> dict[str, Any]:
+    # revision = workspace topology revision (project meta), not CRDT update count.
     return {
         "type": READY,
         "protocol_version": protocol_version,
@@ -41,3 +47,30 @@ def error(code: str, message: str) -> dict[str, Any]:
 
 def pong() -> dict[str, Any]:
     return {"type": PONG}
+
+
+def fs_operation_ack(*, operation_id: str, revision: int) -> dict[str, Any]:
+    return {
+        "type": FS_OPERATION_ACK,
+        "operation_id": operation_id,
+        "revision": revision,
+    }
+
+
+def fs_operation_event(
+    *,
+    operation_id: str,
+    revision: int,
+    operation: dict[str, Any],
+) -> dict[str, Any]:
+    """Broadcast framing for peers (same type as client request; includes revision)."""
+    return {
+        "type": FS_OPERATION,
+        "operation_id": operation_id,
+        "revision": revision,
+        "operation": operation,
+    }
+
+
+def workspace_revision(*, revision: int) -> dict[str, Any]:
+    return {"type": WORKSPACE_REVISION, "revision": revision}

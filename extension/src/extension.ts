@@ -11,9 +11,11 @@ import {
   readWorkspaceMeta,
   writeWorkspaceMeta,
 } from "./projectClient";
+import { SyncController } from "./syncController";
 
 let client: CollaborationClient | undefined;
 let binding: SlideBinding | undefined;
+let sync: SyncController | undefined;
 let statusItem: vscode.StatusBarItem | undefined;
 
 function setStatus(s: string): void {
@@ -34,17 +36,33 @@ async function connect(): Promise<void> {
     );
     return;
   }
+  const folder = vscode.workspace.workspaceFolders?.[0]?.uri;
+  if (!folder) {
+    void vscode.window.showErrorMessage("Collab: no workspace folder open");
+    return;
+  }
   const id = `vscode-${vscode.env.sessionId.slice(0, 8)}`;
   const url = collabWsUrl(meta.server, meta.projectId);
   client = new CollaborationClient(id, url);
   client.onStatus = setStatus;
   binding = await bindSlideDocument(client);
+  sync = new SyncController(client, folder, meta.lastKnownRevision);
+  sync.start();
   try {
     await client.connect();
+    // Persist workspace revision from ready if advanced.
+    if (client.workspaceRevision !== meta.lastKnownRevision) {
+      await writeWorkspaceMeta(folder, {
+        ...meta,
+        lastKnownRevision: client.workspaceRevision,
+      });
+    }
     void vscode.window.showInformationMessage(
       `Collab connected as ${id} → ${meta.projectId}`,
     );
   } catch (err) {
+    sync?.dispose();
+    sync = undefined;
     binding?.dispose();
     binding = undefined;
     client.disconnect();
@@ -55,6 +73,8 @@ async function connect(): Promise<void> {
 }
 
 function disconnect(): void {
+  sync?.dispose();
+  sync = undefined;
   binding?.dispose();
   binding = undefined;
   client?.disconnect();
