@@ -50,16 +50,51 @@ class CollaborationRoom:
             self._seed_from_project()
 
     def _seed_from_project(self) -> None:
-        from pycrdt import Text
+        """Seed documents map from workspace text files; migrate legacy content key."""
+        from pycrdt import Map, Text
 
-        text = project_service.collaborative_slide_text(self.project_id)
-        if not text:
+        docs = self.doc.get("documents", type=Map)
+        self._migrate_legacy_content(docs)
+
+        seeded = False
+        for rel in project_service.list_collaborative_text_paths(self.project_id):
+            existing = docs.get(rel)
+            if existing is not None and str(existing):
+                continue
+            body = project_service.read_workspace_text(self.project_id, rel)
+            if body is None:
+                continue
+            if existing is None:
+                ytext = Text()
+                docs[rel] = ytext
+            else:
+                ytext = existing
+            if body and not str(ytext):
+                ytext.insert(0, body)
+                seeded = True
+            elif existing is None:
+                seeded = True
+        if seeded or list(docs.keys()):
+            self.crdt_generation = max(self.crdt_generation, 1)
+            if seeded:
+                self._persist()
+
+    def _migrate_legacy_content(self, docs: object) -> None:
+        """Move single-file PoC Y.Text('content') into documents[slide_path]."""
+        from pycrdt import Map, Text
+
+        assert isinstance(docs, Map)
+        if list(docs.keys()):
             return
-        ytext = self.doc.get("content", type=Text)
-        if str(ytext):
+        legacy = self.doc.get("content", type=Text)
+        body = str(legacy)
+        if not body:
             return
-        ytext.insert(0, text)
-        self.crdt_generation = 1
+        slide = project_service.collaborative_slide_path(self.project_id) or "slide.md"
+        ytext = Text()
+        docs[slide] = ytext
+        ytext.insert(0, body)
+        self.crdt_generation = max(self.crdt_generation, 1)
         self._persist()
 
     def _persist(self) -> None:
@@ -78,14 +113,106 @@ class CollaborationRoom:
             return None
         return update
 
-    def collaborative_text(self) -> str | None:
-        """Current Y.Text('content'); None only when CRDT not yet seeded."""
-        from pycrdt import Text
+    def collaborative_text(self, path: str | None = None) -> str | None:
+        """Y.Text for path (default: primary slide); None if CRDT not seeded / missing."""
+        from pycrdt import Map, Text
 
         if self.crdt_generation <= 0:
             return None
-        ytext = self.doc.get("content", type=Text)
-        return str(ytext)
+        docs = self.doc.get("documents", type=Map)
+        if path is None:
+            path = project_service.collaborative_slide_path(self.project_id)
+            if path is None:
+                # Legacy single-file blob
+                legacy = self.doc.get("content", type=Text)
+                body = str(legacy)
+                return body if body else None
+        got = docs.get(path)
+        if got is None:
+            return None
+        return str(got)
+
+    def collaborative_texts(self) -> dict[str, str]:
+        """All path → text currently in the documents map."""
+        from pycrdt import Map
+
+        if self.crdt_generation <= 0:
+            return {}
+        docs = self.doc.get("documents", type=Map)
+        out: dict[str, str] = {}
+        for key in docs.keys():
+            if isinstance(key, str):
+                out[key] = str(docs[key])
+        return out
+
+    def apply_fs_to_documents(self, operation: dict) -> bytes | None:
+        """Keep documents map aligned with topology create/delete/rename; return yjs update."""
+        from pycrdt import Map, Text
+
+        from vscode_revealjs_server.projects.service import is_collaborative_text_rel
+
+        kind = operation.get("kind")
+        before = self.doc.get_state()
+        docs = self.doc.get("documents", type=Map)
+        changed = False
+
+        if kind == "create":
+            path = operation.get("path")
+            if isinstance(path, str) and is_collaborative_text_rel(path):
+                content = operation.get("content") or ""
+                if not isinstance(content, str):
+                    content = ""
+                existing = docs.get(path)
+                if existing is None:
+                    ytext = Text()
+                    docs[path] = ytext
+                    if content:
+                        ytext.insert(0, content)
+                    changed = True
+                elif not str(existing) and content:
+                    existing.insert(0, content)
+                    changed = True
+        elif kind == "delete":
+            path = operation.get("path")
+            if isinstance(path, str) and path in list(docs.keys()):
+                del docs[path]
+                changed = True
+        elif kind in ("rename", "move"):
+            frm = operation.get("from")
+            to = operation.get("to")
+            if isinstance(frm, str) and isinstance(to, str):
+                keys = list(docs.keys())
+                # File rename
+                if frm in keys:
+                    body = str(docs[frm])
+                    del docs[frm]
+                    if is_collaborative_text_rel(to):
+                        ytext = Text()
+                        docs[to] = ytext
+                        if body:
+                            ytext.insert(0, body)
+                    changed = True
+                else:
+                    # Chapter directory rename: move prefixed keys
+                    prefix = frm + "/"
+                    for key in keys:
+                        if isinstance(key, str) and key.startswith(prefix):
+                            suffix = key[len(prefix) :]
+                            new_key = f"{to}/{suffix}"
+                            body = str(docs[key])
+                            del docs[key]
+                            if is_collaborative_text_rel(new_key):
+                                ytext = Text()
+                                docs[new_key] = ytext
+                                if body:
+                                    ytext.insert(0, body)
+                            changed = True
+
+        if not changed:
+            return None
+        self.crdt_generation += 1
+        self._persist()
+        return self.doc.get_update(before)
 
     async def join(self, ws: WebSocket, client_id: str = "") -> None:
         self.clients.add(ws)
@@ -147,9 +274,13 @@ class CollaborationManager:
             self._rooms[project_id] = CollaborationRoom(project_id)
         return self._rooms[project_id]
 
-    def collaborative_text(self, project_id: str) -> str | None:
-        """Live CRDT text for project (loads persisted blob if room cold)."""
-        return self.room(project_id).collaborative_text()
+    def collaborative_text(self, project_id: str, path: str | None = None) -> str | None:
+        """Live CRDT text for path (default primary slide); loads blob if room cold."""
+        return self.room(project_id).collaborative_text(path)
+
+    def collaborative_texts(self, project_id: str) -> dict[str, str]:
+        """All live CRDT path→text for project."""
+        return self.room(project_id).collaborative_texts()
 
     def _workspace_revision(self, project_id: str) -> int:
         rev = project_service.revision(project_id)
@@ -318,6 +449,10 @@ class CollaborationManager:
             await ws.send_text(
                 proto.encode(proto.fs_operation_ack(operation_id=op_id, revision=rev))
             )
+            # Keep path→Y.Text in sync for Preview/Publish (broadcast before fs event).
+            yupdate = room.apply_fs_to_documents(normalized)
+            if yupdate is not None:
+                await room.broadcast_bytes(yupdate, exclude=None)
             event = proto.encode(
                 proto.fs_operation_event(
                     operation_id=op_id,

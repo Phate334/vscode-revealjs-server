@@ -100,25 +100,7 @@ async function httpJson<T>(url: string, init?: RequestInit): Promise<T> {
 }
 
 
-const BINARY_EXT = new Set([
-  ".png",
-  ".jpg",
-  ".jpeg",
-  ".gif",
-  ".webp",
-  ".svg",
-  ".mp4",
-  ".webm",
-  ".pdf",
-  ".woff",
-  ".woff2",
-]);
-
-export function isBinaryPath(rel: string): boolean {
-  const i = rel.lastIndexOf(".");
-  if (i < 0) return false;
-  return BINARY_EXT.has(rel.slice(i).toLowerCase());
-}
+export { isBinaryPath, isCollaborativeTextPath } from "./textPaths";
 
 export type AssetPutResult = {
   path: string;

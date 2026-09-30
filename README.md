@@ -17,9 +17,15 @@ Acceptance and live checks use the compose endpoint (`localhost:8000`), not host
 
 See `extension/README.md`. Connect URL comes from `.presentation/workspace.json` (`server` + `projectId`); fixtures already include that file.
 
+## Collaborative text (multi-doc)
+
+CRDT model: `path → Y.Text` inside a Yjs/pycrdt `documents` map (not a single slide blob). Bound extensions: `.md`, `.css`, `.html`, `.yaml`/`.yml`, `.json`. Each file has its own UndoManager. Preview/Publish prefer live CRDT text for those paths.
+
+Open Project warns before overwriting existing files in the target folder (Create still uses a new subfolder under the parent you pick).
+
 ## Preview (M2)
 
-Server Preview reads collaborative state (CRDT text + workspace assets), not client disks. **Preview stays open (no Bearer)** so browser Open Preview keeps working:
+Server Preview reads collaborative state (CRDT documents map + workspace assets), not client disks. **Preview stays open (no Bearer)** so browser Open Preview keeps working:
 
 ```text
 GET /p/{project_id}/preview

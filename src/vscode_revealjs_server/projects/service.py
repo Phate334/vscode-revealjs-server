@@ -96,6 +96,21 @@ def is_binary_rel(rel: str) -> bool:
     return Path(rel).suffix.lower() in _BINARY_EXT
 
 
+# Collaborative text CRDT bindings (spec §9; YAGNI subset — not every non-binary).
+_COLLAB_TEXT_EXT = frozenset({".md", ".css", ".html", ".yaml", ".yml", ".json"})
+_COLLAB_IGNORE_PREFIXES = (".presentation/", ".git/", "node_modules/", ".vscode/")
+
+
+def is_collaborative_text_rel(rel: str) -> bool:
+    """True when path should have a Y.Text in the documents map."""
+    n = rel.replace("\\", "/")
+    if any(n == p.rstrip("/") or n.startswith(p) for p in _COLLAB_IGNORE_PREFIXES):
+        return False
+    if is_binary_rel(rel):
+        return False
+    return Path(rel).suffix.lower() in _COLLAB_TEXT_EXT
+
+
 class FsRejected(ValueError):
     """Path / op validation failure for fs.operation."""
 
@@ -275,6 +290,22 @@ class ProjectService:
         if not rel:
             return None
         return self.read_workspace_text(project_id, rel)
+
+    def list_collaborative_text_paths(self, project_id: str) -> list[str]:
+        """Workspace-relative paths eligible for path→Y.Text CRDT binding."""
+        ws = self._workspace(project_id)
+        if not ws.is_dir():
+            return []
+        out: list[str] = []
+        for path in sorted(ws.rglob("*")):
+            if not path.is_file():
+                continue
+            rel = path.relative_to(ws).as_posix()
+            if not _SAFE_REL.match(rel):
+                continue
+            if is_collaborative_text_rel(rel):
+                out.append(rel)
+        return out
 
     def read_workspace_text(self, project_id: str, rel: str) -> str | None:
         """Read utf-8 text from server collaborative workspace disk (not client FS)."""

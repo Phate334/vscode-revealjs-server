@@ -135,6 +135,38 @@ async function pickLocalFolder(openLabel: string): Promise<vscode.Uri | undefine
   return picked?.[0];
 }
 
+
+/** Refuse silent clobber: warn when snapshot paths already exist in the target folder. */
+async function confirmOpenTarget(
+  folder: vscode.Uri,
+  snap: { files: { path: string }[]; assets?: { path: string }[] },
+): Promise<boolean> {
+  const check = [
+    ...snap.files.map((f) => f.path),
+    ...(snap.assets ?? []).map((a) => a.path),
+    ".presentation/workspace.json",
+  ];
+  const conflicts: string[] = [];
+  for (const rel of check) {
+    try {
+      await vscode.workspace.fs.stat(vscode.Uri.joinPath(folder, rel));
+      conflicts.push(rel);
+    } catch {
+      // missing — ok
+    }
+  }
+  if (conflicts.length === 0) return true;
+  const sample = conflicts.slice(0, 5).join(", ");
+  const more = conflicts.length > 5 ? ` (+${conflicts.length - 5} more)` : "";
+  const pick = await vscode.window.showWarningMessage(
+    `Open Project: folder already has ${conflicts.length} file(s) that would be overwritten (${sample}${more}). Continue?`,
+    { modal: true },
+    "Overwrite",
+    "Cancel",
+  );
+  return pick === "Overwrite";
+}
+
 async function cmdCreateProject(): Promise<void> {
   const name = await vscode.window.showInputBox({
     title: "Presentation: Create Project",
@@ -233,6 +265,10 @@ async function openListedProject(title: string, scope: "owned" | "shared"): Prom
   if (!folder) return;
   try {
     const snap = await fetchSnapshot(server, picked.project.id);
+    if (!(await confirmOpenTarget(folder, snap))) {
+      void vscode.window.showInformationMessage("Open Project cancelled — folder not modified");
+      return;
+    }
     await extractSnapshot(folder, snap, server);
     await writeWorkspaceMeta(folder, {
       version: 1,

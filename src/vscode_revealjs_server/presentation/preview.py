@@ -44,14 +44,13 @@ def _chapter_of(rel: str) -> str:
 
 
 def resolve_path(project_id: str, rel: str) -> PreviewBytes | None:
-    """Resolve preview/{rel} from CRDT (bound slide) or collaborative workspace/assets."""
+    """Resolve preview/{rel} from CRDT documents map or collaborative workspace/assets."""
     if not rel or ".." in rel.split("/") or rel.startswith(("/", "\\")):
         raise FsRejected(f"invalid preview path: {rel!r}")
 
     if project_service.get(project_id) is None:
         return None
 
-    slide_rel = project_service.collaborative_slide_path(project_id)
     chapter = _chapter_of(rel)
 
     def maybe_rewrite_md(text: str) -> bytes:
@@ -61,14 +60,12 @@ def resolve_path(project_id: str, rel: str) -> PreviewBytes | None:
             )
         return text.encode("utf-8")
 
-    if slide_rel and rel == slide_rel:
-        crdt = manager.collaborative_text(project_id)
-        if crdt is not None:
+    # Prefer live multi-doc CRDT for any collaborative text path.
+    crdt = manager.collaborative_text(project_id, rel)
+    if crdt is not None:
+        if rel.endswith(".md"):
             return PreviewBytes(maybe_rewrite_md(crdt), "text/markdown; charset=utf-8")
-        disk = project_service.read_workspace_text(project_id, rel)
-        if disk is None:
-            return None
-        return PreviewBytes(maybe_rewrite_md(disk), "text/markdown; charset=utf-8")
+        return PreviewBytes(crdt.encode("utf-8"), _guess_media(rel))
 
     if is_binary_rel(rel):
         got = project_service.get_asset(project_id, rel)

@@ -47,7 +47,8 @@ const FS_ACK_TIMEOUT_MS = 10_000;
  */
 export class CollaborationClient {
   readonly doc = new Y.Doc();
-  readonly ytext: Y.Text;
+  /** path → Y.Text collaborative documents (spec §8.1). */
+  readonly documents: Y.Map<Y.Text>;
   private ws: WebSocket | undefined;
   private status: CollabStatus = "offline";
   private unsubUpdate: (() => void) | undefined;
@@ -87,10 +88,19 @@ export class CollaborationClient {
     readonly url: string,
     lastKnownRevision = 0,
   ) {
-    // Match server/pycrdt key: Doc.get("content", type=Text)
-    this.ytext = this.doc.getText("content");
+    // Match server/pycrdt: Doc.get("documents", type=Map) of Y.Text
+    this.documents = this.doc.getMap("documents");
     this.lastKnownRevision = lastKnownRevision;
     this.workspaceRevision = lastKnownRevision;
+  }
+
+  /** Get or create Y.Text for a collaborative path (shared with server documents map). */
+  getText(path: string): Y.Text {
+    const existing = this.documents.get(path);
+    if (existing) return existing;
+    const ytext = new Y.Text();
+    this.documents.set(path, ytext);
+    return ytext;
   }
 
   getStatus(): CollabStatus {

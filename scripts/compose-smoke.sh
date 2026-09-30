@@ -293,25 +293,121 @@ pass "publish release ${REL1} slug ${SLUG_PATH}"
 if [[ ! -d "${DATA_PROJECTS}/${PID}/workspace" ]]; then
   fail "publish delta needs host project volume ${DATA_PROJECTS}/${PID}/workspace"
 fi
-echo "mutate server workspace disk (not CRDT) then publish again"
-cat > /tmp/smoke-mutate-deck.py << 'DISKPY'
-import sys
+echo "multi-doc: CRDT deck+delta chapter; disk-only slide marker (CRDT wins)"
+# Disk-only clobber of bound slide — Publish must keep CRDT text, not DISK_ONLY_MARKER.
+sudo python3 - <<DISKPY || fail "disk-only slide mutate"
 from pathlib import Path
-ws = Path(sys.argv[1])
+ws = Path("${DATA_PROJECTS}/${PID}/workspace")
+(ws / "01-introduction" / "slide.md").write_text("# DISK_ONLY_MARKER\n", encoding="utf-8")
+print("disk_slide_mutated")
+DISKPY
+# Live CRDT: patch deck.yaml + create 03-delta/slide.md (path→Y.Text + fs.operation).
+uv run python - <<CRDTPY || fail "multi-doc CRDT delta"
+import asyncio, json
+import websockets
+from pycrdt import Doc, Map, Text
+
+PID = "${PID}"
+URI = "${WS_BASE}/api/projects/${PID}/collaboration?access_token=${ACCESS}"
+DELTA_MD = "# DELTA_CHAPTER\n\n![hero](hero.png)\n"
+
+async def main() -> None:
+    doc = Doc()
+    async with websockets.connect(URI) as ws:
+        await ws.send(json.dumps({
+            "type": "hello",
+            "client_id": "smoke-multidoc",
+            "protocol_version": 1,
+            "last_known_revision": 0,
+        }))
+        ready = json.loads(await asyncio.wait_for(ws.recv(), timeout=5))
+        assert ready.get("type") == "ready", ready
+        if ready.get("has_snapshot"):
+            snap = await asyncio.wait_for(ws.recv(), timeout=5)
+            assert isinstance(snap, (bytes, bytearray))
+            doc.apply_update(bytes(snap))
+        docs = doc.get("documents", type=Map)
+        keys = list(docs.keys())
+        assert "deck.yaml" in keys, keys
+        assert any(str(k).endswith("slide.md") for k in keys), keys
+        # Patch deck.yaml in CRDT
+        before = doc.get_state()
+        deck = docs.get("deck.yaml")
+        assert deck is not None
+        cur = str(deck)
+        needle = "  - 01-introduction\n"
+        assert needle in cur, cur
+        if "03-delta" not in cur:
+            # replace whole text via delete+insert
+            deck.clear()
+            deck.insert(0, cur.replace(needle, needle + "  - 03-delta\n", 1))
+        # Ensure delta slide text in documents map
+        if docs.get("03-delta/slide.md") is None:
+            yt = Text()
+            docs["03-delta/slide.md"] = yt
+            yt.insert(0, DELTA_MD)
+        elif not str(docs["03-delta/slide.md"]):
+            docs["03-delta/slide.md"].insert(0, DELTA_MD)
+        upd = doc.get_update(before)
+        if upd and upd != b"\x00\x00":
+            await ws.send(upd)
+        # Topology create so workspace disk has the file for capture
+        await ws.send(json.dumps({
+            "type": "fs.operation",
+            "operation_id": "smoke_delta_mkdir",
+            "base_revision": ready.get("revision", 0),
+            "operation": {"kind": "mkdir", "path": "03-delta"},
+        }))
+        ack = json.loads(await asyncio.wait_for(ws.recv(), timeout=5))
+        # may be fs ack or yjs binary from server — drain until ack
+        rev = ready.get("revision", 0)
+        for _ in range(8):
+            if isinstance(ack, dict) and ack.get("type") == "fs.operation_ack":
+                rev = ack["revision"]
+                break
+            if isinstance(ack, dict) and ack.get("type") == "error":
+                # mkdir may already exist from a prior run — continue
+                if "already exists" in str(ack.get("message", "")):
+                    break
+                raise SystemExit(ack)
+            msg = await asyncio.wait_for(ws.recv(), timeout=5)
+            ack = json.loads(msg) if isinstance(msg, str) else msg
+        await ws.send(json.dumps({
+            "type": "fs.operation",
+            "operation_id": "smoke_delta_create",
+            "base_revision": rev,
+            "operation": {
+                "kind": "create",
+                "path": "03-delta/slide.md",
+                "content": DELTA_MD,
+            },
+        }))
+        for _ in range(8):
+            msg = await asyncio.wait_for(ws.recv(), timeout=5)
+            if isinstance(msg, str):
+                data = json.loads(msg)
+                if data.get("type") == "fs.operation_ack":
+                    break
+                if data.get("type") == "error" and "already exists" in str(data.get("message", "")):
+                    break
+                if data.get("type") == "error":
+                    raise SystemExit(data)
+        print("multidoc_delta_ok", sorted(str(k) for k in docs.keys()))
+
+asyncio.run(main())
+CRDTPY
+# Also keep disk deck in sync for capture baselines (CRDT already has chapter).
+sudo python3 - <<DISKPY || fail "disk deck sync"
+from pathlib import Path
+ws = Path("${DATA_PROJECTS}/${PID}/workspace")
 deck_path = ws / "deck.yaml"
 deck = deck_path.read_text(encoding="utf-8")
 needle = "  - 01-introduction\n"
-if "03-delta" not in deck:
-    if needle not in deck:
-        raise SystemExit("deck missing introduction chapter")
+if "03-delta" not in deck and needle in deck:
     deck_path.write_text(deck.replace(needle, needle + "  - 03-delta\n", 1), encoding="utf-8")
-(ws / "03-delta").mkdir(exist_ok=True)
-(ws / "03-delta" / "slide.md").write_text("# DELTA_CHAPTER\n\n![hero](hero.png)\n", encoding="utf-8")
-(ws / "01-introduction" / "slide.md").write_text("# DISK_ONLY_MARKER\n", encoding="utf-8")
-print("mutated")
+print("disk_deck_synced")
 DISKPY
-MUT="$(sudo python3 /tmp/smoke-mutate-deck.py "${DATA_PROJECTS}/${PID}/workspace")" || fail "mutate workspace"
-echo "${MUT}" | grep -q mutated || fail "mutate output: ${MUT}"
+
 REL2_JSON="$(curl -sfS -X POST "${BASE}/api/projects/${PID}/releases" -H "$(auth_hdr)")" || fail "publish 2"
 REL2="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' <<<"${REL2_JSON}")"
 [[ "${REL2}" != "${REL1}" ]] || fail "release id reused"

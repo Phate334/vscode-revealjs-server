@@ -46,18 +46,21 @@ def _content_hash(files: list[dict[str, str]], assets: list[dict[str, Any]]) -> 
 
 
 def _overlay_crdt(project_id: str, cap: dict[str, Any]) -> None:
-    """Prefer live CRDT text for the bound slide over workspace disk."""
-    slide = cap.get("slide_path")
-    if not isinstance(slide, str) or not slide or is_binary_rel(slide):
+    """Prefer live multi-doc CRDT text over workspace disk for matching paths."""
+    texts = manager.collaborative_texts(project_id)
+    if not texts:
         return
-    crdt = manager.collaborative_text(project_id)
-    if crdt is None:
-        return
-    for row in cap["files"]:
-        if row["path"] == slide:
-            row["content"] = crdt
-            return
-    cap["files"].append({"path": slide, "content": crdt})
+    by_path = {row["path"]: row for row in cap["files"]}
+    for rel, body in texts.items():
+        if is_binary_rel(rel):
+            continue
+        if rel in by_path:
+            by_path[rel]["content"] = body
+        else:
+            row = {"path": rel, "content": body}
+            cap["files"].append(row)
+            by_path[rel] = row
+
 
 
 def publish(project_id: str) -> dict[str, Any]:

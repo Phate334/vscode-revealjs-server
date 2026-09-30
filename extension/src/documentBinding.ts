@@ -3,15 +3,29 @@ import * as Y from "yjs";
 import type { CollaborationClient } from "./collaborationClient";
 import { OriginTracker } from "./originTracker";
 import { FS_RECONCILE, LOCAL_EDITOR } from "./origins";
+import { COLLAB_TEXT_GLOB, isCollaborativeTextPath } from "./textPaths";
 
-const SLIDE_NAME = "slide.md";
 const CONTEXT_KEY = "presentation.collaborativeEditor";
 // ponytail: single-file PoC debounce; raise / coalesce if bulk rewrite loops (open decision #4).
 const WATCHER_DEBOUNCE_MS = 150;
 // ponytail: ~500ms groups keystrokes into one undo step; tune if users want finer/coarser undo.
 const UNDO_CAPTURE_TIMEOUT_MS = 500;
 
-export type SlideBinding = {
+export type DocumentsBinding = {
+  dispose: () => void;
+  undo: () => void;
+  redo: () => void;
+};
+
+type FileBinding = {
+  uri: vscode.Uri;
+  rel: string;
+  doc: vscode.TextDocument;
+  ytext: Y.Text;
+  undoManager: Y.UndoManager;
+  origin: OriginTracker;
+  onDiskEvent: () => void;
+  seedOrPull: () => Promise<void>;
   dispose: () => void;
   undo: () => void;
   redo: () => void;
@@ -49,7 +63,6 @@ function diffSpan(
 function applyTextDiff(doc: Y.Doc, ytext: Y.Text, oldText: string, newText: string): void {
   const span = diffSpan(oldText, newText);
   if (!span) return;
-  // FS_RECONCILE: not tracked by UndoManager (git/shell/agent rewrites stay out of local undo).
   doc.transact(() => {
     const del = span.oldEnd - span.start;
     if (del > 0) ytext.delete(span.start, del);
@@ -57,65 +70,64 @@ function applyTextDiff(doc: Y.Doc, ytext: Y.Text, oldText: string, newText: stri
   }, FS_RECONCILE);
 }
 
-/** Find collaborative slide.md: prefer nested chapter path, else root, else first match. */
-async function findSlideUri(): Promise<vscode.Uri | undefined> {
-  const folders = vscode.workspace.workspaceFolders;
-  if (!folders?.length) return undefined;
-  const folder = folders[0];
-  // Nested chapter first (Create Project template: 01-introduction/slide.md).
-  const nested = await vscode.workspace.findFiles(
-    new vscode.RelativePattern(folder, `*/${SLIDE_NAME}`),
-    "**/node_modules/**",
-    1,
-  );
-  if (nested[0]) return nested[0];
-  const root = vscode.Uri.joinPath(folder.uri, SLIDE_NAME);
-  try {
-    await vscode.workspace.fs.stat(root);
-    return root;
-  } catch {
-    // not at root
-  }
-  const hits = await vscode.workspace.findFiles(
-    new vscode.RelativePattern(folder, `**/${SLIDE_NAME}`),
-    "**/node_modules/**",
-    1,
-  );
-  return hits[0];
+function applyTextDiffAsLocal(ydoc: Y.Doc, yt: Y.Text, oldText: string, newText: string): void {
+  const span = diffSpan(oldText, newText);
+  if (!span) return;
+  ydoc.transact(() => {
+    const del = span.oldEnd - span.start;
+    if (del > 0) yt.delete(span.start, del);
+    if (span.newEnd > span.start) yt.insert(span.start, newText.slice(span.start, span.newEnd));
+  }, LOCAL_EDITOR);
 }
 
-/**
- * Bind one slide.md to client.ytext.
- * Init assumes ready/snapshot barrier already passed (H2) — seedOrPull runs immediately,
- * and onReady re-seeds after reconnect.
- *
- * Local edits → Y.Text (LOCAL_EDITOR); remote Y→editor = minimal diff (H4), serialized (H3);
- * OriginTracker only wraps the WorkspaceEdit — genuine concurrent local edits are recovered.
- * Nested slide.md watcher (H5).
- */
-export async function bindSlideDocument(client: CollaborationClient): Promise<SlideBinding> {
-  const uri = await findSlideUri();
-  if (!uri) {
-    void vscode.window.showWarningMessage(`Collab: no ${SLIDE_NAME} in workspace`);
-    return {
-      dispose: () => undefined,
-      undo: () => undefined,
-      redo: () => undefined,
-    };
-  }
+function relPath(folder: vscode.Uri, uri: vscode.Uri): string | undefined {
+  const root = folder.fsPath.replace(/[/\\]+$/, "");
+  const full = uri.fsPath;
+  if (!full.startsWith(root)) return undefined;
+  const rel = full.slice(root.length).replace(/^[/\\]+/, "").replace(/\\/g, "/");
+  return rel || undefined;
+}
 
-  const doc = await vscode.workspace.openTextDocument(uri);
-  await vscode.window.showTextDocument(doc, { preview: false });
+async function findCollaborativeUris(folder: vscode.Uri): Promise<vscode.Uri[]> {
+  const hits = await vscode.workspace.findFiles(
+    new vscode.RelativePattern(folder, COLLAB_TEXT_GLOB),
+    "{**/node_modules/**,**/.git/**,**/.presentation/**,**/.vscode/**}",
+    200,
+  );
+  return hits.filter((uri) => {
+    const rel = relPath(folder, uri);
+    return !!rel && isCollaborativeTextPath(rel);
+  });
+}
+
+/** Prefer nested chapter slide.md, else root slide.md, else first markdown. */
+function pickPrimaryUri(folder: vscode.Uri, uris: vscode.Uri[]): vscode.Uri | undefined {
+  const rels = uris.map((u) => ({ uri: u, rel: relPath(folder, u) || "" }));
+  const nested = rels.find((r) => /^[^/]+\/slide\.md$/.test(r.rel));
+  if (nested) return nested.uri;
+  const root = rels.find((r) => r.rel === "slide.md");
+  if (root) return root.uri;
+  return uris[0];
+}
+
+function bindOneFile(
+  client: CollaborationClient,
+  folder: vscode.Uri,
+  uri: vscode.Uri,
+  doc: vscode.TextDocument,
+): FileBinding {
+  const rel = relPath(folder, uri);
+  if (!rel) {
+    throw new Error(`Collab: uri outside workspace: ${uri.fsPath}`);
+  }
   const origin = new OriginTracker();
-  const ytext = client.ytext;
+  const ytext = client.getText(rel);
   const undoManager = new Y.UndoManager(ytext, {
     trackedOrigins: new Set([LOCAL_EDITOR]),
     captureTimeout: UNDO_CAPTURE_TIMEOUT_MS,
   });
 
-  /** Serialize Y→editor / native-undo reconcile (H3). */
   let applyChain: Promise<void> = Promise.resolve();
-  /** After remote markRemote ends, push any genuine local text that arrived during apply. */
   let recoverLocalAfterRemote = false;
 
   const enqueueApply = (fn: () => Promise<void>): Promise<void> => {
@@ -123,7 +135,6 @@ export async function bindSlideDocument(client: CollaborationClient): Promise<Sl
     return applyChain;
   };
 
-  /** Core Y→editor apply (must run on applyChain). */
   const applyYToEditorCore = async (): Promise<void> => {
     const next = ytext.toString();
     const prev = doc.getText();
@@ -135,7 +146,6 @@ export async function bindSlideDocument(client: CollaborationClient): Promise<Sl
     edit.replace(uri, range, next.slice(span.start, span.newEnd));
     recoverLocalAfterRemote = false;
     await origin.markRemote(() => vscode.workspace.applyEdit(edit));
-    // If a local keystroke landed while markRemote was set, recover it into Y.
     if (recoverLocalAfterRemote) {
       recoverLocalAfterRemote = false;
       const editorNow = doc.getText();
@@ -146,25 +156,12 @@ export async function bindSlideDocument(client: CollaborationClient): Promise<Sl
     }
   };
 
-  /** Y.Text → editor via prefix/suffix WorkspaceEdit (H4 — no whole-doc replace). */
   const applyYToEditor = (): Promise<void> => enqueueApply(() => applyYToEditorCore());
-
-  /** Genuine local text that arrived during remote apply → LOCAL_EDITOR (not discarded). */
-  function applyTextDiffAsLocal(ydoc: Y.Doc, yt: Y.Text, oldText: string, newText: string): void {
-    const span = diffSpan(oldText, newText);
-    if (!span) return;
-    ydoc.transact(() => {
-      const del = span.oldEnd - span.start;
-      if (del > 0) yt.delete(span.start, del);
-      if (span.newEnd > span.start) yt.insert(span.start, newText.slice(span.start, span.newEnd));
-    }, LOCAL_EDITOR);
-  }
 
   const seedOrPull = async () => {
     const fileText = doc.getText();
     const remote = ytext.toString();
     if (remote.length === 0 && fileText.length > 0) {
-      // Seed empty CRDT from local file (null origin → not undo-tracked).
       ytext.insert(0, fileText);
       return;
     }
@@ -172,16 +169,6 @@ export async function bindSlideDocument(client: CollaborationClient): Promise<Sl
       await applyYToEditor();
     }
   };
-
-  // H2: bind after ready barrier — seed immediately; keep onReady for reconnect.
-  const prevReady = client.onReady;
-  client.onReady = () => {
-    prevReady?.();
-    void seedOrPull();
-  };
-  if (client.getStatus() === "connected") {
-    await seedOrPull();
-  }
 
   const yObserver = () => {
     void applyYToEditor();
@@ -192,13 +179,10 @@ export async function bindSlideDocument(client: CollaborationClient): Promise<Sl
     if (e.document.uri.toString() !== uri.toString()) return;
 
     if (origin.isRemote()) {
-      // H3: do not swallow genuine local edits during remote apply.
-      // Echo of our WorkspaceEdit leaves editor == ytext; concurrent typing diverges.
       recoverLocalAfterRemote = true;
       return;
     }
 
-    // Safety: native Undo/Redo must not push VS Code state into Yjs.
     if (e.reason === vscode.TextDocumentChangeReason.Undo) {
       void enqueueApply(async () => {
         undoManager.undo();
@@ -214,7 +198,6 @@ export async function bindSlideDocument(client: CollaborationClient): Promise<Sl
       return;
     }
 
-    // Apply VS Code deltas onto Y.Text (reverse order keeps offsets valid).
     const changes = [...e.contentChanges].sort((a, b) => b.rangeOffset - a.rangeOffset);
     client.doc.transact(() => {
       for (const c of changes) {
@@ -224,24 +207,8 @@ export async function bindSlideDocument(client: CollaborationClient): Promise<Sl
     }, LOCAL_EDITOR);
   });
 
-  const updateContext = () => {
-    const ed = vscode.window.activeTextEditor;
-    const on = !!(ed && ed.document.uri.toString() === uri.toString());
-    void vscode.commands.executeCommand("setContext", CONTEXT_KEY, on);
-  };
-  updateContext();
-  const ctxSub = vscode.window.onDidChangeActiveTextEditor(updateContext);
-
   let watchTimer: ReturnType<typeof setTimeout> | undefined;
-  const folder = vscode.workspace.getWorkspaceFolder(uri);
-  // H5: watch all nested slide.md under the workspace folder (bound uri filtered below).
-  const pattern = folder
-    ? new vscode.RelativePattern(folder, `**/${SLIDE_NAME}`)
-    : new vscode.RelativePattern(vscode.Uri.joinPath(uri, ".."), SLIDE_NAME);
-  const watcher = vscode.workspace.createFileSystemWatcher(pattern);
-
-  const onDiskEvent = (eventUri: vscode.Uri) => {
-    if (eventUri.toString() !== uri.toString()) return;
+  const onDiskEvent = () => {
     if (origin.isRemote()) return;
     if (watchTimer) clearTimeout(watchTimer);
     watchTimer = setTimeout(() => {
@@ -255,26 +222,26 @@ export async function bindSlideDocument(client: CollaborationClient): Promise<Sl
           if (diskText === crdtText) return;
           applyTextDiff(client.doc, ytext, crdtText, diskText);
         } catch {
-          // deleted / unreadable — PoC ignores
+          // deleted / unreadable
         }
       })();
     }, WATCHER_DEBOUNCE_MS);
   };
 
-  const wChange = watcher.onDidChange(onDiskEvent);
-  const wCreate = watcher.onDidCreate(onDiskEvent);
-
   return {
+    uri,
+    rel,
+    doc,
+    ytext,
+    undoManager,
+    origin,
+    onDiskEvent,
+    seedOrPull,
     dispose: () => {
       ytext.unobserve(yObserver);
       undoManager.destroy();
       changeSub.dispose();
-      ctxSub.dispose();
-      void vscode.commands.executeCommand("setContext", CONTEXT_KEY, false);
       if (watchTimer) clearTimeout(watchTimer);
-      wChange.dispose();
-      wCreate.dispose();
-      watcher.dispose();
     },
     undo: () => {
       void enqueueApply(async () => {
@@ -290,3 +257,125 @@ export async function bindSlideDocument(client: CollaborationClient): Promise<Sl
     },
   };
 }
+
+/**
+ * Bind all collaborative text files (path → Y.Text) with per-file UndoManager.
+ * Init assumes ready/snapshot barrier already passed (H2).
+ */
+export async function bindCollaborativeDocuments(
+  client: CollaborationClient,
+): Promise<DocumentsBinding> {
+  const folder = vscode.workspace.workspaceFolders?.[0]?.uri;
+  if (!folder) {
+    void vscode.window.showWarningMessage("Collab: no workspace folder");
+    return { dispose: () => undefined, undo: () => undefined, redo: () => undefined };
+  }
+
+  const bindings = new Map<string, FileBinding>();
+
+  const bindUri = async (uri: vscode.Uri, show = false): Promise<void> => {
+    const rel = relPath(folder, uri);
+    if (!rel || !isCollaborativeTextPath(rel)) return;
+    if (bindings.has(rel)) return;
+    const doc = await vscode.workspace.openTextDocument(uri);
+    if (show) {
+      await vscode.window.showTextDocument(doc, { preview: false });
+    }
+    const binding = bindOneFile(client, folder, uri, doc);
+    bindings.set(rel, binding);
+    if (client.getStatus() === "connected") {
+      await binding.seedOrPull();
+    }
+  };
+
+  const uris = await findCollaborativeUris(folder);
+  const primary = pickPrimaryUri(folder, uris);
+  for (const uri of uris) {
+    await bindUri(uri, primary !== undefined && uri.toString() === primary.toString());
+  }
+  if (uris.length === 0) {
+    void vscode.window.showWarningMessage("Collab: no collaborative text files in workspace");
+  }
+
+  // H2: seed after ready; keep onReady for reconnect.
+  const prevReady = client.onReady;
+  client.onReady = () => {
+    prevReady?.();
+    for (const b of bindings.values()) {
+      void b.seedOrPull();
+    }
+  };
+  if (client.getStatus() === "connected") {
+    for (const b of bindings.values()) {
+      void b.seedOrPull();
+    }
+  }
+
+  const updateContext = () => {
+    const ed = vscode.window.activeTextEditor;
+    let on = false;
+    if (ed) {
+      const rel = relPath(folder, ed.document.uri);
+      on = !!(rel && bindings.has(rel));
+    }
+    void vscode.commands.executeCommand("setContext", CONTEXT_KEY, on);
+  };
+  updateContext();
+  const ctxSub = vscode.window.onDidChangeActiveTextEditor(updateContext);
+
+  const watcher = vscode.workspace.createFileSystemWatcher(
+    new vscode.RelativePattern(folder, COLLAB_TEXT_GLOB),
+  );
+
+  const onDisk = (eventUri: vscode.Uri) => {
+    const rel = relPath(folder, eventUri);
+    if (!rel || !isCollaborativeTextPath(rel)) return;
+    const b = bindings.get(rel);
+    if (b) {
+      b.onDiskEvent();
+      return;
+    }
+    void bindUri(eventUri, false);
+  };
+
+  const wChange = watcher.onDidChange(onDisk);
+  const wCreate = watcher.onDidCreate(onDisk);
+
+  // Observe documents map for remote-created paths (server fs→CRDT).
+  const mapObserver = (event: Y.YMapEvent<Y.Text>) => {
+    event.keysChanged.forEach((key) => {
+      if (bindings.has(key)) return;
+      if (!isCollaborativeTextPath(key)) return;
+      const uri = vscode.Uri.joinPath(folder, key);
+      void bindUri(uri, false);
+    });
+  };
+  client.documents.observe(mapObserver);
+
+  const activeBinding = (): FileBinding | undefined => {
+    const ed = vscode.window.activeTextEditor;
+    if (!ed) return undefined;
+    const rel = relPath(folder, ed.document.uri);
+    return rel ? bindings.get(rel) : undefined;
+  };
+
+  return {
+    dispose: () => {
+      client.documents.unobserve(mapObserver);
+      client.onReady = prevReady;
+      for (const b of bindings.values()) b.dispose();
+      bindings.clear();
+      ctxSub.dispose();
+      void vscode.commands.executeCommand("setContext", CONTEXT_KEY, false);
+      wChange.dispose();
+      wCreate.dispose();
+      watcher.dispose();
+    },
+    undo: () => activeBinding()?.undo(),
+    redo: () => activeBinding()?.redo(),
+  };
+}
+
+/** @deprecated alias — prefer bindCollaborativeDocuments */
+export const bindSlideDocument = bindCollaborativeDocuments;
+export type SlideBinding = DocumentsBinding;
