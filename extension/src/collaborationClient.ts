@@ -22,6 +22,9 @@ export class CollaborationClient {
   private intentionalClose = false;
   private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   private reconnectAttempt = 0;
+  // ponytail: ready fires before optional snapshot binary; wait briefly or until first update.
+  private readyFlushTimer: ReturnType<typeof setTimeout> | undefined;
+  private readyFlushed = false;
   private connectWaiters: {
     resolve: () => void;
     reject: (e: Error) => void;
@@ -70,6 +73,18 @@ export class CollaborationClient {
     }
   }
 
+  private flushReady(): void {
+    if (this.readyFlushed) return;
+    this.readyFlushed = true;
+    if (this.readyFlushTimer) {
+      clearTimeout(this.readyFlushTimer);
+      this.readyFlushTimer = undefined;
+    }
+    this.pushFullState();
+    this.onReady?.();
+    this.settleConnect();
+  }
+
   private openSocket(): void {
     if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
       return;
@@ -100,12 +115,13 @@ export class CollaborationClient {
         }
         if (msg.type === "ready") {
           this.reconnectAttempt = 0;
+          this.readyFlushed = false;
           this.setStatus("connected");
           this.wireOutgoing();
-          // Snapshot binary follows ready; push local state after it merges.
-          queueMicrotask(() => this.pushFullState());
-          this.onReady?.();
-          this.settleConnect();
+          // Snapshot binary follows ready. Flush after it, or in 50ms if none
+          // (empty room). Avoids seedOrPull duplicating into a late snapshot.
+          if (this.readyFlushTimer) clearTimeout(this.readyFlushTimer);
+          this.readyFlushTimer = setTimeout(() => this.flushReady(), 50);
         } else if (msg.type === "pong") {
           // ignore
         } else if (msg.type === "error") {
@@ -115,6 +131,9 @@ export class CollaborationClient {
       }
       const buf = ev.data instanceof ArrayBuffer ? new Uint8Array(ev.data) : new Uint8Array(ev.data as ArrayBuffer);
       Y.applyUpdate(this.doc, buf, REMOTE_ORIGIN);
+      if (!this.readyFlushed && this.readyFlushTimer) {
+        this.flushReady();
+      }
     };
 
     ws.onerror = () => {
@@ -125,6 +144,9 @@ export class CollaborationClient {
     };
 
     ws.onclose = () => {
+      // ponytail: ignore close from a superseded socket so reconnect race
+      // doesn't clear the live ws / stick status at offline (open decision #7 framing).
+      if (this.ws !== ws) return;
       this.unsubUpdate?.();
       this.unsubUpdate = undefined;
       this.ws = undefined;
@@ -184,6 +206,11 @@ export class CollaborationClient {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = undefined;
     }
+    if (this.readyFlushTimer) {
+      clearTimeout(this.readyFlushTimer);
+      this.readyFlushTimer = undefined;
+    }
+    this.readyFlushed = false;
     this.unsubUpdate?.();
     this.unsubUpdate = undefined;
     this.ws?.close();
