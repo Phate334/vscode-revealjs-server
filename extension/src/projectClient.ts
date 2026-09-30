@@ -20,6 +20,8 @@ export type Snapshot = {
   project_id: string;
   name: string;
   revision: number;
+  /** Workspace content fingerprint (B4); optional for older servers. */
+  content_hash?: string;
   directories: string[];
   files: { path: string; content: string }[];
   assets: { path: string; content_hash: string; size: number }[];

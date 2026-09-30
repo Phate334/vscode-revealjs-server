@@ -8,10 +8,18 @@ import {
 } from "./projectClient";
 import type { OriginTracker } from "./originTracker";
 
+const IGNORE_PREFIXES = [".presentation/", ".git/", "node_modules/", ".vscode/"];
+
+function shouldIgnore(rel: string): boolean {
+  const n = rel.replace(/\\/g, "/");
+  return IGNORE_PREFIXES.some((p) => n === p.slice(0, -1) || n.startsWith(p));
+}
+
 /**
- * Apply server snapshot onto local folder under remote/reconcile origin.
- * Text CRDT-bound paths (slide.md) are skipped so Yjs merge stays authoritative;
- * disk for those is left for Document Binding / FS_RECONCILE after.
+ * Apply server snapshot as authoritative workspace-diff (B3):
+ * - write/update all snapshot files + assets (including chapter slide.md)
+ * - delete local files/dirs not present on server (except ignore prefixes)
+ * - CRDT-bound text converges via disk watcher → FS_RECONCILE (not LOCAL_EDITOR)
  *
  * ponytail: open-decision #10 — JSON manifest + per-asset GET (no archive).
  * Ceiling: large asset fan-out. Upgrade: tar/zip bundle (M3).
@@ -23,24 +31,52 @@ export async function pullAndApplySnapshot(
   origin: OriginTracker,
   suppressPaths: Set<string>,
   meta?: WorkspaceMeta,
+  /** Optional: currently bound CRDT path — content still written; binding picks up via FS_RECONCILE. */
+  _boundCrdtPath?: string,
 ): Promise<Snapshot> {
-  const snap = await fetchSnapshot(server, projectId);
-  const touched: string[] = [];
-  for (const d of snap.directories) touched.push(d);
-  for (const f of snap.files) touched.push(f.path);
-  for (const a of snap.assets ?? []) if (a?.path) touched.push(a.path);
+  let snap = await fetchSnapshot(server, projectId);
+  // B4 client side: if server revision moved between fetches, take the newer full snap once.
+  const again = await fetchSnapshot(server, projectId);
+  if (
+    again.revision !== snap.revision ||
+    (again.content_hash && snap.content_hash && again.content_hash !== snap.content_hash)
+  ) {
+    snap = again;
+  }
+
+  const serverFiles = new Set(snap.files.map((f) => f.path.replace(/\\/g, "/")));
+  const serverAssets = new Set((snap.assets ?? []).map((a) => a.path.replace(/\\/g, "/")));
+  const serverDirs = new Set(snap.directories.map((d) => d.replace(/\\/g, "/")));
+  const serverPaths = new Set<string>([...serverFiles, ...serverAssets, ...serverDirs]);
+
+  const localEntries = await listLocalRelPaths(folder);
+  const toDelete = localEntries
+    .filter((rel) => !shouldIgnore(rel) && !serverPaths.has(rel))
+    // Delete files before parent dirs: longer paths first.
+    .sort((a, b) => b.length - a.length);
+
+  const touched = new Set<string>([
+    ...serverPaths,
+    ...toDelete,
+  ]);
   for (const p of touched) suppressPaths.add(p);
 
   try {
     await origin.markRemote(async () => {
-      // Skip collaborative slide.md content — CRDT owns text; avoid UndoManager pollution.
-      const filtered: Snapshot = {
-        ...snap,
-        files: snap.files.filter((f) => !isCrdtBoundPath(f.path)),
-      };
-      await extractSnapshot(folder, filtered, server);
+      // Deletes first so rename-as-delete+create and orphan cleanup stick.
+      for (const rel of toDelete) {
+        try {
+          await vscode.workspace.fs.delete(vscode.Uri.joinPath(folder, rel), {
+            recursive: true,
+            useTrash: false,
+          });
+        } catch {
+          // already gone
+        }
+      }
+      // Full extract including all slide.md (no blanket CRDT skip — B3).
+      await extractSnapshot(folder, snap, server);
     });
-    // Hold suppress — VS Code may emit create/change after writes.
     await new Promise((r) => setTimeout(r, 300));
   } finally {
     for (const p of touched) suppressPaths.delete(p);
@@ -55,10 +91,34 @@ export async function pullAndApplySnapshot(
   return snap;
 }
 
-/** Bound collaborative text paths (root or chapter slide.md). */
+/** Bound collaborative text paths (root or chapter slide.md). Kept for callers. */
 export function isCrdtBoundPath(rel: string): boolean {
   const n = rel.replace(/\\/g, "/");
   return n === "slide.md" || n.endsWith("/slide.md");
+}
+
+async function listLocalRelPaths(folder: vscode.Uri): Promise<string[]> {
+  const out: string[] = [];
+  async function walk(dir: vscode.Uri, prefix: string): Promise<void> {
+    let entries: [string, vscode.FileType][];
+    try {
+      entries = await vscode.workspace.fs.readDirectory(dir);
+    } catch {
+      return;
+    }
+    for (const [name, type] of entries) {
+      const rel = prefix ? `${prefix}/${name}` : name;
+      if (shouldIgnore(rel)) continue;
+      if (type & vscode.FileType.Directory) {
+        out.push(rel);
+        await walk(vscode.Uri.joinPath(dir, name), rel);
+      } else if (type & vscode.FileType.File) {
+        out.push(rel);
+      }
+    }
+  }
+  await walk(folder, "");
+  return out;
 }
 
 /**

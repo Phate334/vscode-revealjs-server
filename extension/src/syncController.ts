@@ -6,6 +6,12 @@ import type {
   ReconcileRequiredEvent,
 } from "./collaborationClient";
 import { OriginTracker } from "./originTracker";
+import {
+  appendJournal,
+  clearJournal,
+  loadJournal,
+  type JournalEntry,
+} from "./offlineJournal";
 import { getAsset, isBinaryPath, putAsset, type WorkspaceMeta } from "./projectClient";
 import {
   BULK_EVENT_THRESHOLD,
@@ -35,12 +41,18 @@ function relPath(folder: vscode.Uri, uri: vscode.Uri): string | undefined {
  * remote fs.operation / asset.changed → apply with origin mark (echo suppress);
  * revision gap / bulk local change → snapshot reconcile (FS_RECONCILE, not UndoManager).
  *
+ * B1: serialize local sends + ordered remote applies (skip stale rev).
+ * B2: durable offline journal; flush on reconnect.
+ * B5: external single create/delete sync (not only ≥8 bulk).
+ *
  * H2: startRemoteHandlers before connect; startLocalWatchers after ready + document bind.
  */
 export class SyncController {
   private readonly origin = new OriginTracker();
   /** Paths suppressed while / shortly after remote apply (async FS event echo). */
   private readonly suppressPaths = new Set<string>();
+  /** Paths recently handled by VS Code workspace FS events (dedupe external watcher). */
+  private readonly recentApiPaths = new Map<string, number>();
   private readonly disposables: vscode.Disposable[] = [];
   private workspaceRevision: number;
   private disposed = false;
@@ -52,6 +64,13 @@ export class SyncController {
   private meta: WorkspaceMeta | undefined;
   private localStarted = false;
 
+  /** B1: one in-flight local send; FIFO queue. */
+  private sendChain: Promise<void> = Promise.resolve();
+  /** B1: ordered remote apply; skip rev <= lastAppliedRemoteRev. */
+  private remoteChain: Promise<void> = Promise.resolve();
+  private lastAppliedRemoteRev = 0;
+  private flushingJournal = false;
+
   constructor(
     private readonly client: CollaborationClient,
     private readonly folder: vscode.Uri,
@@ -61,25 +80,38 @@ export class SyncController {
     meta?: WorkspaceMeta,
   ) {
     this.workspaceRevision = initialRevision;
+    this.lastAppliedRemoteRev = initialRevision;
     this.meta = meta;
   }
 
   /** Register WS handlers before connect so reconcile_required is not missed. */
   startRemoteHandlers(): void {
     this.client.onFsOperation = (msg) => {
-      if (this.reconciling) return;
-      void this.applyRemote(msg.operation, msg.revision);
+      this.enqueueRemote(async () => {
+        if (this.reconciling) return;
+        if (msg.revision <= this.lastAppliedRemoteRev) return;
+        await this.applyRemote(msg.operation, msg.revision);
+      });
     };
     this.client.onWorkspaceRevision = (rev) => {
-      this.workspaceRevision = rev;
-      this.client.lastKnownRevision = rev;
+      this.workspaceRevision = Math.max(this.workspaceRevision, rev);
+      this.client.lastKnownRevision = this.workspaceRevision;
     };
     this.client.onAssetChanged = (msg) => {
-      if (this.reconciling) return;
-      void this.applyRemoteAsset(msg);
+      this.enqueueRemote(async () => {
+        if (this.reconciling) return;
+        if (msg.revision <= this.lastAppliedRemoteRev) return;
+        await this.applyRemoteAsset(msg);
+      });
     };
     this.client.onReconcileRequired = (msg) => {
       void this.onReconcileRequired(msg);
+    };
+    // B2: flush offline journal after ready/reconnect barrier.
+    const prevReady = this.client.onReady;
+    this.client.onReady = () => {
+      prevReady?.();
+      void this.flushOfflineJournal();
     };
   }
 
@@ -90,15 +122,25 @@ export class SyncController {
     this.disposables.push(
       vscode.workspace.onDidCreateFiles((e) => {
         if (this.origin.isRemote() || this.reconciling) return;
-        for (const uri of e.files) void this.onLocalCreate(uri);
+        for (const uri of e.files) {
+          this.markApiPath(uri);
+          void this.onLocalCreate(uri);
+        }
       }),
       vscode.workspace.onDidDeleteFiles((e) => {
         if (this.origin.isRemote() || this.reconciling) return;
-        for (const uri of e.files) void this.onLocalDelete(uri);
+        for (const uri of e.files) {
+          this.markApiPath(uri);
+          void this.onLocalDelete(uri);
+        }
       }),
       vscode.workspace.onDidRenameFiles((e) => {
         if (this.origin.isRemote() || this.reconciling) return;
-        for (const f of e.files) void this.onLocalRename(f.oldUri, f.newUri);
+        for (const f of e.files) {
+          this.markApiPath(f.oldUri);
+          this.markApiPath(f.newUri);
+          void this.onLocalRename(f.oldUri, f.newUri);
+        }
       }),
     );
 
@@ -113,18 +155,39 @@ export class SyncController {
       }),
     );
 
-    // External bulk (git checkout/merge): VS Code onDidCreateFiles does not fire for
-    // shell/git FS changes — watch create/delete and trip bulk → FS_RECONCILE.
+    // External FS (shell/git): VS Code onDidCreateFiles does not fire — watch create/delete.
+    // B5: single create/delete sync; bulk (≥8/2s) still → FS_RECONCILE.
     const topo = vscode.workspace.createFileSystemWatcher(
       new vscode.RelativePattern(this.folder, "**/*"),
     );
-    const onExternalTopo = (uri: vscode.Uri) => {
+    const onExternalCreate = (uri: vscode.Uri) => {
       if (this.origin.isRemote() || this.reconciling) return;
       const rel = relPath(this.folder, uri);
       if (!rel || shouldIgnore(rel) || this.suppressPaths.has(rel)) return;
+      if (this.wasApiPath(rel)) return;
       this.noteLocalTopologyEvent();
+      if (this.reconciling) return;
+      void this.onLocalCreate(uri);
     };
-    this.disposables.push(topo, topo.onDidCreate(onExternalTopo), topo.onDidDelete(onExternalTopo));
+    const onExternalDelete = (uri: vscode.Uri) => {
+      if (this.origin.isRemote() || this.reconciling) return;
+      const rel = relPath(this.folder, uri);
+      if (!rel || shouldIgnore(rel) || this.suppressPaths.has(rel)) return;
+      if (this.wasApiPath(rel)) return;
+      this.noteLocalTopologyEvent();
+      if (this.reconciling) return;
+      void this.onLocalDelete(uri);
+    };
+    this.disposables.push(
+      topo,
+      topo.onDidCreate(onExternalCreate),
+      topo.onDidDelete(onExternalDelete),
+    );
+
+    // Flush any journal left from previous session once connected.
+    if (this.client.getStatus() === "connected") {
+      void this.flushOfflineJournal();
+    }
   }
 
   dispose(): void {
@@ -157,11 +220,14 @@ export class SyncController {
         this.meta,
       );
       this.workspaceRevision = snap.revision;
+      this.lastAppliedRemoteRev = snap.revision;
       this.client.lastKnownRevision = snap.revision;
       this.client.workspaceRevision = snap.revision;
       if (this.meta) {
         this.meta = { ...this.meta, lastKnownRevision: snap.revision };
       }
+      // Server state is authoritative — drop pending offline ops that would fight it.
+      await clearJournal(this.folder);
       void vscode.window.showInformationMessage(
         `Collab reconciled @ rev ${snap.revision} (${reason})`,
       );
@@ -182,6 +248,8 @@ export class SyncController {
 
   /** Record a local topology event; trigger reconcile on bulk burst. */
   private noteLocalTopologyEvent(): void {
+    // Offline: journal only — bulk snapshot reconcile would delete unsynced local ops (B2).
+    if (!this.clientIsOpen()) return;
     const now = Date.now();
     this.bulkTimestamps.push(now);
     this.bulkTimestamps = this.bulkTimestamps.filter((t) => now - t <= BULK_WINDOW_MS);
@@ -191,38 +259,80 @@ export class SyncController {
     }
   }
 
+  private markApiPath(uri: vscode.Uri): void {
+    const rel = relPath(this.folder, uri);
+    if (rel) this.recentApiPaths.set(rel, Date.now());
+  }
+
+  private wasApiPath(rel: string): boolean {
+    const t = this.recentApiPaths.get(rel);
+    if (t === undefined) return false;
+    if (Date.now() - t > 800) {
+      this.recentApiPaths.delete(rel);
+      return false;
+    }
+    return true;
+  }
+
+  private enqueueSend(fn: () => Promise<void>): void {
+    this.sendChain = this.sendChain.then(fn, fn);
+  }
+
+  private enqueueRemote(fn: () => Promise<void>): void {
+    this.remoteChain = this.remoteChain.then(fn, fn);
+  }
+
   private async onLocalCreate(uri: vscode.Uri): Promise<void> {
     const rel = relPath(this.folder, uri);
     if (!rel || shouldIgnore(rel) || this.suppressPaths.has(rel)) return;
     this.noteLocalTopologyEvent();
     if (this.reconciling) return;
-    try {
-      const stat = await vscode.workspace.fs.stat(uri);
-      if (stat.type & vscode.FileType.Directory) {
-        await this.send({ kind: "mkdir", path: rel });
-        return;
+    this.enqueueSend(async () => {
+      if (this.disposed || this.reconciling) return;
+      try {
+        const stat = await vscode.workspace.fs.stat(uri);
+        if (stat.type & vscode.FileType.Directory) {
+          await this.sendOrJournal({ kind: "mkdir", path: rel });
+          return;
+        }
+        if (isBinaryPath(rel)) {
+          await this.uploadAssetOrJournal(uri, rel);
+          return;
+        }
+        const bytes = await vscode.workspace.fs.readFile(uri);
+        const content = Buffer.from(bytes).toString("utf8");
+        await this.sendOrJournal({ kind: "create", path: rel, content });
+      } catch (err) {
+        void vscode.window.showWarningMessage(`Collab fs create failed: ${String(err)}`);
       }
-      if (isBinaryPath(rel)) {
-        await this.uploadAsset(uri, rel);
-        return;
-      }
-      const bytes = await vscode.workspace.fs.readFile(uri);
-      const content = Buffer.from(bytes).toString("utf8");
-      await this.send({ kind: "create", path: rel, content });
-    } catch (err) {
-      void vscode.window.showWarningMessage(`Collab fs create failed: ${String(err)}`);
-    }
+    });
   }
 
   private async onLocalAssetWrite(uri: vscode.Uri): Promise<void> {
     const rel = relPath(this.folder, uri);
     if (!rel || shouldIgnore(rel) || this.suppressPaths.has(rel)) return;
     if (!isBinaryPath(rel)) return;
-    try {
-      await this.uploadAsset(uri, rel);
-    } catch (err) {
-      void vscode.window.showWarningMessage(`Collab asset upload failed: ${String(err)}`);
+    this.enqueueSend(async () => {
+      if (this.disposed || this.reconciling) return;
+      try {
+        await this.uploadAssetOrJournal(uri, rel);
+      } catch (err) {
+        void vscode.window.showWarningMessage(`Collab asset upload failed: ${String(err)}`);
+      }
+    });
+  }
+
+  private async uploadAssetOrJournal(uri: vscode.Uri, rel: string): Promise<void> {
+    if (this.disposed || this.reconciling) return;
+    if (!this.clientIsOpen()) {
+      await appendJournal(this.folder, {
+        kind: "asset",
+        path: rel,
+        queuedAt: Date.now(),
+      });
+      return;
     }
+    await this.uploadAsset(uri, rel);
   }
 
   private async uploadAsset(uri: vscode.Uri, rel: string): Promise<void> {
@@ -239,6 +349,7 @@ export class SyncController {
       );
       this.workspaceRevision = result.revision;
       this.client.lastKnownRevision = result.revision;
+      this.lastAppliedRemoteRev = Math.max(this.lastAppliedRemoteRev, result.revision);
     } finally {
       await new Promise((r) => setTimeout(r, 250));
       this.suppressPaths.delete(rel);
@@ -250,11 +361,14 @@ export class SyncController {
     if (!rel || shouldIgnore(rel) || this.suppressPaths.has(rel)) return;
     this.noteLocalTopologyEvent();
     if (this.reconciling) return;
-    try {
-      await this.send({ kind: "delete", path: rel });
-    } catch (err) {
-      void vscode.window.showWarningMessage(`Collab fs delete failed: ${String(err)}`);
-    }
+    this.enqueueSend(async () => {
+      if (this.disposed || this.reconciling) return;
+      try {
+        await this.sendOrJournal({ kind: "delete", path: rel });
+      } catch (err) {
+        void vscode.window.showWarningMessage(`Collab fs delete failed: ${String(err)}`);
+      }
+    });
   }
 
   private async onLocalRename(oldUri: vscode.Uri, newUri: vscode.Uri): Promise<void> {
@@ -268,11 +382,31 @@ export class SyncController {
       from.includes("/") !== to.includes("/") || from.split("/")[0] !== to.split("/")[0]
         ? "move"
         : "rename";
-    try {
-      await this.send({ kind, from, to });
-    } catch (err) {
-      void vscode.window.showWarningMessage(`Collab fs rename failed: ${String(err)}`);
+    this.enqueueSend(async () => {
+      if (this.disposed || this.reconciling) return;
+      try {
+        await this.sendOrJournal({ kind, from, to });
+      } catch (err) {
+        void vscode.window.showWarningMessage(`Collab fs rename failed: ${String(err)}`);
+      }
+    });
+  }
+
+  private clientIsOpen(): boolean {
+    return this.client.getStatus() === "connected";
+  }
+
+  private async sendOrJournal(operation: FsOperation): Promise<void> {
+    if (this.disposed || this.reconciling) return;
+    if (!this.clientIsOpen()) {
+      await appendJournal(this.folder, {
+        kind: "fs",
+        operation,
+        queuedAt: Date.now(),
+      });
+      return;
     }
+    await this.send(operation);
   }
 
   private async send(operation: FsOperation): Promise<void> {
@@ -281,10 +415,72 @@ export class SyncController {
       const ack = await this.client.sendFsOperation(operation, this.workspaceRevision);
       this.workspaceRevision = ack.revision;
       this.client.lastKnownRevision = ack.revision;
+      this.lastAppliedRemoteRev = Math.max(this.lastAppliedRemoteRev, ack.revision);
     } catch (err) {
       const msg = String(err);
+      if (msg.includes("not connected") || msg.includes("websocket closed")) {
+        await appendJournal(this.folder, {
+          kind: "fs",
+          operation,
+          queuedAt: Date.now(),
+        });
+        return;
+      }
       if (msg.includes("stale base_revision")) {
         void this.runReconcile("stale_base_revision");
+        return;
+      }
+      throw err;
+    }
+  }
+
+  /** B2: replay durable journal after reconnect (serialized). */
+  private async flushOfflineJournal(): Promise<void> {
+    if (this.disposed || this.flushingJournal || this.reconciling) return;
+    if (!this.clientIsOpen()) return;
+    this.flushingJournal = true;
+    try {
+      const entries = await loadJournal(this.folder);
+      if (entries.length === 0) return;
+      await clearJournal(this.folder);
+      for (const entry of entries) {
+        if (this.disposed) {
+          for (const rest of entries.slice(entries.indexOf(entry))) {
+            await appendJournal(this.folder, rest);
+          }
+          return;
+        }
+        // Reconcile (stale/gap) is server-authoritative and clears journal — stop flush.
+        if (this.reconciling) return;
+        await this.replayJournalEntry(entry);
+      }
+    } catch (err) {
+      void vscode.window.showWarningMessage(`Collab journal flush failed: ${String(err)}`);
+    } finally {
+      this.flushingJournal = false;
+    }
+  }
+
+  private async replayJournalEntry(entry: JournalEntry): Promise<void> {
+    if (entry.kind === "asset") {
+      const uri = vscode.Uri.joinPath(this.folder, entry.path);
+      try {
+        await this.uploadAsset(uri, entry.path);
+      } catch (err) {
+        // File may be gone after offline delete — drop.
+        if (!String(err).includes("EntryNotFound") && !String(err).includes("ENOENT")) {
+          await appendJournal(this.folder, entry);
+          throw err;
+        }
+      }
+      return;
+    }
+    try {
+      await this.send(entry.operation);
+    } catch (err) {
+      const msg = String(err);
+      if (msg.includes("already exists") || msg.includes("not a file") || msg.includes("missing")) {
+        // Topology already matches or race — skip.
         return;
       }
       throw err;
@@ -311,10 +507,12 @@ export class SyncController {
     }
     this.workspaceRevision = msg.revision;
     this.client.lastKnownRevision = msg.revision;
+    this.lastAppliedRemoteRev = Math.max(this.lastAppliedRemoteRev, msg.revision);
   }
 
   private async applyRemote(operation: FsOperation, revision: number): Promise<void> {
     if (this.disposed || this.reconciling) return;
+    if (revision <= this.lastAppliedRemoteRev) return;
     const paths: string[] = [];
     if (operation.path) paths.push(operation.path);
     if (operation.from) paths.push(operation.from);
@@ -372,5 +570,6 @@ export class SyncController {
     }
     this.workspaceRevision = revision;
     this.client.lastKnownRevision = revision;
+    this.lastAppliedRemoteRev = Math.max(this.lastAppliedRemoteRev, revision);
   }
 }

@@ -7,6 +7,7 @@ Upgrade: §18.1 project tables + membership (M3).
 from __future__ import annotations
 
 import hashlib
+import threading
 import json
 import os
 import re
@@ -115,6 +116,9 @@ def _atomic_write_text(path: Path, text: str, *, encoding: str = "utf-8") -> Non
 class ProjectService:
     def __init__(self, root: Path | None = None) -> None:
         self.root = root or _PROJECTS_DIR
+        # ponytail: process-local mutation lock for fs/asset/snapshot consistency (B4).
+        # Ceiling: multi-replica. Upgrade: DB transaction / distributed lock (M3).
+        self._mut = threading.RLock()
 
     def _project_dir(self, project_id: str) -> Path:
         return self.root / project_id
@@ -197,51 +201,77 @@ class ProjectService:
         hits = sorted(ws.rglob("slide.md"))
         return hits[0].read_text(encoding="utf-8") if hits else None
 
-    def snapshot(self, project_id: str) -> dict[str, Any] | None:
-        """Consistent workspace view @ current revision (JSON manifest).
-
-        ponytail: text inline; binaries as path/hash/size refs (GET separately). Ceiling:
-        large assets / #10 archive format. Upgrade: tar/zip bundle (M3 publish).
-        """
-        meta = self._read_meta(project_id)
-        if meta is None:
-            return None
+    def _build_snapshot_unlocked(self, project_id: str, meta: dict[str, Any]) -> dict[str, Any]:
+        """Build manifest; caller holds _mut."""
         ws = self._workspace(project_id)
         files: list[dict[str, str]] = []
         directories: list[str] = []
         assets: list[dict[str, object]] = []
+        hash_parts: list[str] = []
         if ws.is_dir():
             for path in sorted(ws.rglob("*")):
                 rel = path.relative_to(ws).as_posix()
                 if path.is_dir():
                     directories.append(rel)
+                    hash_parts.append(f"d:{rel}")
                     continue
                 if not _SAFE_REL.match(rel):
                     continue
                 if is_binary_rel(rel):
                     raw = path.read_bytes()
+                    digest = hashlib.sha256(raw).hexdigest()
                     assets.append(
                         {
                             "path": rel,
-                            "content_hash": hashlib.sha256(raw).hexdigest(),
+                            "content_hash": digest,
                             "size": len(raw),
                         }
                     )
+                    hash_parts.append(f"a:{rel}:{digest}")
                     continue
-                files.append(
-                    {
-                        "path": rel,
-                        "content": path.read_text(encoding="utf-8"),
-                    }
-                )
+                content = path.read_text(encoding="utf-8")
+                digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+                files.append({"path": rel, "content": content})
+                hash_parts.append(f"f:{rel}:{digest}")
+        content_hash = hashlib.sha256("\n".join(hash_parts).encode("utf-8")).hexdigest()
         return {
             "project_id": project_id,
             "name": meta["name"],
-            "revision": meta.get("revision", 0),
+            "revision": int(meta.get("revision", 0)),
+            "content_hash": content_hash,
             "directories": directories,
             "files": files,
             "assets": assets,
         }
+
+    def snapshot(self, project_id: str) -> dict[str, Any] | None:
+        """Consistent workspace view @ current revision (JSON manifest).
+
+        Holds mutation lock; retries if revision moves mid-build (B4).
+        ponytail: text inline; binaries as path/hash/size refs (GET separately). Ceiling:
+        large assets / #10 archive format. Upgrade: tar/zip bundle (M3 publish).
+        """
+        # ponytail: up to 3 rebuilds under lock if concurrent bump races the unlocked
+        # re-check — lock held for whole build so mismatch should be rare.
+        for _ in range(3):
+            with self._mut:
+                meta = self._read_meta(project_id)
+                if meta is None:
+                    return None
+                rev_before = int(meta.get("revision", 0))
+                snap = self._build_snapshot_unlocked(project_id, meta)
+                meta_after = self._read_meta(project_id)
+                if meta_after is None:
+                    return None
+                rev_after = int(meta_after.get("revision", 0))
+                if rev_after == rev_before and snap["revision"] == rev_before:
+                    return snap
+                # Rare: another thread wrote without lock — rebuild.
+        with self._mut:
+            meta = self._read_meta(project_id)
+            if meta is None:
+                return None
+            return self._build_snapshot_unlocked(project_id, meta)
 
     def _resolve_rel(self, project_id: str, rel: str) -> Path:
         ws = self._workspace(project_id)
@@ -266,9 +296,21 @@ class ProjectService:
     ) -> tuple[int, dict[str, Any]]:
         """Authoritative fs op under project workspace; bump revision.
 
-        ponytail: process-local apply (no multi-writer lock across instances). Ceiling:
-        concurrent writers on multi-replica. Upgrade: DB row lock / single writer (M3).
+        ponytail: process-local apply + _mut (B4). Ceiling: multi-replica.
+        Upgrade: DB row lock / single writer (M3).
         """
+        with self._mut:
+            return self._apply_fs_operation_unlocked(
+                project_id, operation, base_revision=base_revision
+            )
+
+    def _apply_fs_operation_unlocked(
+        self,
+        project_id: str,
+        operation: dict[str, Any],
+        *,
+        base_revision: int | None = None,
+    ) -> tuple[int, dict[str, Any]]:
         meta = self._read_meta(project_id)
         if meta is None:
             raise FsRejected("project not found")
@@ -375,9 +417,18 @@ class ProjectService:
     ) -> tuple[int, dict[str, Any]]:
         """Store binary at workspace-relative path; bump revision (last-write-wins).
 
-        ponytail: bytes live under workspace/ (no content-addressed object store).
-        Ceiling: dedup / CDN. Upgrade: §18.2 assets/{hash} (M3).
+        ponytail: bytes live under workspace/ + _mut (B4). Ceiling: dedup / CDN.
+        Upgrade: §18.2 assets/{hash} (M3).
         """
+        with self._mut:
+            return self._put_asset_unlocked(project_id, rel, data)
+
+    def _put_asset_unlocked(
+        self,
+        project_id: str,
+        rel: str,
+        data: bytes,
+    ) -> tuple[int, dict[str, Any]]:
         meta = self._read_meta(project_id)
         if meta is None:
             raise FsRejected("project not found")
