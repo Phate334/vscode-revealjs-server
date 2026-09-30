@@ -22,7 +22,7 @@ export type Snapshot = {
   revision: number;
   directories: string[];
   files: { path: string; content: string }[];
-  assets: unknown[];
+  assets: { path: string; content_hash: string; size: number }[];
 };
 
 export function collabWsUrl(server: string, projectId: string): string {
@@ -78,6 +78,77 @@ async function httpJson<T>(url: string, init?: RequestInit): Promise<T> {
   return (await res.json()) as T;
 }
 
+
+const BINARY_EXT = new Set([
+  ".png",
+  ".jpg",
+  ".jpeg",
+  ".gif",
+  ".webp",
+  ".svg",
+  ".mp4",
+  ".webm",
+  ".pdf",
+  ".woff",
+  ".woff2",
+]);
+
+export function isBinaryPath(rel: string): boolean {
+  const i = rel.lastIndexOf(".");
+  if (i < 0) return false;
+  return BINARY_EXT.has(rel.slice(i).toLowerCase());
+}
+
+export type AssetPutResult = {
+  path: string;
+  content_hash: string;
+  size: number;
+  revision: number;
+};
+
+export async function putAsset(
+  server: string,
+  projectId: string,
+  relPath: string,
+  data: Uint8Array,
+  clientId?: string,
+): Promise<AssetPutResult> {
+  const base = server.replace(/\/$/, "");
+  const q = clientId ? `?client_id=${encodeURIComponent(clientId)}` : "";
+  const url = `${base}/api/projects/${encodeURIComponent(projectId)}/assets/${relPath
+    .split("/")
+    .map(encodeURIComponent)
+    .join("/")}${q}`;
+  const res = await fetch(url, {
+    method: "PUT",
+    headers: { "Content-Type": "application/octet-stream" },
+    body: Buffer.from(data),
+  });
+  if (!res.ok) {
+    const detail = await res.text().catch(() => "");
+    throw new Error(`HTTP ${res.status} PUT asset: ${detail || res.statusText}`);
+  }
+  return (await res.json()) as AssetPutResult;
+}
+
+export async function getAsset(
+  server: string,
+  projectId: string,
+  relPath: string,
+): Promise<Uint8Array> {
+  const base = server.replace(/\/$/, "");
+  const url = `${base}/api/projects/${encodeURIComponent(projectId)}/assets/${relPath
+    .split("/")
+    .map(encodeURIComponent)
+    .join("/")}`;
+  const res = await fetch(url);
+  if (!res.ok) {
+    const detail = await res.text().catch(() => "");
+    throw new Error(`HTTP ${res.status} GET asset: ${detail || res.statusText}`);
+  }
+  return new Uint8Array(await res.arrayBuffer());
+}
+
 export async function createProject(
   server: string,
   name: string,
@@ -109,6 +180,7 @@ export async function fetchSnapshot(
 export async function extractSnapshot(
   folder: vscode.Uri,
   snap: Snapshot,
+  server?: string,
 ): Promise<void> {
   for (const dir of snap.directories) {
     await vscode.workspace.fs.createDirectory(vscode.Uri.joinPath(folder, dir));
@@ -118,5 +190,14 @@ export async function extractSnapshot(
     const parent = vscode.Uri.joinPath(uri, "..");
     await vscode.workspace.fs.createDirectory(parent);
     await vscode.workspace.fs.writeFile(uri, Buffer.from(f.content, "utf8"));
+  }
+  // Asset bodies are refs only in JSON snapshot; pull via GET when server known.
+  const base = server ?? DEFAULT_SERVER;
+  for (const a of snap.assets ?? []) {
+    if (!a?.path) continue;
+    const bytes = await getAsset(base, snap.project_id, a.path);
+    const uri = vscode.Uri.joinPath(folder, a.path);
+    await vscode.workspace.fs.createDirectory(vscode.Uri.joinPath(uri, ".."));
+    await vscode.workspace.fs.writeFile(uri, bytes);
   }
 }

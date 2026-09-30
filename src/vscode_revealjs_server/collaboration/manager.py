@@ -23,6 +23,7 @@ class CollaborationRoom:
     def __init__(self, project_id: str) -> None:
         self.project_id = project_id
         self.clients: set[WebSocket] = set()
+        self.client_ids: dict[WebSocket, str] = {}
         self.doc = Doc()
         # CRDT blob generation counter (not workspace topology revision).
         self.crdt_generation = 0
@@ -51,11 +52,14 @@ class CollaborationRoom:
             return None
         return update
 
-    async def join(self, ws: WebSocket) -> None:
+    async def join(self, ws: WebSocket, client_id: str = "") -> None:
         self.clients.add(ws)
+        if client_id:
+            self.client_ids[ws] = client_id
 
     async def leave(self, ws: WebSocket) -> None:
         self.clients.discard(ws)
+        self.client_ids.pop(ws, None)
 
     async def apply_and_broadcast(self, update: bytes, sender: WebSocket) -> None:
         self.doc.apply_update(update)
@@ -77,6 +81,7 @@ class CollaborationRoom:
                 dead.append(client)
         for client in dead:
             self.clients.discard(client)
+            self.client_ids.pop(client, None)
 
     async def broadcast_text(self, data: str, *, exclude: WebSocket | None = None) -> None:
         dead: list[WebSocket] = []
@@ -92,6 +97,7 @@ class CollaborationRoom:
                 dead.append(client)
         for client in dead:
             self.clients.discard(client)
+            self.client_ids.pop(client, None)
 
 
 class CollaborationManager:
@@ -134,7 +140,7 @@ class CollaborationManager:
             return
 
         # ponytail: protocol_version accepted but not negotiated; upgrade when clients diverge.
-        await room.join(ws)
+        await room.join(ws, client_id)
         await ws.send_text(
             proto.encode(proto.ready(revision=self._workspace_revision(project_id)))
         )
@@ -228,6 +234,39 @@ class CollaborationManager:
                 proto.encode(proto.workspace_revision(revision=rev)),
                 exclude=None,
             )
+
+    async def notify_asset_changed(
+        self,
+        project_id: str,
+        *,
+        path: str,
+        revision: int,
+        content_hash: str,
+        size: int,
+        exclude_client_id: str | None = None,
+    ) -> None:
+        """Broadcast asset.changed + workspace.revision after HTTP PUT."""
+        room = self.room(project_id)
+        exclude: WebSocket | None = None
+        if exclude_client_id:
+            for ws, cid in room.client_ids.items():
+                if cid == exclude_client_id:
+                    exclude = ws
+                    break
+        event = proto.encode(
+            proto.asset_changed(
+                path=path,
+                revision=revision,
+                content_hash=content_hash,
+                size=size,
+            )
+        )
+        await room.broadcast_text(event, exclude=exclude)
+        await room.broadcast_text(
+            proto.encode(proto.workspace_revision(revision=revision)),
+            exclude=None,
+        )
+
 
 
 manager = CollaborationManager()

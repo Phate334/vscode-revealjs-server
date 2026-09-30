@@ -1,4 +1,4 @@
-"""Filesystem-backed project create/list/get + workspace snapshot + fs ops.
+"""Filesystem-backed project create/list/get + workspace snapshot + fs ops + assets.
 
 ponytail: local dir store (no Postgres). Ceiling: single-node, no members/auth.
 Upgrade: §18.1 project tables + membership (M3).
@@ -6,6 +6,7 @@ Upgrade: §18.1 project tables + membership (M3).
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -28,6 +29,23 @@ _SAFE_NAME = re.compile(r"^[\w\s.\-]{1,120}$")
 _SAFE_REL = re.compile(r"^(?:[\w.\-]+|[\w.\-]+/[\w.\-]+)$")
 _SAFE_DIR = re.compile(r"^[\w.\-]+$")
 _FS_KINDS = frozenset({"create", "delete", "rename", "move", "mkdir"})
+_BINARY_EXT = frozenset({
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".webp",
+    ".svg",
+    ".mp4",
+    ".webm",
+    ".pdf",
+    ".woff",
+    ".woff2",
+})
+
+
+def is_binary_rel(rel: str) -> bool:
+    return Path(rel).suffix.lower() in _BINARY_EXT
 
 
 class FsRejected(ValueError):
@@ -155,8 +173,8 @@ class ProjectService:
     def snapshot(self, project_id: str) -> dict[str, Any] | None:
         """Consistent workspace view @ current revision (JSON manifest).
 
-        ponytail: JSON text files only (no tar/zip, no binary bodies). Ceiling: large
-        assets / #10 archive format. Upgrade: archive + asset refs (M1 assets / M3 publish).
+        ponytail: text inline; binaries as path/hash/size refs (GET separately). Ceiling:
+        large assets / #10 archive format. Upgrade: tar/zip bundle (M3 publish).
         """
         meta = self._read_meta(project_id)
         if meta is None:
@@ -164,6 +182,7 @@ class ProjectService:
         ws = self._workspace(project_id)
         files: list[dict[str, str]] = []
         directories: list[str] = []
+        assets: list[dict[str, object]] = []
         if ws.is_dir():
             for path in sorted(ws.rglob("*")):
                 rel = path.relative_to(ws).as_posix()
@@ -172,20 +191,15 @@ class ProjectService:
                     continue
                 if not _SAFE_REL.match(rel):
                     continue
-                # Text only for this slice; skip obvious binaries by extension.
-                if path.suffix.lower() in {
-                    ".png",
-                    ".jpg",
-                    ".jpeg",
-                    ".gif",
-                    ".webp",
-                    ".svg",
-                    ".mp4",
-                    ".webm",
-                    ".pdf",
-                    ".woff",
-                    ".woff2",
-                }:
+                if is_binary_rel(rel):
+                    raw = path.read_bytes()
+                    assets.append(
+                        {
+                            "path": rel,
+                            "content_hash": hashlib.sha256(raw).hexdigest(),
+                            "size": len(raw),
+                        }
+                    )
                     continue
                 files.append(
                     {
@@ -199,7 +213,7 @@ class ProjectService:
             "revision": meta.get("revision", 0),
             "directories": directories,
             "files": files,
-            "assets": [],
+            "assets": assets,
         }
 
     def _resolve_rel(self, project_id: str, rel: str) -> Path:
@@ -325,6 +339,65 @@ class ProjectService:
 
         rev = self._bump_revision(meta)
         return rev, normalized
+
+    def put_asset(
+        self,
+        project_id: str,
+        rel: str,
+        data: bytes,
+    ) -> tuple[int, dict[str, Any]]:
+        """Store binary at workspace-relative path; bump revision (last-write-wins).
+
+        ponytail: bytes live under workspace/ (no content-addressed object store).
+        Ceiling: dedup / CDN. Upgrade: §18.2 assets/{hash} (M3).
+        """
+        meta = self._read_meta(project_id)
+        if meta is None:
+            raise FsRejected("project not found")
+        if not isinstance(rel, str) or not _SAFE_REL.match(rel):
+            raise FsRejected(f"invalid asset path: {rel!r}")
+        if not is_binary_rel(rel):
+            raise FsRejected(f"not a binary asset extension: {rel!r}")
+        if not isinstance(data, (bytes, bytearray)):
+            raise FsRejected("asset body must be bytes")
+
+        ws = self._workspace(project_id)
+        ws.mkdir(parents=True, exist_ok=True)
+        ws_resolved = ws.resolve()
+        dest = self._resolve_rel(project_id, rel)
+        parent = dest.parent
+        if parent != ws_resolved:
+            if not _SAFE_DIR.match(parent.name) or parent.parent.resolve() != ws_resolved:
+                raise FsRejected(f"invalid parent for asset: {rel}")
+            parent.mkdir(parents=False, exist_ok=True)
+
+        payload = bytes(data)
+        dest.write_bytes(payload)
+        digest = hashlib.sha256(payload).hexdigest()
+        rev = self._bump_revision(meta)
+        return rev, {
+            "path": rel,
+            "content_hash": digest,
+            "size": len(payload),
+        }
+
+    def get_asset(self, project_id: str, rel: str) -> tuple[bytes, dict[str, Any]] | None:
+        meta = self._read_meta(project_id)
+        if meta is None:
+            return None
+        if not isinstance(rel, str) or not _SAFE_REL.match(rel):
+            raise FsRejected(f"invalid asset path: {rel!r}")
+        if not is_binary_rel(rel):
+            raise FsRejected(f"not a binary asset extension: {rel!r}")
+        dest = self._resolve_rel(project_id, rel)
+        if not dest.is_file():
+            return None
+        payload = dest.read_bytes()
+        return payload, {
+            "path": rel,
+            "content_hash": hashlib.sha256(payload).hexdigest(),
+            "size": len(payload),
+        }
 
     @staticmethod
     def _public(meta: dict[str, Any]) -> dict[str, Any]:

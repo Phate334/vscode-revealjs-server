@@ -22,6 +22,13 @@ export type FsOperationAck = {
   revision: number;
 };
 
+export type AssetChangedEvent = {
+  path: string;
+  revision: number;
+  content_hash: string;
+  size: number;
+};
+
 const DEFAULT_URL = "ws://127.0.0.1:8000/api/projects/poc/collaboration";
 const PROTOCOL_VERSION = 1;
 // ponytail: exp backoff capped at 30s; upgrade to jittered shared retry policy if many clients stampede.
@@ -61,6 +68,7 @@ export class CollaborationClient {
   onReady: (() => void) | undefined;
   onFsOperation: ((msg: FsOperationEvent) => void) | undefined;
   onWorkspaceRevision: ((revision: number) => void) | undefined;
+  onAssetChanged: ((msg: AssetChangedEvent) => void) | undefined;
 
   constructor(
     readonly clientId: string,
@@ -141,6 +149,9 @@ export class CollaborationClient {
           revision?: number;
           operation_id?: string;
           operation?: FsOperation;
+          path?: string;
+          content_hash?: string;
+          size?: number;
           code?: string;
           message?: string;
         };
@@ -192,6 +203,21 @@ export class CollaborationClient {
           if (typeof msg.revision === "number") {
             this.workspaceRevision = msg.revision;
             this.onWorkspaceRevision?.(msg.revision);
+          }
+        } else if (msg.type === "asset.changed") {
+          if (
+            typeof msg.path === "string" &&
+            typeof msg.revision === "number" &&
+            typeof msg.content_hash === "string" &&
+            typeof msg.size === "number"
+          ) {
+            this.workspaceRevision = msg.revision;
+            this.onAssetChanged?.({
+              path: msg.path,
+              revision: msg.revision,
+              content_hash: msg.content_hash,
+              size: msg.size,
+            });
           }
         } else if (msg.type === "error") {
           const code = msg.code ?? "";

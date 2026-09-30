@@ -46,7 +46,7 @@ async function connect(): Promise<void> {
   client = new CollaborationClient(id, url);
   client.onStatus = setStatus;
   binding = await bindSlideDocument(client);
-  sync = new SyncController(client, folder, meta.lastKnownRevision);
+  sync = new SyncController(client, folder, meta.server, meta.projectId, meta.lastKnownRevision);
   sync.start();
   try {
     await client.connect();
@@ -105,7 +105,7 @@ async function cmdCreateProject(): Promise<void> {
     const folderName = name.trim().replace(/[^\w.\-]+/g, "-").replace(/^-+|-+$/g, "") || project.id;
     const folder = vscode.Uri.joinPath(parent[0], folderName);
     await vscode.workspace.fs.createDirectory(folder);
-    await extractSnapshot(folder, snap);
+    await extractSnapshot(folder, snap, server);
     await writeWorkspaceMeta(folder, {
       version: 1,
       server,
@@ -155,7 +155,7 @@ async function cmdOpenProject(): Promise<void> {
   try {
     const snap = await fetchSnapshot(server, picked.project.id);
     // Use selected folder as workspace root (extract into it).
-    await extractSnapshot(parent[0], snap);
+    await extractSnapshot(parent[0], snap, server);
     await writeWorkspaceMeta(parent[0], {
       version: 1,
       server,

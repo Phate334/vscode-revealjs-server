@@ -1,8 +1,15 @@
 import * as vscode from "vscode";
-import type { CollaborationClient, FsOperation } from "./collaborationClient";
+import type {
+  AssetChangedEvent,
+  CollaborationClient,
+  FsOperation,
+} from "./collaborationClient";
 import { OriginTracker } from "./originTracker";
+import { getAsset, isBinaryPath, putAsset } from "./projectClient";
 
 const IGNORE_PREFIXES = [".presentation/", ".git/", "node_modules/", ".vscode/"];
+
+const BINARY_GLOB = "**/*.{png,jpg,jpeg,gif,webp,svg,mp4,webm,pdf,woff,woff2}";
 
 function shouldIgnore(rel: string): boolean {
   const n = rel.replace(/\\/g, "/");
@@ -18,8 +25,8 @@ function relPath(folder: vscode.Uri, uri: vscode.Uri): string | undefined {
 }
 
 /**
- * Sync Controller skeleton (M1 Slice 2): local FS topology → fs.operation;
- * remote fs.operation → apply with origin mark (echo suppress).
+ * Sync Controller (M1): local FS topology → fs.operation; binary → Asset PUT;
+ * remote fs.operation / asset.changed → apply with origin mark (echo suppress).
  * UndoManager stays on Document Binding — not here.
  */
 export class SyncController {
@@ -33,6 +40,8 @@ export class SyncController {
   constructor(
     private readonly client: CollaborationClient,
     private readonly folder: vscode.Uri,
+    private readonly server: string,
+    private readonly projectId: string,
     initialRevision: number,
   ) {
     this.workspaceRevision = initialRevision;
@@ -54,11 +63,26 @@ export class SyncController {
       }),
     );
 
+    // Binary replacement (existing file overwrite) — create already covered above.
+    const watcher = vscode.workspace.createFileSystemWatcher(
+      new vscode.RelativePattern(this.folder, BINARY_GLOB),
+    );
+    this.disposables.push(
+      watcher,
+      watcher.onDidChange((uri) => {
+        if (this.origin.isRemote()) return;
+        void this.onLocalAssetWrite(uri);
+      }),
+    );
+
     this.client.onFsOperation = (msg) => {
       void this.applyRemote(msg.operation, msg.revision);
     };
     this.client.onWorkspaceRevision = (rev) => {
       this.workspaceRevision = rev;
+    };
+    this.client.onAssetChanged = (msg) => {
+      void this.applyRemoteAsset(msg);
     };
   }
 
@@ -68,6 +92,7 @@ export class SyncController {
     this.disposables.length = 0;
     if (this.client.onFsOperation) this.client.onFsOperation = undefined;
     if (this.client.onWorkspaceRevision) this.client.onWorkspaceRevision = undefined;
+    if (this.client.onAssetChanged) this.client.onAssetChanged = undefined;
   }
 
   private async onLocalCreate(uri: vscode.Uri): Promise<void> {
@@ -79,11 +104,46 @@ export class SyncController {
         await this.send({ kind: "mkdir", path: rel });
         return;
       }
+      if (isBinaryPath(rel)) {
+        await this.uploadAsset(uri, rel);
+        return;
+      }
       const bytes = await vscode.workspace.fs.readFile(uri);
       const content = Buffer.from(bytes).toString("utf8");
       await this.send({ kind: "create", path: rel, content });
     } catch (err) {
       void vscode.window.showWarningMessage(`Collab fs create failed: ${String(err)}`);
+    }
+  }
+
+  private async onLocalAssetWrite(uri: vscode.Uri): Promise<void> {
+    const rel = relPath(this.folder, uri);
+    if (!rel || shouldIgnore(rel) || this.suppressPaths.has(rel)) return;
+    if (!isBinaryPath(rel)) return;
+    try {
+      await this.uploadAsset(uri, rel);
+    } catch (err) {
+      void vscode.window.showWarningMessage(`Collab asset upload failed: ${String(err)}`);
+    }
+  }
+
+  private async uploadAsset(uri: vscode.Uri, rel: string): Promise<void> {
+    if (this.disposed) return;
+    const bytes = await vscode.workspace.fs.readFile(uri);
+    // Suppress echo if server still broadcasts to us (client_id exclude may miss).
+    this.suppressPaths.add(rel);
+    try {
+      const result = await putAsset(
+        this.server,
+        this.projectId,
+        rel,
+        bytes,
+        this.client.clientId,
+      );
+      this.workspaceRevision = result.revision;
+    } finally {
+      await new Promise((r) => setTimeout(r, 250));
+      this.suppressPaths.delete(rel);
     }
   }
 
@@ -102,9 +162,10 @@ export class SyncController {
     const to = relPath(this.folder, newUri);
     if (!from || !to || shouldIgnore(from) || shouldIgnore(to)) return;
     if (this.suppressPaths.has(from) || this.suppressPaths.has(to)) return;
-    const kind = from.includes("/") !== to.includes("/") || from.split("/")[0] !== to.split("/")[0]
-      ? "move"
-      : "rename";
+    const kind =
+      from.includes("/") !== to.includes("/") || from.split("/")[0] !== to.split("/")[0]
+        ? "move"
+        : "rename";
     try {
       await this.send({ kind, from, to });
     } catch (err) {
@@ -116,6 +177,27 @@ export class SyncController {
     if (this.disposed) return;
     const ack = await this.client.sendFsOperation(operation, this.workspaceRevision);
     this.workspaceRevision = ack.revision;
+  }
+
+  private async applyRemoteAsset(msg: AssetChangedEvent): Promise<void> {
+    if (this.disposed) return;
+    const rel = msg.path;
+    if (!rel || shouldIgnore(rel) || this.suppressPaths.has(rel)) return;
+    this.suppressPaths.add(rel);
+    try {
+      await this.origin.markRemote(async () => {
+        const bytes = await getAsset(this.server, this.projectId, rel);
+        const uri = vscode.Uri.joinPath(this.folder, rel);
+        await vscode.workspace.fs.createDirectory(vscode.Uri.joinPath(uri, ".."));
+        await vscode.workspace.fs.writeFile(uri, bytes);
+      });
+      await new Promise((r) => setTimeout(r, 250));
+    } catch (err) {
+      void vscode.window.showWarningMessage(`Collab asset download failed: ${String(err)}`);
+    } finally {
+      this.suppressPaths.delete(rel);
+    }
+    this.workspaceRevision = msg.revision;
   }
 
   private async applyRemote(operation: FsOperation, revision: number): Promise<void> {

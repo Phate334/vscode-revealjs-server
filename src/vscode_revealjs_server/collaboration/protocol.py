@@ -15,9 +15,10 @@ PONG = "pong"
 FS_OPERATION = "fs.operation"
 FS_OPERATION_ACK = "fs.operation_ack"
 WORKSPACE_REVISION = "workspace.revision"
+ASSET_CHANGED = "asset.changed"
 
 CONTROL_TYPES = frozenset(
-    {HELLO, READY, ERROR, PING, PONG, FS_OPERATION, FS_OPERATION_ACK, WORKSPACE_REVISION}
+    {HELLO, READY, ERROR, PING, PONG, FS_OPERATION, FS_OPERATION_ACK, WORKSPACE_REVISION, ASSET_CHANGED}
 )
 
 
@@ -74,3 +75,20 @@ def fs_operation_event(
 
 def workspace_revision(*, revision: int) -> dict[str, Any]:
     return {"type": WORKSPACE_REVISION, "revision": revision}
+
+
+def asset_changed(
+    *,
+    path: str,
+    revision: int,
+    content_hash: str,
+    size: int,
+) -> dict[str, Any]:
+    """Peers should HTTP GET the asset at path (last-write-wins; open decision #9)."""
+    return {
+        "type": ASSET_CHANGED,
+        "path": path,
+        "revision": revision,
+        "content_hash": content_hash,
+        "size": size,
+    }
