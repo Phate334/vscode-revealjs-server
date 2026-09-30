@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Live smoke against compose-published port (AGENTS: no host uvicorn for live checks).
-# Covers: health, project create, preview HTML, runtime static, binary asset via preview,
+# Covers: health, auth stub, project create, preview HTML, runtime static, binary asset via preview,
 # chapter-relative asset rewrite. CRDT unsaved-edit visibility: real VS Code EDH only.
 set -euo pipefail
 BASE="${1:-http://127.0.0.1:8000}"
@@ -16,6 +16,24 @@ echo "GET ${BASE}/health"
 HEALTH="$(curl -sfS "${BASE}/health")" || fail "health"
 echo "${HEALTH}" | grep -q '"status":"ok"' || fail "health body: ${HEALTH}"
 pass "health"
+
+echo "POST /api/auth/login (demo/demo)"
+LOGIN="$(curl -sfS -X POST "${BASE}/api/auth/login" \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"demo","password":"demo"}')" || fail "auth login"
+ACCESS="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])' <<<"${LOGIN}")"
+REFRESH="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["refresh_token"])' <<<"${LOGIN}")"
+[[ -n "${ACCESS}" && -n "${REFRESH}" ]] || fail "login missing tokens"
+ME="$(curl -sfS "${BASE}/api/auth/me" -H "Authorization: Bearer ${ACCESS}")" || fail "auth me"
+echo "${ME}" | grep -q '"username":"demo"' || fail "me body: ${ME}"
+REF="$(curl -sfS -X POST "${BASE}/api/auth/refresh" \
+  -H 'Content-Type: application/json' \
+  -d "{\"refresh_token\":\"${REFRESH}\"}")" || fail "auth refresh"
+echo "${REF}" | grep -q 'access_token' || fail "refresh body"
+CODE="$(curl -sS -o /dev/null -w '%{http_code}' -X POST "${BASE}/api/auth/login" \
+  -H 'Content-Type: application/json' -d '{"username":"demo","password":"wrong"}' || true)"
+[[ "${CODE}" == "401" ]] || fail "expected 401 bad login, got ${CODE}"
+pass "auth login/me/refresh"
 
 NAME="smoke-$(date +%s)"
 echo "POST /api/projects name=${NAME}"

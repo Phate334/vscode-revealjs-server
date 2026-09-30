@@ -9,6 +9,7 @@ from vscode_revealjs_server.presentation.runtime import (
     is_supported_runtime,
     resolve_runtime_file,
 )
+from vscode_revealjs_server.auth import service as auth_service
 from vscode_revealjs_server.projects import project_service
 from vscode_revealjs_server.projects.service import FsRejected
 
@@ -19,9 +20,46 @@ class CreateProjectBody(BaseModel):
     name: str = Field(min_length=1, max_length=120)
 
 
+class LoginBody(BaseModel):
+    username: str = Field(min_length=1, max_length=120)
+    password: str = Field(min_length=1, max_length=200)
+
+
+class RefreshBody(BaseModel):
+    refresh_token: str = Field(min_length=1)
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.post("/api/auth/login")
+def auth_login(body: LoginBody) -> dict:
+    """M3 auth stub: demo users (default demo/demo). Enforcement on routes = next slice."""
+    got = auth_service.login(body.username, body.password)
+    if got is None:
+        raise HTTPException(status_code=401, detail="invalid credentials")
+    return got
+
+
+@app.post("/api/auth/refresh")
+def auth_refresh(body: RefreshBody) -> dict:
+    got = auth_service.refresh(body.refresh_token)
+    if got is None:
+        raise HTTPException(status_code=401, detail="invalid refresh token")
+    return got
+
+
+@app.get("/api/auth/me")
+def auth_me(request: Request) -> dict:
+    token = auth_service.bearer_token(request.headers.get("authorization"))
+    if token is None:
+        raise HTTPException(status_code=401, detail="missing bearer token")
+    user = auth_service.me_from_access(token)
+    if user is None:
+        raise HTTPException(status_code=401, detail="invalid access token")
+    return user
 
 
 @app.post("/api/projects")

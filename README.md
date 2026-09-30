@@ -29,3 +29,14 @@ GET /runtimes/reveal-v1/...   # shared reveal.js runtime (Publish will reuse)
 
 In VS Code: **Presentation: Open Preview** opens the Server Preview URL from `.presentation/workspace.json`.
 
+## Auth (M3 stub)
+
+Demo user `demo` / `demo` (override with `AUTH_DEMO_USER=name:pass`, secret `AUTH_JWT_SECRET`):
+
+```text
+POST /api/auth/login     {"username","password"} → access_token + refresh_token
+POST /api/auth/refresh   {"refresh_token"}
+GET  /api/auth/me        Authorization: Bearer <access>
+```
+
+Route enforcement (HTTP/WS require token) is the next M3 slice — Preview/collab still open for now.
