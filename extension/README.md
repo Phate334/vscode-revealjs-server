@@ -27,10 +27,10 @@ published compose port (`localhost:8000`), not host `uv run uvicorn`.
 Two Extension Development Host windows (after compose is up):
 
 ```bash
-code --extensionDevelopmentPath=/workspace/vscode-revealjs-server/extension \
-  /workspace/vscode-revealjs-server/fixtures/alice
-code --extensionDevelopmentPath=/workspace/vscode-revealjs-server/extension \
-  /workspace/vscode-revealjs-server/fixtures/bob
+code --extensionDevelopmentPath=$PWD \
+  ../fixtures/alice
+code --extensionDevelopmentPath=$PWD \
+  ../fixtures/bob
 ```
 
 Or open `extension/` and press F5 (`.vscode/launch.json` → Alice fixture).
