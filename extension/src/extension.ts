@@ -24,6 +24,13 @@ function setStatus(s: string): void {
   statusItem.show();
 }
 
+/**
+ * H2 init order:
+ * 1. create client + SyncController remote handlers (catch reconcile_required)
+ * 2. connect → ready/snapshot barrier
+ * 3. bind documents (seed after barrier)
+ * 4. start local FS watchers
+ */
 async function connect(): Promise<void> {
   if (client) {
     void vscode.window.showInformationMessage("Collab already connected");
@@ -43,14 +50,21 @@ async function connect(): Promise<void> {
   }
   const id = `vscode-${vscode.env.sessionId.slice(0, 8)}`;
   const url = collabWsUrl(meta.server, meta.projectId);
-  client = new CollaborationClient(id, url);
+  client = new CollaborationClient(id, url, meta.lastKnownRevision);
   client.onStatus = setStatus;
-  binding = await bindSlideDocument(client);
-  sync = new SyncController(client, folder, meta.server, meta.projectId, meta.lastKnownRevision);
-  sync.start();
+  sync = new SyncController(
+    client,
+    folder,
+    meta.server,
+    meta.projectId,
+    meta.lastKnownRevision,
+    meta,
+  );
+  sync.startRemoteHandlers();
   try {
     await client.connect();
-    // Persist workspace revision from ready if advanced.
+    binding = await bindSlideDocument(client);
+    sync.startLocalWatchers();
     if (client.workspaceRevision !== meta.lastKnownRevision) {
       await writeWorkspaceMeta(folder, {
         ...meta,
@@ -154,7 +168,6 @@ async function cmdOpenProject(): Promise<void> {
 
   try {
     const snap = await fetchSnapshot(server, picked.project.id);
-    // Use selected folder as workspace root (extract into it).
     await extractSnapshot(parent[0], snap, server);
     await writeWorkspaceMeta(parent[0], {
       version: 1,

@@ -17,30 +17,12 @@ export type SlideBinding = {
   redo: () => void;
 };
 
-/** Find slide.md at workspace root (or first match). */
-async function findSlideUri(): Promise<vscode.Uri | undefined> {
-  const folders = vscode.workspace.workspaceFolders;
-  if (folders) {
-    for (const f of folders) {
-      const uri = vscode.Uri.joinPath(f.uri, SLIDE_NAME);
-      try {
-        await vscode.workspace.fs.stat(uri);
-        return uri;
-      } catch {
-        // not at root
-      }
-    }
-  }
-  const hits = await vscode.workspace.findFiles(`**/${SLIDE_NAME}`, "**/node_modules/**", 1);
-  return hits[0];
-}
-
-/**
- * Apply external file text onto Y.Text via prefix/suffix diff (keeps CRDT merge on unchanged spans).
- * Do not replace the whole string in one shot — that bypasses concurrent merge.
- */
-function applyTextDiff(doc: Y.Doc, ytext: Y.Text, oldText: string, newText: string): void {
-  if (oldText === newText) return;
+/** Shared prefix/suffix span for minimal text replace (disk→Y and Y→editor). */
+function diffSpan(
+  oldText: string,
+  newText: string,
+): { start: number; oldEnd: number; newEnd: number } | undefined {
+  if (oldText === newText) return undefined;
   let start = 0;
   const oldLen = oldText.length;
   const newLen = newText.length;
@@ -57,20 +39,59 @@ function applyTextDiff(doc: Y.Doc, ytext: Y.Text, oldText: string, newText: stri
     oldEnd--;
     newEnd--;
   }
+  return { start, oldEnd, newEnd };
+}
+
+/**
+ * Apply external file text onto Y.Text via prefix/suffix diff (keeps CRDT merge on unchanged spans).
+ * Do not replace the whole string in one shot — that bypasses concurrent merge.
+ */
+function applyTextDiff(doc: Y.Doc, ytext: Y.Text, oldText: string, newText: string): void {
+  const span = diffSpan(oldText, newText);
+  if (!span) return;
   // FS_RECONCILE: not tracked by UndoManager (git/shell/agent rewrites stay out of local undo).
   doc.transact(() => {
-    const del = oldEnd - start;
-    if (del > 0) ytext.delete(start, del);
-    if (newEnd > start) ytext.insert(start, newText.slice(start, newEnd));
+    const del = span.oldEnd - span.start;
+    if (del > 0) ytext.delete(span.start, del);
+    if (span.newEnd > span.start) ytext.insert(span.start, newText.slice(span.start, span.newEnd));
   }, FS_RECONCILE);
+}
+
+/** Find collaborative slide.md: prefer nested chapter path, else root, else first match. */
+async function findSlideUri(): Promise<vscode.Uri | undefined> {
+  const folders = vscode.workspace.workspaceFolders;
+  if (!folders?.length) return undefined;
+  const folder = folders[0];
+  // Nested chapter first (Create Project template: 01-introduction/slide.md).
+  const nested = await vscode.workspace.findFiles(
+    new vscode.RelativePattern(folder, `*/${SLIDE_NAME}`),
+    "**/node_modules/**",
+    1,
+  );
+  if (nested[0]) return nested[0];
+  const root = vscode.Uri.joinPath(folder.uri, SLIDE_NAME);
+  try {
+    await vscode.workspace.fs.stat(root);
+    return root;
+  } catch {
+    // not at root
+  }
+  const hits = await vscode.workspace.findFiles(
+    new vscode.RelativePattern(folder, `**/${SLIDE_NAME}`),
+    "**/node_modules/**",
+    1,
+  );
+  return hits[0];
 }
 
 /**
  * Bind one slide.md to client.ytext.
- * Local edits → Y.Text (LOCAL_EDITOR, tracked by UndoManager);
- * remote Y.Text → WorkspaceEdit (OriginTracker skips echo);
- * FileSystemWatcher → FS_RECONCILE (not undo-tracked).
- * Ctrl/Cmd+Z routed via presentation.undo → Y.UndoManager (native stack not authoritative).
+ * Init assumes ready/snapshot barrier already passed (H2) — seedOrPull runs immediately,
+ * and onReady re-seeds after reconnect.
+ *
+ * Local edits → Y.Text (LOCAL_EDITOR); remote Y→editor = minimal diff (H4), serialized (H3);
+ * OriginTracker only wraps the WorkspaceEdit — genuine concurrent local edits are recovered.
+ * Nested slide.md watcher (H5).
  */
 export async function bindSlideDocument(client: CollaborationClient): Promise<SlideBinding> {
   const uri = await findSlideUri();
@@ -87,20 +108,57 @@ export async function bindSlideDocument(client: CollaborationClient): Promise<Sl
   await vscode.window.showTextDocument(doc, { preview: false });
   const origin = new OriginTracker();
   const ytext = client.ytext;
-  // Selective undo: only LOCAL_EDITOR transactions; remote/FS stay out of the stack.
   const undoManager = new Y.UndoManager(ytext, {
     trackedOrigins: new Set([LOCAL_EDITOR]),
     captureTimeout: UNDO_CAPTURE_TIMEOUT_MS,
   });
 
-  const applyYToEditor = async () => {
-    const next = ytext.toString();
-    if (doc.getText() === next) return;
-    const edit = new vscode.WorkspaceEdit();
-    const full = new vscode.Range(doc.positionAt(0), doc.positionAt(doc.getText().length));
-    edit.replace(uri, full, next);
-    await origin.markRemote(() => vscode.workspace.applyEdit(edit));
+  /** Serialize Y→editor / native-undo reconcile (H3). */
+  let applyChain: Promise<void> = Promise.resolve();
+  /** After remote markRemote ends, push any genuine local text that arrived during apply. */
+  let recoverLocalAfterRemote = false;
+
+  const enqueueApply = (fn: () => Promise<void>): Promise<void> => {
+    applyChain = applyChain.then(fn, fn);
+    return applyChain;
   };
+
+  /** Core Y→editor apply (must run on applyChain). */
+  const applyYToEditorCore = async (): Promise<void> => {
+    const next = ytext.toString();
+    const prev = doc.getText();
+    if (prev === next) return;
+    const span = diffSpan(prev, next);
+    if (!span) return;
+    const edit = new vscode.WorkspaceEdit();
+    const range = new vscode.Range(doc.positionAt(span.start), doc.positionAt(span.oldEnd));
+    edit.replace(uri, range, next.slice(span.start, span.newEnd));
+    recoverLocalAfterRemote = false;
+    await origin.markRemote(() => vscode.workspace.applyEdit(edit));
+    // If a local keystroke landed while markRemote was set, recover it into Y.
+    if (recoverLocalAfterRemote) {
+      recoverLocalAfterRemote = false;
+      const editorNow = doc.getText();
+      const crdtNow = ytext.toString();
+      if (editorNow !== crdtNow) {
+        applyTextDiffAsLocal(client.doc, ytext, crdtNow, editorNow);
+      }
+    }
+  };
+
+  /** Y.Text → editor via prefix/suffix WorkspaceEdit (H4 — no whole-doc replace). */
+  const applyYToEditor = (): Promise<void> => enqueueApply(() => applyYToEditorCore());
+
+  /** Genuine local text that arrived during remote apply → LOCAL_EDITOR (not discarded). */
+  function applyTextDiffAsLocal(ydoc: Y.Doc, yt: Y.Text, oldText: string, newText: string): void {
+    const span = diffSpan(oldText, newText);
+    if (!span) return;
+    ydoc.transact(() => {
+      const del = span.oldEnd - span.start;
+      if (del > 0) yt.delete(span.start, del);
+      if (span.newEnd > span.start) yt.insert(span.start, newText.slice(span.start, span.newEnd));
+    }, LOCAL_EDITOR);
+  }
 
   const seedOrPull = async () => {
     const fileText = doc.getText();
@@ -115,15 +173,14 @@ export async function bindSlideDocument(client: CollaborationClient): Promise<Sl
     }
   };
 
-  // After ready (snapshot may already be applied), sync file ↔ CRDT once.
+  // H2: bind after ready barrier — seed immediately; keep onReady for reconnect.
+  const prevReady = client.onReady;
+  client.onReady = () => {
+    prevReady?.();
+    void seedOrPull();
+  };
   if (client.getStatus() === "connected") {
     await seedOrPull();
-  } else {
-    const prev = client.onReady;
-    client.onReady = () => {
-      prev?.();
-      void seedOrPull();
-    };
   }
 
   const yObserver = () => {
@@ -133,18 +190,27 @@ export async function bindSlideDocument(client: CollaborationClient): Promise<Sl
 
   const changeSub = vscode.workspace.onDidChangeTextDocument((e) => {
     if (e.document.uri.toString() !== uri.toString()) return;
-    if (origin.isRemote()) return;
+
+    if (origin.isRemote()) {
+      // H3: do not swallow genuine local edits during remote apply.
+      // Echo of our WorkspaceEdit leaves editor == ytext; concurrent typing diverges.
+      recoverLocalAfterRemote = true;
+      return;
+    }
 
     // Safety: native Undo/Redo must not push VS Code state into Yjs.
-    // Treat as undo/redo intent → UndoManager, then reconcile editor to ytext.
     if (e.reason === vscode.TextDocumentChangeReason.Undo) {
-      undoManager.undo();
-      void applyYToEditor();
+      void enqueueApply(async () => {
+        undoManager.undo();
+        await applyYToEditorCore();
+      });
       return;
     }
     if (e.reason === vscode.TextDocumentChangeReason.Redo) {
-      undoManager.redo();
-      void applyYToEditor();
+      void enqueueApply(async () => {
+        undoManager.redo();
+        await applyYToEditorCore();
+      });
       return;
     }
 
@@ -168,17 +234,14 @@ export async function bindSlideDocument(client: CollaborationClient): Promise<Sl
 
   let watchTimer: ReturnType<typeof setTimeout> | undefined;
   const folder = vscode.workspace.getWorkspaceFolder(uri);
-  // Watch the bound file path (root or chapter/slide.md), not only workspace-root slide.md.
-  const rel = folder
-    ? uri.fsPath.slice(folder.uri.fsPath.length).replace(/^[/\\]/, "")
-    : SLIDE_NAME;
+  // H5: watch all nested slide.md under the workspace folder (bound uri filtered below).
   const pattern = folder
-    ? new vscode.RelativePattern(folder, rel)
+    ? new vscode.RelativePattern(folder, `**/${SLIDE_NAME}`)
     : new vscode.RelativePattern(vscode.Uri.joinPath(uri, ".."), SLIDE_NAME);
   const watcher = vscode.workspace.createFileSystemWatcher(pattern);
 
-  const onDiskEvent = () => {
-    // Skip while our remote WorkspaceEdit is in flight (echo / save churn).
+  const onDiskEvent = (eventUri: vscode.Uri) => {
+    if (eventUri.toString() !== uri.toString()) return;
     if (origin.isRemote()) return;
     if (watchTimer) clearTimeout(watchTimer);
     watchTimer = setTimeout(() => {
@@ -214,13 +277,16 @@ export async function bindSlideDocument(client: CollaborationClient): Promise<Sl
       watcher.dispose();
     },
     undo: () => {
-      undoManager.undo();
-      // yObserver → applyYToEditor; explicit reconcile covers empty-stack no-op after native undo.
-      void applyYToEditor();
+      void enqueueApply(async () => {
+        undoManager.undo();
+        await applyYToEditorCore();
+      });
     },
     redo: () => {
-      undoManager.redo();
-      void applyYToEditor();
+      void enqueueApply(async () => {
+        undoManager.redo();
+        await applyYToEditorCore();
+      });
     },
   };
 }
