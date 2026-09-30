@@ -49,3 +49,9 @@ Each window auto-connects when `.presentation/workspace.json` is present, or run
 - **External rewrite:** `FileSystemWatcher` on workspace `slide.md` reads disk, prefix/suffix-diffs into local Y.Text (skips OriginTracker remote applies + equal content; 150ms debounce).
 - **Reconnect:** WS drop → status `offline`, exp backoff retry → `syncing` → hello again → merge (apply server snapshot + push full local Yjs state).
 
+## Undo (Yjs UndoManager)
+
+- Local typing uses origin `LOCAL_EDITOR` → tracked by per-doc `Y.UndoManager`.
+- Remote applies use `REMOTE_SYNC`; FileSystemWatcher diffs use `FS_RECONCILE` (not undo-tracked).
+- Keybindings: Ctrl/Cmd+Z / redo → `presentation.undo` / `presentation.redo` when `presentation.collaborativeEditor && editorTextFocus`.
+- If native Undo/Redo still fires (`TextDocumentChangeReason`), binding skips pushing into Yjs and routes to UndoManager, then reconciles the editor to `ytext`.

@@ -1,9 +1,9 @@
 import * as vscode from "vscode";
 import { CollaborationClient } from "./collaborationClient";
-import { bindSlideDocument } from "./documentBinding";
+import { bindSlideDocument, type SlideBinding } from "./documentBinding";
 
 let client: CollaborationClient | undefined;
-let unbind: (() => void) | undefined;
+let binding: SlideBinding | undefined;
 let statusItem: vscode.StatusBarItem | undefined;
 
 function setStatus(s: string): void {
@@ -20,13 +20,13 @@ async function connect(): Promise<void> {
   const id = `vscode-${vscode.env.sessionId.slice(0, 8)}`;
   client = new CollaborationClient(id);
   client.onStatus = setStatus;
-  unbind = await bindSlideDocument(client);
+  binding = await bindSlideDocument(client);
   try {
     await client.connect();
     void vscode.window.showInformationMessage(`Collab connected as ${id}`);
   } catch (err) {
-    unbind?.();
-    unbind = undefined;
+    binding?.dispose();
+    binding = undefined;
     client.disconnect();
     client = undefined;
     setStatus("offline");
@@ -35,8 +35,8 @@ async function connect(): Promise<void> {
 }
 
 function disconnect(): void {
-  unbind?.();
-  unbind = undefined;
+  binding?.dispose();
+  binding = undefined;
   client?.disconnect();
   client = undefined;
   setStatus("offline");
@@ -52,6 +52,9 @@ export function activate(context: vscode.ExtensionContext): void {
     statusItem,
     vscode.commands.registerCommand("revealjsCollab.connect", () => connect()),
     vscode.commands.registerCommand("revealjsCollab.disconnect", () => disconnect()),
+    // Yjs UndoManager selective undo (open-decisions #2); keybindings when collaborative slide focused.
+    vscode.commands.registerCommand("presentation.undo", () => binding?.undo()),
+    vscode.commands.registerCommand("presentation.redo", () => binding?.redo()),
   );
 
   // Auto-connect when folder was opened because .presentation/workspace.json exists.

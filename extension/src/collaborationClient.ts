@@ -1,10 +1,10 @@
 import * as Y from "yjs";
+import { REMOTE_SYNC } from "./origins";
 
 export type CollabStatus = "offline" | "connecting" | "syncing" | "connected";
 
 const DEFAULT_URL = "ws://127.0.0.1:8000/api/projects/poc/collaboration";
 const PROTOCOL_VERSION = 1;
-const REMOTE_ORIGIN = "remote";
 // ponytail: exp backoff capped at 30s; upgrade to jittered shared retry policy if many clients stampede.
 const BACKOFF_MS = [1000, 2000, 4000, 8000, 16000, 30000];
 
@@ -130,7 +130,8 @@ export class CollaborationClient {
         return;
       }
       const buf = ev.data instanceof ArrayBuffer ? new Uint8Array(ev.data) : new Uint8Array(ev.data as ArrayBuffer);
-      Y.applyUpdate(this.doc, buf, REMOTE_ORIGIN);
+      // REMOTE_SYNC: not tracked by UndoManager (selective local undo).
+      Y.applyUpdate(this.doc, buf, REMOTE_SYNC);
       if (!this.readyFlushed && this.readyFlushTimer) {
         this.flushReady();
       }
@@ -178,7 +179,7 @@ export class CollaborationClient {
   private wireOutgoing(): void {
     this.unsubUpdate?.();
     const handler = (update: Uint8Array, origin: unknown) => {
-      if (origin === REMOTE_ORIGIN) return;
+      if (origin === REMOTE_SYNC) return;
       if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
       this.ws.send(update);
     };

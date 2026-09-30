@@ -24,6 +24,33 @@
       {
         "command": "revealjsCollab.disconnect",
         "title": "RevealJS Collab: Disconnect"
+      },
+      {
+        "command": "presentation.undo",
+        "title": "Presentation: Undo"
+      },
+      {
+        "command": "presentation.redo",
+        "title": "Presentation: Redo"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "presentation.undo",
+        "key": "ctrl+z",
+        "mac": "cmd+z",
+        "when": "presentation.collaborativeEditor && editorTextFocus"
+      },
+      {
+        "command": "presentation.redo",
+        "key": "ctrl+y",
+        "mac": "cmd+shift+z",
+        "when": "presentation.collaborativeEditor && editorTextFocus"
+      },
+      {
+        "command": "presentation.redo",
+        "key": "ctrl+shift+z",
+        "when": "presentation.collaborativeEditor && editorTextFocus"
       }
     ]
   },
