@@ -1,0 +1,45 @@
+# Build context is for the FastAPI server image only.
+# Need: pyproject.toml, uv.lock, src/, .python-version (optional)
+
+# VCS / editors / agents
+.git/
+.cursor/
+AGENTS.md
+
+# Local envs and caches (never copy host venv into image)
+.venv/
+**/__pycache__/
+**/*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+.coverage
+htmlcov/
+
+# Runtime data written on host
+.data/
+
+# Docs and progress (not needed to run the server)
+docs/
+*.md
+!README.md
+
+# Client-side / PoC fixtures (extension talks to published port; not baked into server image)
+extension/
+fixtures/
+tests/
+
+# Node / VS Code extension artifacts if present at repo root later
+node_modules/
+**/node_modules/
+**/.vscode-test/
+*.vsix
+
+# Compose / docker meta (optional; keep Dockerfile out of ignore)
+compose.yaml
+compose.yml
+docker-compose*.yml
+.dockerignore
+
+.gitignore
