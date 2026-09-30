@@ -73,14 +73,21 @@ def _is_relative_asset_url(url: str) -> bool:
     return True
 
 
-def rewrite_chapter_relative_urls(text: str, *, project_id: str, chapter: str) -> str:
-    """Rewrite relative img/video/source/a (and md links) to preview chapter URLs.
+def rewrite_chapter_relative_urls(
+    text: str,
+    *,
+    project_id: str,
+    chapter: str,
+    url_prefix: str | None = None,
+) -> str:
+    """Rewrite relative img/video/source/a (and md links) to absolute chapter URLs.
 
-    Reveal's markdown plugin resolves relative URLs against the HTML page
-    (`/p/{id}/preview`), so chapter-local `hero.png` must become
-    `/p/{id}/preview/{chapter}/hero.png`.
+    Reveal's markdown plugin resolves relative URLs against the HTML page,
+    not the markdown file. Preview pages live at `/p/{id}/preview`; Publish
+    passes `url_prefix=/release/{release_id}` so frozen markdown stays immutable.
     """
-    prefix = f"/p/{project_id}/preview"
+    prefix = url_prefix if url_prefix is not None else f"/p/{project_id}/preview"
+    prefix = prefix.rstrip("/")
     if chapter:
         prefix = f"{prefix}/{chapter}"
 
@@ -164,20 +171,40 @@ def _fallback_shell(title: str) -> str:
     )
 
 
+def fallback_chapters_for(deck_yaml: str, slide_path: str | None) -> list[str] | None:
+    """When deck.yaml lists no chapters, infer from the CRDT-bound slide path."""
+    _title, _runtime, chapters = parse_deck(deck_yaml)
+    if chapters:
+        return None
+    if slide_path and "/" in slide_path:
+        return [slide_path.rsplit("/", 1)[0]]
+    if slide_path == "slide.md":
+        return []
+    return ["01-introduction"]
+
+
 def render_presentation_html(
     *,
     project_id: str,
     index_html: str | None,
     deck_yaml: str,
     fallback_chapters: list[str] | None = None,
+    asset_base: str | None = None,
+    runtime_base: str | None = None,
 ) -> str:
-    """Inject runtime + slides into editable index.html (Preview + Publish)."""
+    """Inject runtime + slides into editable index.html (Preview + Publish).
+
+    Defaults are live Preview URLs. Publish passes absolute `/release/{id}`
+    bases so the artifact does not follow later collaborative edits.
+    """
     title, runtime, chapters = parse_deck(deck_yaml)
     if not chapters and fallback_chapters is not None:
         chapters = list(fallback_chapters)
 
-    base = f"/p/{project_id}/preview"
-    rt = f"/runtimes/{runtime}"
+    base = asset_base if asset_base is not None else f"/p/{project_id}/preview"
+    rt = runtime_base if runtime_base is not None else f"/runtimes/{runtime}"
+    base = base.rstrip("/")
+    rt = rt.rstrip("/")
 
     if chapters:
         sections = [_section_for(f"{base}/{ch}/slide.md") for ch in chapters]

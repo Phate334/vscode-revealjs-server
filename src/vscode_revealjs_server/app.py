@@ -8,6 +8,8 @@ from vscode_revealjs_server.auth import service as auth_service
 from vscode_revealjs_server.auth.deps import require_user, user_from_websocket
 from vscode_revealjs_server.collaboration.manager import manager
 from vscode_revealjs_server.presentation import preview as preview_service
+from vscode_revealjs_server.presentation.publish import publish as publish_release
+from vscode_revealjs_server.presentation.publish import read_published
 from vscode_revealjs_server.presentation.runtime import (
     is_supported_runtime,
     resolve_runtime_file,
@@ -29,6 +31,14 @@ class LoginBody(BaseModel):
 
 class RefreshBody(BaseModel):
     refresh_token: str = Field(min_length=1)
+
+
+class CreateShareBody(BaseModel):
+    role: str = Field(default=ROLE_VIEWER, min_length=1, max_length=32)
+
+
+class AcceptShareBody(BaseModel):
+    token: str = Field(min_length=8, max_length=200)
 
 
 class AddMemberBody(BaseModel):
@@ -95,8 +105,14 @@ def create_project(
 
 
 @app.get("/api/projects")
-def list_projects(user: Annotated[dict[str, str], Depends(require_user)]) -> list[dict]:
-    return project_service.list_projects(user_id=user["id"])
+def list_projects(
+    user: Annotated[dict[str, str], Depends(require_user)],
+    scope: str | None = Query(default=None),
+) -> list[dict]:
+    """scope=owned | shared. Omit for every project the caller belongs to."""
+    if scope not in (None, "owned", "shared"):
+        raise HTTPException(status_code=400, detail="scope must be owned or shared")
+    return project_service.list_projects(user_id=user["id"], scope=scope)
 
 
 @app.get("/api/projects/{project_id}")
@@ -105,7 +121,7 @@ def get_project(
     user: Annotated[dict[str, str], Depends(require_user)],
 ) -> dict:
     _forbid_unless_member(project_id, user["id"])
-    meta = project_service.get(project_id)
+    meta = project_service.get(project_id, user_id=user["id"])
     assert meta is not None
     return meta
 
@@ -254,6 +270,162 @@ async def collaboration_ws(
     else:
         can_write = True
     await manager.handle(websocket, project_id, user_id=user["id"], can_write=can_write)
+
+
+
+@app.post("/api/projects/{project_id}/shares")
+def post_share(
+    project_id: str,
+    body: CreateShareBody,
+    user: Annotated[dict[str, str], Depends(require_user)],
+) -> dict:
+    """Owner creates a reusable invite (Presentation: Share Project)."""
+    _forbid_unless_member(project_id, user["id"])
+    if not project_service.can_manage_members(project_id, user["id"]):
+        raise HTTPException(status_code=403, detail="owner permission required")
+    try:
+        return project_service.create_share(project_id, role=body.role)
+    except FsRejected as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
+@app.get("/api/projects/{project_id}/shares")
+def get_shares(
+    project_id: str,
+    user: Annotated[dict[str, str], Depends(require_user)],
+) -> list[dict]:
+    _forbid_unless_member(project_id, user["id"])
+    if not project_service.can_manage_members(project_id, user["id"]):
+        raise HTTPException(status_code=403, detail="owner permission required")
+    shares = project_service.list_shares(project_id)
+    if shares is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    return shares
+
+
+@app.delete("/api/projects/{project_id}/shares/{share_id}")
+def delete_share(
+    project_id: str,
+    share_id: str,
+    user: Annotated[dict[str, str], Depends(require_user)],
+) -> list[dict]:
+    _forbid_unless_member(project_id, user["id"])
+    if not project_service.can_manage_members(project_id, user["id"]):
+        raise HTTPException(status_code=403, detail="owner permission required")
+    try:
+        return project_service.revoke_share(project_id, share_id)
+    except FsRejected as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
+@app.get("/api/shares/{token}")
+def preview_share(
+    token: str,
+    user: Annotated[dict[str, str], Depends(require_user)],
+) -> dict:
+    """Invite preview for Open Shared (does not join)."""
+    _ = user
+    got = project_service.preview_share(token)
+    if got is None:
+        raise HTTPException(status_code=404, detail="share not found")
+    return got
+
+
+@app.post("/api/shares/accept")
+def accept_share(
+    body: AcceptShareBody,
+    user: Annotated[dict[str, str], Depends(require_user)],
+) -> dict:
+    """Join the project at the share role (no-op if already a member)."""
+    try:
+        return project_service.accept_share(
+            body.token,
+            user_id=user["id"],
+            username=user["username"],
+        )
+    except FsRejected as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
+@app.post("/api/projects/{project_id}/releases")
+def post_release(
+    project_id: str,
+    user: Annotated[dict[str, str], Depends(require_user)],
+) -> dict:
+    """Publish from server collaborative state. Editors and owners only."""
+    _forbid_unless_writer(project_id, user["id"])
+    try:
+        return publish_release(project_id)
+    except FsRejected as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
+@app.get("/api/projects/{project_id}/releases")
+def get_releases(
+    project_id: str,
+    user: Annotated[dict[str, str], Depends(require_user)],
+) -> list[dict]:
+    _forbid_unless_member(project_id, user["id"])
+    rows = project_service.list_releases(project_id)
+    if rows is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    return rows
+
+
+@app.get("/api/projects/{project_id}/releases/{release_id}")
+def get_release(
+    project_id: str,
+    release_id: str,
+    user: Annotated[dict[str, str], Depends(require_user)],
+) -> dict:
+    _forbid_unless_member(project_id, user["id"])
+    row = project_service.get_release(project_id, release_id)
+    if row is None:
+        if project_service.get(project_id) is None:
+            raise HTTPException(status_code=404, detail="project not found")
+        raise HTTPException(status_code=404, detail="release not found")
+    return row
+
+
+def _serve_published(root: object, rel: str) -> Response:
+    from pathlib import Path
+
+    if not isinstance(root, Path):
+        raise HTTPException(status_code=404, detail="not found")
+    try:
+        got = read_published(root, rel)
+    except FsRejected as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    if got is None:
+        raise HTTPException(status_code=404, detail="not found")
+    body, media = got
+    return Response(content=body, media_type=media)
+
+
+@app.get("/s/{slug}")
+@app.get("/s/{slug}/{rel_path:path}")
+def public_slug(slug: str, rel_path: str = "") -> Response:
+    """Current published release for the project slug (pointer)."""
+    root = project_service.resolve_slug_dir(slug)
+    if root is None:
+        raise HTTPException(status_code=404, detail="not published")
+    return _serve_published(root, rel_path)
+
+
+@app.get("/release/{release_id}")
+@app.get("/release/{release_id}/{rel_path:path}")
+def public_release(release_id: str, rel_path: str = "") -> Response:
+    """Immutable release bytes. Content does not follow later publishes."""
+    root = project_service.resolve_release_dir(release_id)
+    if root is None:
+        raise HTTPException(status_code=404, detail="release not found")
+    return _serve_published(root, rel_path)
 
 
 @app.get("/runtimes/{runtime_name}/{runtime_path:path}")

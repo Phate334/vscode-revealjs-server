@@ -7,6 +7,7 @@ Upgrade: §18.1 project tables + membership DB (post-MVP).
 from __future__ import annotations
 
 import hashlib
+import secrets
 import threading
 import json
 import os
@@ -52,6 +53,43 @@ ROLE_EDITOR = "editor"
 ROLE_VIEWER = "viewer"
 ROLES = frozenset({ROLE_OWNER, ROLE_EDITOR, ROLE_VIEWER})
 WRITE_ROLES = frozenset({ROLE_OWNER, ROLE_EDITOR})
+
+_RELEASE_ID = re.compile(r"^rel_[0-9a-f]{12}$")
+_SLUG = re.compile(r"^[a-z0-9][a-z0-9-]{0,60}$")
+_SHARE_ID = re.compile(r"^shr_[0-9a-f]{12}$")
+
+
+def _slugify(name: str) -> str:
+    s = re.sub(r"[^a-z0-9]+", "-", name.strip().lower()).strip("-")[:48]
+    if not s or not s[0].isalnum():
+        return "deck"
+    return s
+
+
+def _share_rows(shares: object) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    if not isinstance(shares, list):
+        return out
+    for row in shares:
+        if not isinstance(row, dict):
+            continue
+        sid, token, role, created = (
+            row.get("id"),
+            row.get("token"),
+            row.get("role"),
+            row.get("created_at"),
+        )
+        if all(isinstance(x, str) for x in (sid, token, role, created)):
+            out.append(
+                {
+                    "id": sid,
+                    "token": token,
+                    "role": role,
+                    "created_at": created,
+                }
+            )
+    return out
+
 
 
 def is_binary_rel(rel: str) -> bool:
@@ -146,8 +184,18 @@ class ProjectService:
             return None
         return int(meta.get("revision", 0))
 
-    def list_projects(self, *, user_id: str | None = None) -> list[dict[str, Any]]:
-        """List projects; when user_id set, only membership (or legacy open) projects."""
+    def list_projects(
+        self,
+        *,
+        user_id: str | None = None,
+        scope: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """List projects; when user_id set, only membership (or legacy open) projects.
+
+        scope: None/all, "owned" (owner_id == user), "shared" (member, not owner).
+        """
+        if scope not in (None, "owned", "shared"):
+            raise ValueError("scope must be owned or shared")
         if not self.root.is_dir():
             return []
         out: list[dict[str, Any]] = []
@@ -159,12 +207,17 @@ class ProjectService:
                 continue
             if user_id is not None and self._role_in_meta(meta, user_id) is None:
                 continue
-            out.append(self._public(meta))
+            owner = meta.get("owner_id")
+            if scope == "owned" and owner != user_id:
+                continue
+            if scope == "shared" and (not isinstance(owner, str) or owner == user_id):
+                continue
+            out.append(self._public(meta, user_id=user_id))
         return out
 
-    def get(self, project_id: str) -> dict[str, Any] | None:
+    def get(self, project_id: str, *, user_id: str | None = None) -> dict[str, Any] | None:
         meta = self._read_meta(project_id)
-        return self._public(meta) if meta else None
+        return self._public(meta, user_id=user_id) if meta else None
 
     def create(self, *, name: str, owner_id: str, owner_username: str) -> dict[str, Any]:
         name = name.strip()
@@ -187,6 +240,10 @@ class ProjectService:
             "created_at": _now(),
             "revision": 0,
             "owner_id": owner_id,
+            "slug": self._alloc_slug(name),
+            "published_release_id": None,
+            "releases": [],
+            "shares": [],
             "members": [
                 {
                     "user_id": owner_id,
@@ -196,7 +253,7 @@ class ProjectService:
             ],
         }
         self._write_meta(meta)
-        return self._public(meta)
+        return self._public(meta, user_id=owner_id)
 
     def collaborative_slide_path(self, project_id: str) -> str | None:
         """Workspace-relative path of the CRDT-bound slide.md (nested preferred)."""
@@ -611,9 +668,297 @@ class ProjectService:
             self._write_meta(meta)
             return self.list_members(project_id) or []
 
+    def _alloc_slug(self, name: str) -> str:
+        """Unique public slug from project name.
+
+        ponytail: scan meta.json files. Ceiling: create races on the same slug.
+        Upgrade: unique index (post-MVP).
+        """
+        base = _slugify(name)
+        taken = self._slugs_in_use()
+        if base not in taken:
+            return base
+        for n in range(2, 100):
+            cand = f"{base}-{n}"
+            if cand not in taken:
+                return cand
+        return f"{base}-{uuid.uuid4().hex[:6]}"
+
+    def _slugs_in_use(self) -> set[str]:
+        found: set[str] = set()
+        if not self.root.is_dir():
+            return found
+        for child in self.root.iterdir():
+            if not child.is_dir():
+                continue
+            meta = self._read_meta(child.name)
+            if not meta:
+                continue
+            slug = meta.get("slug")
+            if isinstance(slug, str) and slug:
+                found.add(slug)
+        return found
+
+    def ensure_slug(self, project_id: str) -> str:
+        """Assign a slug if a pre-share project has none. Returns slug."""
+        with self._mut:
+            meta = self._read_meta(project_id)
+            if meta is None:
+                raise FsRejected("project not found")
+            slug = meta.get("slug")
+            if isinstance(slug, str) and slug:
+                return slug
+            slug = self._alloc_slug(str(meta.get("name") or "deck"))
+            meta["slug"] = slug
+            self._write_meta(meta)
+            return slug
+
+    def create_share(self, project_id: str, *, role: str) -> dict[str, str]:
+        """Reusable invite token. Owner adds members by handing the token out.
+
+        ponytail: token stored in meta.json, no expiry, multi-use until revoked.
+        Ceiling: leaked token. Upgrade: expiry + single-use (post-MVP).
+        """
+        if role not in (ROLE_EDITOR, ROLE_VIEWER):
+            raise ValueError("role must be editor or viewer")
+        with self._mut:
+            meta = self._read_meta(project_id)
+            if meta is None:
+                raise FsRejected("project not found")
+            shares = meta.get("shares")
+            if not isinstance(shares, list):
+                shares = []
+                meta["shares"] = shares
+            row = {
+                "id": f"shr_{uuid.uuid4().hex[:12]}",
+                "token": secrets.token_urlsafe(24),
+                "role": role,
+                "created_at": _now(),
+            }
+            shares.append(row)
+            self._write_meta(meta)
+            return {
+                "id": row["id"],
+                "token": row["token"],
+                "role": role,
+                "project_id": project_id,
+                "created_at": row["created_at"],
+            }
+
+    def list_shares(self, project_id: str) -> list[dict[str, str]] | None:
+        meta = self._read_meta(project_id)
+        if meta is None:
+            return None
+        return _share_rows(meta.get("shares"))
+
+    def revoke_share(self, project_id: str, share_id: str) -> list[dict[str, str]]:
+        if not _SHARE_ID.match(share_id):
+            raise ValueError("share not found")
+        with self._mut:
+            meta = self._read_meta(project_id)
+            if meta is None:
+                raise FsRejected("project not found")
+            shares = meta.get("shares")
+            if not isinstance(shares, list):
+                raise ValueError("share not found")
+            kept = [r for r in shares if not (isinstance(r, dict) and r.get("id") == share_id)]
+            if len(kept) == len(shares):
+                raise ValueError("share not found")
+            meta["shares"] = kept
+            self._write_meta(meta)
+            return _share_rows(kept)
+
+    def _find_share(self, token: str) -> tuple[dict[str, Any], dict[str, Any]] | None:
+        """ponytail: linear scan of project metas. Ceiling: many projects.
+        Upgrade: token → project index.
+        """
+        if not token or not self.root.is_dir():
+            return None
+        for child in self.root.iterdir():
+            if not child.is_dir():
+                continue
+            meta = self._read_meta(child.name)
+            if not meta:
+                continue
+            shares = meta.get("shares")
+            if not isinstance(shares, list):
+                continue
+            for row in shares:
+                if isinstance(row, dict) and row.get("token") == token:
+                    return meta, row
+        return None
+
+    def preview_share(self, token: str) -> dict[str, str] | None:
+        found = self._find_share(token)
+        if found is None:
+            return None
+        meta, row = found
+        role = row.get("role")
+        return {
+            "project_id": meta["id"],
+            "project_name": meta["name"],
+            "role": role if isinstance(role, str) else ROLE_VIEWER,
+            "share_id": str(row.get("id") or ""),
+        }
+
+    def accept_share(self, token: str, *, user_id: str, username: str) -> dict[str, Any]:
+        """Add caller as member at the share's role. Existing members keep their role."""
+        with self._mut:
+            found = self._find_share(token)
+            if found is None:
+                raise FsRejected("share not found")
+            meta, row = found
+            project_id = meta["id"]
+            share_role = row.get("role")
+            if share_role not in (ROLE_EDITOR, ROLE_VIEWER):
+                raise ValueError("invalid share role")
+            existing = self._role_in_meta(meta, user_id)
+            already = existing is not None
+            if not already:
+                members = meta.get("members")
+                if not isinstance(members, list):
+                    members = []
+                    meta["members"] = members
+                members.append({"user_id": user_id, "username": username, "role": share_role})
+                self._write_meta(meta)
+                meta = self._read_meta(project_id) or meta
+            pub = self._public(meta, user_id=user_id)
+            return {"project": pub, "already_member": already}
+
+    def capture_workspace(self, project_id: str) -> dict[str, Any] | None:
+        """Copy collaborative workspace bytes under the mutation lock.
+
+        Text + binary from the server workspace dir only (not a client disk).
+        Caller may overlay the CRDT-bound slide before building a release.
+        """
+        with self._mut:
+            meta = self._read_meta(project_id)
+            if meta is None:
+                return None
+            ws = self._workspace(project_id)
+            files: list[dict[str, str]] = []
+            assets: list[dict[str, Any]] = []
+            if ws.is_dir():
+                for path in sorted(ws.rglob("*")):
+                    if not path.is_file():
+                        continue
+                    rel = path.relative_to(ws).as_posix()
+                    if not _SAFE_REL.match(rel):
+                        continue
+                    if is_binary_rel(rel):
+                        assets.append({"path": rel, "data": path.read_bytes()})
+                    else:
+                        files.append({"path": rel, "content": path.read_text(encoding="utf-8")})
+            slug = meta.get("slug")
+            return {
+                "revision": int(meta.get("revision", 0)),
+                "name": meta["name"],
+                "slug": slug if isinstance(slug, str) else "",
+                "files": files,
+                "assets": assets,
+                "slide_path": self.collaborative_slide_path(project_id),
+            }
+
+    def release_staging_paths(self, project_id: str, release_id: str) -> tuple[Path, Path]:
+        """Return (final_dir, staging_dir). Caller writes staging then renames."""
+        if not _RELEASE_ID.match(release_id):
+            raise FsRejected(f"invalid release id: {release_id!r}")
+        base = self._project_dir(project_id) / "releases"
+        final = base / release_id
+        staging = base / f".{release_id}.building"
+        return final, staging
+
+    def commit_release(self, project_id: str, record: dict[str, Any]) -> dict[str, Any]:
+        """Append an immutable release record and point the public slug at it."""
+        with self._mut:
+            meta = self._read_meta(project_id)
+            if meta is None:
+                raise FsRejected("project not found")
+            if not isinstance(meta.get("slug"), str) or not meta.get("slug"):
+                meta["slug"] = self._alloc_slug(str(meta.get("name") or "deck"))
+            releases = meta.get("releases")
+            if not isinstance(releases, list):
+                releases = []
+                meta["releases"] = releases
+            releases.append(record)
+            meta["published_release_id"] = record["id"]
+            self._write_meta(meta)
+            return self._release_public(meta, record)
+
+    def list_releases(self, project_id: str) -> list[dict[str, Any]] | None:
+        meta = self._read_meta(project_id)
+        if meta is None:
+            return None
+        releases = meta.get("releases")
+        if not isinstance(releases, list):
+            return []
+        return [self._release_public(meta, r) for r in releases if isinstance(r, dict)]
+
+    def get_release(self, project_id: str, release_id: str) -> dict[str, Any] | None:
+        meta = self._read_meta(project_id)
+        if meta is None:
+            return None
+        releases = meta.get("releases")
+        if not isinstance(releases, list):
+            return None
+        for r in releases:
+            if isinstance(r, dict) and r.get("id") == release_id:
+                return self._release_public(meta, r)
+        return None
+
+    def resolve_release_dir(self, release_id: str) -> Path | None:
+        if not _RELEASE_ID.match(release_id) or not self.root.is_dir():
+            return None
+        for child in self.root.iterdir():
+            if not child.is_dir():
+                continue
+            meta = self._read_meta(child.name)
+            if not meta:
+                continue
+            releases = meta.get("releases")
+            if not isinstance(releases, list):
+                continue
+            if any(isinstance(r, dict) and r.get("id") == release_id for r in releases):
+                path = self._project_dir(child.name) / "releases" / release_id
+                return path if path.is_dir() else None
+        return None
+
+    def resolve_slug_dir(self, slug: str) -> Path | None:
+        if not _SLUG.match(slug) or not self.root.is_dir():
+            return None
+        for child in self.root.iterdir():
+            if not child.is_dir():
+                continue
+            meta = self._read_meta(child.name)
+            if not meta or meta.get("slug") != slug:
+                continue
+            rid = meta.get("published_release_id")
+            if not isinstance(rid, str) or not _RELEASE_ID.match(rid):
+                return None
+            path = self._project_dir(child.name) / "releases" / rid
+            return path if path.is_dir() else None
+        return None
+
     @staticmethod
-    def _public(meta: dict[str, Any]) -> dict[str, Any]:
-        out = {
+    def _release_public(meta: dict[str, Any], record: dict[str, Any]) -> dict[str, Any]:
+        slug = meta.get("slug") if isinstance(meta.get("slug"), str) else ""
+        rid = str(record.get("id") or "")
+        return {
+            "id": rid,
+            "project_id": meta["id"],
+            "created_at": record.get("created_at"),
+            "revision": record.get("revision", 0),
+            "content_hash": record.get("content_hash"),
+            "runtime": record.get("runtime"),
+            "slug": slug,
+            "current": meta.get("published_release_id") == rid,
+            "public_path": f"/s/{slug}" if slug else "",
+            "release_path": f"/release/{rid}",
+        }
+
+    @staticmethod
+    def _public(meta: dict[str, Any], *, user_id: str | None = None) -> dict[str, Any]:
+        out: dict[str, Any] = {
             "id": meta["id"],
             "name": meta["name"],
             "created_at": meta["created_at"],
@@ -622,6 +967,16 @@ class ProjectService:
         owner_id = meta.get("owner_id")
         if isinstance(owner_id, str):
             out["owner_id"] = owner_id
+        slug = meta.get("slug")
+        if isinstance(slug, str) and slug:
+            out["slug"] = slug
+        published = meta.get("published_release_id")
+        if isinstance(published, str) and published:
+            out["published_release_id"] = published
+        if user_id:
+            role = ProjectService._role_in_meta(meta, user_id)
+            if role:
+                out["role"] = role
         return out
 
 

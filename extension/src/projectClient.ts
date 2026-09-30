@@ -14,6 +14,8 @@ export type ProjectInfo = {
   name: string;
   created_at: string;
   revision: number;
+  role?: string;
+  slug?: string;
 };
 
 export type Snapshot = {
@@ -27,12 +29,28 @@ export type Snapshot = {
   assets: { path: string; content_hash: string; size: number }[];
 };
 
-export function collabWsUrl(server: string, projectId: string): string {
+let accessTokenGetter: () => Promise<string | undefined> = async () => undefined;
+
+/** Extension wires this to SecretStorage. HTTP and WS attach the token when set. */
+export function setAccessTokenGetter(fn: () => Promise<string | undefined>): void {
+  accessTokenGetter = fn;
+}
+
+async function authHeaders(extra?: Record<string, string>): Promise<Record<string, string>> {
+  const headers: Record<string, string> = { ...extra };
+  const token = await accessTokenGetter();
+  if (token) headers.Authorization = `Bearer ${token}`;
+  return headers;
+}
+
+export async function collabWsUrl(server: string, projectId: string): Promise<string> {
   const base = server.replace(/\/$/, "");
   const ws = base.startsWith("https")
     ? base.replace(/^https/, "wss")
     : base.replace(/^http/, "ws");
-  return `${ws}/api/projects/${encodeURIComponent(projectId)}/collaboration`;
+  const token = await accessTokenGetter();
+  const q = token ? `?access_token=${encodeURIComponent(token)}` : "";
+  return `${ws}/api/projects/${encodeURIComponent(projectId)}/collaboration${q}`;
 }
 
 export async function readWorkspaceMeta(
@@ -72,7 +90,8 @@ export async function writeWorkspaceMeta(
 }
 
 async function httpJson<T>(url: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(url, init);
+  const headers = await authHeaders(init?.headers as Record<string, string> | undefined);
+  const res = await fetch(url, { ...init, headers });
   if (!res.ok) {
     const detail = await res.text().catch(() => "");
     throw new Error(`HTTP ${res.status} ${url}: ${detail || res.statusText}`);
@@ -123,7 +142,7 @@ export async function putAsset(
     .join("/")}${q}`;
   const res = await fetch(url, {
     method: "PUT",
-    headers: { "Content-Type": "application/octet-stream" },
+    headers: await authHeaders({ "Content-Type": "application/octet-stream" }),
     body: Buffer.from(data),
   });
   if (!res.ok) {
@@ -143,7 +162,7 @@ export async function getAsset(
     .split("/")
     .map(encodeURIComponent)
     .join("/")}`;
-  const res = await fetch(url);
+  const res = await fetch(url, { headers: await authHeaders() });
   if (!res.ok) {
     const detail = await res.text().catch(() => "");
     throw new Error(`HTTP ${res.status} GET asset: ${detail || res.statusText}`);
@@ -163,9 +182,93 @@ export async function createProject(
   });
 }
 
-export async function listProjects(server: string): Promise<ProjectInfo[]> {
+export async function listProjects(
+  server: string,
+  scope?: "owned" | "shared",
+): Promise<ProjectInfo[]> {
   const base = server.replace(/\/$/, "");
-  return httpJson<ProjectInfo[]>(`${base}/api/projects`);
+  const q = scope ? `?scope=${scope}` : "";
+  return httpJson<ProjectInfo[]>(`${base}/api/projects${q}`);
+}
+
+export type LoginResult = {
+  access_token: string;
+  refresh_token: string;
+  user: { id: string; username: string };
+};
+
+export async function login(
+  server: string,
+  username: string,
+  password: string,
+): Promise<LoginResult> {
+  const base = server.replace(/\/$/, "");
+  return httpJson<LoginResult>(`${base}/api/auth/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username, password }),
+  });
+}
+
+export type ShareInvite = {
+  id: string;
+  token: string;
+  role: string;
+  project_id: string;
+};
+
+export async function createShare(
+  server: string,
+  projectId: string,
+  role: "editor" | "viewer",
+): Promise<ShareInvite> {
+  const base = server.replace(/\/$/, "");
+  return httpJson<ShareInvite>(
+    `${base}/api/projects/${encodeURIComponent(projectId)}/shares`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ role }),
+    },
+  );
+}
+
+export async function acceptShare(
+  server: string,
+  token: string,
+): Promise<{ project: ProjectInfo; already_member: boolean }> {
+  const base = server.replace(/\/$/, "");
+  return httpJson(`${base}/api/shares/accept`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ token }),
+  });
+}
+
+export type MemberInfo = { user_id: string; username: string; role: string };
+
+export async function listMembers(server: string, projectId: string): Promise<MemberInfo[]> {
+  const base = server.replace(/\/$/, "");
+  return httpJson<MemberInfo[]>(
+    `${base}/api/projects/${encodeURIComponent(projectId)}/members`,
+  );
+}
+
+export type ReleaseInfo = {
+  id: string;
+  public_path: string;
+  release_path: string;
+  current: boolean;
+  revision: number;
+  slug?: string;
+};
+
+export async function publishRelease(server: string, projectId: string): Promise<ReleaseInfo> {
+  const base = server.replace(/\/$/, "");
+  return httpJson<ReleaseInfo>(
+    `${base}/api/projects/${encodeURIComponent(projectId)}/releases`,
+    { method: "POST" },
+  );
 }
 
 export async function fetchSnapshot(

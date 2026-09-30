@@ -13,7 +13,7 @@ from pathlib import PurePosixPath
 
 from vscode_revealjs_server.collaboration.manager import manager
 from vscode_revealjs_server.presentation.render import (
-    parse_deck,
+    fallback_chapters_for,
     render_presentation_html,
     rewrite_chapter_relative_urls,
 )
@@ -91,22 +91,11 @@ def compose_index(project_id: str) -> PreviewBytes | None:
         return None
     deck = project_service.read_workspace_text(project_id, "deck.yaml") or ""
     index_html = project_service.read_workspace_text(project_id, "index.html")
-
-    fallback: list[str] | None = None
-    _title, _rt, chapters = parse_deck(deck)
-    if not chapters:
-        slide = project_service.collaborative_slide_path(project_id)
-        if slide and "/" in slide:
-            fallback = [slide.rsplit("/", 1)[0]]
-        elif slide == "slide.md":
-            fallback = []
-        else:
-            fallback = ["01-introduction"]
-
+    slide = project_service.collaborative_slide_path(project_id)
     body = render_presentation_html(
         project_id=project_id,
         index_html=index_html,
         deck_yaml=deck,
-        fallback_chapters=fallback,
+        fallback_chapters=fallback_chapters_for(deck, slide),
     )
     return PreviewBytes(body.encode("utf-8"), "text/html; charset=utf-8")

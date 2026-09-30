@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Live smoke against compose-published port (AGENTS: no host uvicorn for live checks).
 # Covers: health, auth, JWT-gated projects/snapshot/assets/members, preview (open),
-# runtime static, chapter-relative rewrite, collaboration WS token gate.
+# runtime static, chapter-relative rewrite, collaboration WS token gate,
+# share invite/accept, publish immutable release + public slug.
 # CRDT unsaved-edit visibility: real VS Code EDH only.
 set -euo pipefail
 BASE="${1:-http://127.0.0.1:8000}"
@@ -222,5 +223,142 @@ DEL="$(curl -sfS -X DELETE "${BASE}/api/projects/${PID}/members/usr_alice" \
 echo "${DEL}" | grep -q 'usr_demo' || fail "delete body: ${DEL}"
 echo "${DEL}" | grep -q 'usr_alice' && fail "alice still present after delete"
 pass "delete member alice"
+
+echo "POST share (owner) + alice accept as viewer"
+SHARE="$(curl -sfS -X POST "${BASE}/api/projects/${PID}/shares" \
+  -H 'Content-Type: application/json' -H "$(auth_hdr)" \
+  -d '{"role":"viewer"}')" || fail "create share"
+TOKEN="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])' <<<"${SHARE}")"
+SHARE_ID="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' <<<"${SHARE}")"
+[[ -n "${TOKEN}" && -n "${SHARE_ID}" ]] || fail "share body: ${SHARE}"
+PREV_SHARE="$(curl -sfS "${BASE}/api/shares/${TOKEN}" -H "Authorization: Bearer ${ALICE_ACCESS}")" \
+  || fail "preview share"
+echo "${PREV_SHARE}" | grep -q "${PID}" || fail "preview share body: ${PREV_SHARE}"
+ACC="$(curl -sfS -X POST "${BASE}/api/shares/accept" \
+  -H 'Content-Type: application/json' -H "Authorization: Bearer ${ALICE_ACCESS}" \
+  -d "{\"token\":\"${TOKEN}\"}")" || fail "accept share"
+echo "${ACC}" | grep -q '"role":"viewer"' || fail "accept role: ${ACC}"
+echo "${ACC}" | grep -q '"already_member":false' || fail "expected new member: ${ACC}"
+OWN="$(curl -sfS -X POST "${BASE}/api/shares/accept" \
+  -H 'Content-Type: application/json' -H "$(auth_hdr)" \
+  -d "{\"token\":\"${TOKEN}\"}")" || fail "owner accept"
+echo "${OWN}" | grep -q '"already_member":true' || fail "owner already member: ${OWN}"
+echo "${OWN}" | grep -q '"role":"owner"' || fail "owner role changed: ${OWN}"
+pass "share create/accept"
+
+echo "alice scope=shared includes project; scope=owned does not"
+SHARED="$(curl -sfS "${BASE}/api/projects?scope=shared" -H "Authorization: Bearer ${ALICE_ACCESS}")" \
+  || fail "list shared"
+echo "${SHARED}" | grep -q "${PID}" || fail "shared list missing ${PID}: ${SHARED}"
+OWNED="$(curl -sfS "${BASE}/api/projects?scope=owned" -H "Authorization: Bearer ${ALICE_ACCESS}")" \
+  || fail "list owned alice"
+if echo "${OWNED}" | grep -q "${PID}"; then
+  fail "owned list should not include shared ${PID}: ${OWNED}"
+fi
+DEMO_OWNED="$(curl -sfS "${BASE}/api/projects?scope=owned" -H "$(auth_hdr)")" || fail "list owned demo"
+echo "${DEMO_OWNED}" | grep -q "${PID}" || fail "owner missing from owned: ${DEMO_OWNED}"
+CODE="$(curl -sS -o /dev/null -w '%{http_code}' "${BASE}/api/projects?scope=nope" -H "$(auth_hdr)" || true)"
+[[ "${CODE}" == "400" ]] || fail "expected 400 bad scope, got ${CODE}"
+pass "project scope owned/shared"
+
+echo "viewer cannot publish; anonymous 401"
+CODE="$(curl -sS -o /dev/null -w '%{http_code}' -X POST "${BASE}/api/projects/${PID}/releases" \
+  -H "Authorization: Bearer ${ALICE_ACCESS}" || true)"
+[[ "${CODE}" == "403" ]] || fail "expected 403 viewer publish, got ${CODE}"
+CODE="$(curl -sS -o /dev/null -w '%{http_code}' -X POST "${BASE}/api/projects/${PID}/releases" || true)"
+[[ "${CODE}" == "401" ]] || fail "expected 401 publish no token, got ${CODE}"
+CODE="$(curl -sS -o /dev/null -w '%{http_code}' -X POST "${BASE}/api/projects/${PID}/shares" \
+  -H 'Content-Type: application/json' -H "Authorization: Bearer ${ALICE_ACCESS}" \
+  -d '{"role":"editor"}' || true)"
+[[ "${CODE}" == "403" ]] || fail "expected 403 viewer share, got ${CODE}"
+pass "publish/share permission gates"
+
+echo "POST release from server collaborative state"
+REL1_JSON="$(curl -sfS -X POST "${BASE}/api/projects/${PID}/releases" -H "$(auth_hdr)")" || fail "publish 1"
+REL1="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' <<<"${REL1_JSON}")"
+SLUG_PATH="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["public_path"])' <<<"${REL1_JSON}")"
+REL1_PATH="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["release_path"])' <<<"${REL1_JSON}")"
+[[ "${REL1}" == rel_* ]] || fail "bad release id ${REL1}"
+HTML1="$(curl -sfS "${BASE}${REL1_PATH}")" || fail "GET release 1"
+echo "${HTML1}" | grep -q "/release/${REL1}/runtime/reveal.js" || fail "release html runtime url"
+echo "${HTML1}" | grep -q "/release/${REL1}/01-introduction/slide.md" || fail "release html slide url"
+if echo "${HTML1}" | grep -q "/p/${PID}/preview"; then
+  fail "release html still points at live preview"
+fi
+curl -sfS -o /dev/null "${BASE}/release/${REL1}/runtime/reveal.js" || fail "frozen runtime file"
+SLUG_HTML="$(curl -sfS "${BASE}${SLUG_PATH}")" || fail "GET slug"
+echo "${SLUG_HTML}" | grep -q "/release/${REL1}/" || fail "slug did not serve release 1"
+pass "publish release ${REL1} slug ${SLUG_PATH}"
+
+if [[ ! -d "${DATA_PROJECTS}/${PID}/workspace" ]]; then
+  fail "publish delta needs host project volume ${DATA_PROJECTS}/${PID}/workspace"
+fi
+echo "mutate server workspace disk (not CRDT) then publish again"
+cat > /tmp/smoke-mutate-deck.py << 'DISKPY'
+import sys
+from pathlib import Path
+ws = Path(sys.argv[1])
+deck_path = ws / "deck.yaml"
+deck = deck_path.read_text(encoding="utf-8")
+needle = "  - 01-introduction\n"
+if "03-delta" not in deck:
+    if needle not in deck:
+        raise SystemExit("deck missing introduction chapter")
+    deck_path.write_text(deck.replace(needle, needle + "  - 03-delta\n", 1), encoding="utf-8")
+(ws / "03-delta").mkdir(exist_ok=True)
+(ws / "03-delta" / "slide.md").write_text("# DELTA_CHAPTER\n\n![hero](hero.png)\n", encoding="utf-8")
+(ws / "01-introduction" / "slide.md").write_text("# DISK_ONLY_MARKER\n", encoding="utf-8")
+print("mutated")
+DISKPY
+MUT="$(sudo python3 /tmp/smoke-mutate-deck.py "${DATA_PROJECTS}/${PID}/workspace")" || fail "mutate workspace"
+echo "${MUT}" | grep -q mutated || fail "mutate output: ${MUT}"
+REL2_JSON="$(curl -sfS -X POST "${BASE}/api/projects/${PID}/releases" -H "$(auth_hdr)")" || fail "publish 2"
+REL2="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' <<<"${REL2_JSON}")"
+[[ "${REL2}" != "${REL1}" ]] || fail "release id reused"
+HTML1B="$(curl -sfS "${BASE}/release/${REL1}")" || fail "reget release 1"
+[[ "${HTML1B}" == "${HTML1}" ]] || fail "release 1 html changed after second publish"
+HTML2="$(curl -sfS "${BASE}/release/${REL2}")" || fail "GET release 2"
+echo "${HTML2}" | grep -q "03-delta/slide.md" || fail "release 2 missing delta chapter"
+if echo "${HTML1B}" | grep -q "03-delta"; then
+  fail "release 1 gained delta chapter"
+fi
+SLUG2="$(curl -sfS "${BASE}${SLUG_PATH}")" || fail "slug after republish"
+echo "${SLUG2}" | grep -q "/release/${REL2}/" || fail "slug did not move to release 2"
+if echo "${SLUG2}" | grep -q "/release/${REL1}/"; then
+  fail "slug still pinned to release 1"
+fi
+S1="$(curl -sfS "${BASE}/release/${REL1}/01-introduction/slide.md")" || fail "rel1 slide"
+S2="$(curl -sfS "${BASE}/release/${REL2}/01-introduction/slide.md")" || fail "rel2 slide"
+echo "${S1}" | grep -q "First slide" || fail "rel1 slide lost collaborative text: ${S1}"
+echo "${S2}" | grep -q "First slide" || fail "rel2 slide did not use CRDT: ${S2}"
+if echo "${S1}${S2}" | grep -q "DISK_ONLY_MARKER"; then
+  fail "publish followed disk edit instead of CRDT"
+fi
+MD2="$(curl -sfS "${BASE}/release/${REL2}/03-delta/slide.md")" || fail "delta md"
+echo "${MD2}" | grep -q "/release/${REL2}/03-delta/hero.png" || fail "publish rewrite missing: ${MD2}"
+LIST="$(curl -sfS "${BASE}/api/projects/${PID}/releases" -H "$(auth_hdr)")" || fail "list releases"
+echo "${LIST}" | grep -q "${REL1}" || fail "history missing rel1"
+echo "${LIST}" | grep -q "${REL2}" || fail "history missing rel2"
+ONE="$(curl -sfS "${BASE}/api/projects/${PID}/releases/${REL1}" -H "$(auth_hdr)")" || fail "get release meta"
+echo "${ONE}" | grep -q '"current":false' || fail "rel1 should not be current: ${ONE}"
+TWO="$(curl -sfS "${BASE}/api/projects/${PID}/releases/${REL2}" -H "Authorization: Bearer ${ALICE_ACCESS}")" \
+  || fail "viewer get release meta"
+echo "${TWO}" | grep -q '"current":true' || fail "rel2 current: ${TWO}"
+CODE="$(curl -sS -o /dev/null -w '%{http_code}' --path-as-is \
+  "${BASE}/release/${REL2}/../${REL1}/index.html" || true)"
+[[ "${CODE}" == "400" || "${CODE}" == "404" ]] || fail "expected 400/404 traversal, got ${CODE}"
+pass "immutable release + slug pointer"
+
+echo "revoke share; accept fails"
+REV="$(curl -sfS -X DELETE "${BASE}/api/projects/${PID}/shares/${SHARE_ID}" -H "$(auth_hdr)")" \
+  || fail "revoke share"
+if echo "${REV}" | grep -q "${SHARE_ID}"; then
+  fail "revoked share still listed: ${REV}"
+fi
+CODE="$(curl -sS -o /dev/null -w '%{http_code}' -X POST "${BASE}/api/shares/accept" \
+  -H 'Content-Type: application/json' -H "Authorization: Bearer ${ALICE_ACCESS}" \
+  -d "{\"token\":\"${TOKEN}\"}" || true)"
+[[ "${CODE}" == "404" ]] || fail "expected 404 revoked share, got ${CODE}"
+pass "revoke share"
 
 echo "=== all compose smoke checks passed ==="

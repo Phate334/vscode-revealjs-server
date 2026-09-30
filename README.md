@@ -69,6 +69,32 @@ WS       /api/projects/{id}/collaboration
 
 Create sets the caller as **owner**. Roles: `owner` | `editor` | `viewer` (write = owner/editor). Members APIs are owner-only for add/remove.
 
+### Sharing
+
+Owner-only invite. Token is reusable until revoked. Accept adds the caller as `editor` or `viewer` (existing members keep their role). `GET /api/projects?scope=shared` is the Open Shared list; `scope=owned` is Open Project.
+
+```text
+POST   /api/projects/{id}/shares          {"role":"viewer"|"editor"} → {id, token, role}
+GET    /api/projects/{id}/shares
+DELETE /api/projects/{id}/shares/{share_id}
+GET    /api/shares/{token}                invite preview
+POST   /api/shares/accept                 {"token"} → {project, already_member}
+GET    /api/projects?scope=owned|shared
+```
+
+### Publish
+
+`POST /api/projects/{id}/releases` builds from **server** collaborative state (CRDT slide if present, else workspace disk). Same `presentation.render` injection as Preview, but URLs are frozen under `/release/{release_id}/` (runtime copied into the release). Republish allocates a new id and moves the slug pointer. Old `/release/{id}` bytes do not change. Viewers cannot publish.
+
+```text
+POST/GET /api/projects/{id}/releases
+GET      /api/projects/{id}/releases/{release_id}
+GET      /s/{slug}                  current pointer (public)
+GET      /s/{slug}/{path}
+GET      /release/{release_id}      immutable (public)
+GET      /release/{release_id}/{path}
+```
+
 Demo curl:
 
 ```bash

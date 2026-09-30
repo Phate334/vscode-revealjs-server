@@ -15,7 +15,12 @@
     "workspaceContains:.presentation/workspace.json",
     "onCommand:presentation.createProject",
     "onCommand:presentation.openProject",
-    "onCommand:presentation.openPreview"
+    "onCommand:presentation.openPreview",
+    "onCommand:presentation.signIn",
+    "onCommand:presentation.openSharedProject",
+    "onCommand:presentation.shareProject",
+    "onCommand:presentation.projectMembers",
+    "onCommand:presentation.publish"
   ],
   "main": "./out/extension.js",
   "contributes": {
@@ -43,6 +48,26 @@
       {
         "command": "presentation.openProject",
         "title": "Presentation: Open Project"
+      },
+      {
+        "command": "presentation.signIn",
+        "title": "Presentation: Sign In"
+      },
+      {
+        "command": "presentation.openSharedProject",
+        "title": "Presentation: Open Shared Project"
+      },
+      {
+        "command": "presentation.shareProject",
+        "title": "Presentation: Share Project"
+      },
+      {
+        "command": "presentation.projectMembers",
+        "title": "Presentation: Project Members"
+      },
+      {
+        "command": "presentation.publish",
+        "title": "Presentation: Publish"
       },
       {
         "command": "presentation.openPreview",

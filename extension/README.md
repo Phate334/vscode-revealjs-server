@@ -36,9 +36,14 @@ code --extensionDevelopmentPath=$PWD \
 
 Or open `extension/` and press F5 (`.vscode/launch.json` → Alice fixture).
 
-Each window auto-connects when `.presentation/workspace.json` is present (fixtures ship with
-`server` + `projectId`), or run **RevealJS Collab: Connect** / **Presentation: Create Project** /
-**Presentation: Open Project**. Missing metadata fails clearly — create or open a project first.
+Run **Presentation: Sign In** first (`demo` / `demo` or `alice` / `alice` against compose).
+The access token is stored in VS Code SecretStorage and attached to project HTTP calls and the
+collaboration WebSocket (`?access_token=`). A window auto-connects only when both
+`.presentation/workspace.json` and a saved token are present.
+
+**Presentation: Share Project** copies an invite token. **Presentation: Open Shared Project**
+accepts that token, then extracts the snapshot. **Presentation: Publish** returns the public
+slug URL (copied) and the immutable `/release/{id}` URL.
 
 Edit `slide.md` on either side; the other should converge.
 
