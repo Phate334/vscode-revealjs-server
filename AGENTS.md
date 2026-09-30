@@ -37,3 +37,10 @@ Mark intentional PoC shortcuts with a `ponytail:` comment naming the ceiling and
 
 - Do not invent or change the local git author identity.
 - Do not commit local-only progress / process files if they exist and are gitignored (e.g. milestone progress trackers).
+
+# Releases
+
+- Canonical version is `pyproject.toml` `[project].version` (e.g. `0.1.0`).
+- To cut a release: bump that version first, keep `compose.yaml` `image:` tag on the same `X.Y.Z`, commit, push `main`, then create and push git tag `vX.Y.Z` (must match exactly). Do not push a release tag before the version bump is on the commit being tagged.
+- Tag `v*` triggers `.github/workflows/release.yml` (VSIX on GitHub Release + multi-arch image to `ghcr.io/phate334/vscode-revealjs-server`).
+- Do not invent ad-hoc version numbers in the extension or image tags that diverge from `pyproject.toml`.

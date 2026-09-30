@@ -5,7 +5,8 @@ FastAPI collaboration server (uv) + VS Code extension PoC.
 ## Server (Docker Compose)
 
 ```bash
-docker compose up -d --build
+docker compose pull
+docker compose up -d
 ./scripts/compose-smoke.sh   # GET http://127.0.0.1:8000/health → {"status":"ok"}
 ```
 
@@ -45,7 +46,7 @@ docker pull ghcr.io/phate334/vscode-revealjs-server:latest
 
 For a private package, authenticate first (`gh auth token | docker login ghcr.io -u USER --password-stdin`) and ensure you have package read access.
 
-Local compose still builds from the Dockerfile (`docker compose up -d --build`).
+Compose pulls `ghcr.io/phate334/vscode-revealjs-server:<version>` (see `compose.yaml`). Private GHCR needs `docker login ghcr.io` first. To iterate on the Dockerfile locally, temporarily switch the service back to `build: .`.
 
 ## Collaborative text (multi-doc)
 
