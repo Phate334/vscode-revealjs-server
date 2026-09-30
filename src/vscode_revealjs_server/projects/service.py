@@ -187,19 +187,40 @@ class ProjectService:
         self._write_meta(meta)
         return self._public(meta)
 
-    def collaborative_slide_text(self, project_id: str) -> str | None:
-        """Prefer nested chapter slide.md, else root — for empty-room CRDT seed."""
+    def collaborative_slide_path(self, project_id: str) -> str | None:
+        """Workspace-relative path of the CRDT-bound slide.md (nested preferred)."""
         ws = self._workspace(project_id)
         if not ws.is_dir():
             return None
-        nested = sorted(ws.glob(f"*/slide.md"))
+        nested = sorted(ws.glob("*/slide.md"))
         if nested:
-            return nested[0].read_text(encoding="utf-8")
+            return nested[0].relative_to(ws).as_posix()
         root = ws / "slide.md"
         if root.is_file():
-            return root.read_text(encoding="utf-8")
+            return "slide.md"
         hits = sorted(ws.rglob("slide.md"))
-        return hits[0].read_text(encoding="utf-8") if hits else None
+        return hits[0].relative_to(ws).as_posix() if hits else None
+
+    def collaborative_slide_text(self, project_id: str) -> str | None:
+        """Prefer nested chapter slide.md, else root — for empty-room CRDT seed."""
+        rel = self.collaborative_slide_path(project_id)
+        if not rel:
+            return None
+        return self.read_workspace_text(project_id, rel)
+
+    def read_workspace_text(self, project_id: str, rel: str) -> str | None:
+        """Read utf-8 text from server collaborative workspace disk (not client FS)."""
+        meta = self._read_meta(project_id)
+        if meta is None:
+            return None
+        if not isinstance(rel, str) or not _SAFE_REL.match(rel):
+            raise FsRejected(f"invalid path: {rel!r}")
+        if is_binary_rel(rel):
+            raise FsRejected(f"not a text path: {rel!r}")
+        dest = self._resolve_rel(project_id, rel)
+        if not dest.is_file():
+            return None
+        return dest.read_text(encoding="utf-8")
 
     def _build_snapshot_unlocked(self, project_id: str, meta: dict[str, Any]) -> dict[str, Any]:
         """Build manifest; caller holds _mut."""

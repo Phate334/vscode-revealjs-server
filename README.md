@@ -16,3 +16,16 @@ Acceptance and live checks use the compose endpoint (`localhost:8000`), not host
 ## Extension
 
 See `extension/README.md`. Connect URL comes from `.presentation/workspace.json` (`server` + `projectId`); fixtures already include that file.
+
+## Preview (M2)
+
+Server Preview reads collaborative state (CRDT text + workspace assets), not client disks:
+
+```text
+GET /p/{project_id}/preview
+GET /p/{project_id}/preview/{path}
+GET /runtimes/reveal-v1/...   # shared reveal.js runtime (Publish will reuse)
+```
+
+In VS Code: **Presentation: Open Preview** opens the Server Preview URL from `.presentation/workspace.json`.
+

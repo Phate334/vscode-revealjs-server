@@ -61,3 +61,10 @@ Edit `slide.md` on either side; the other should converge.
 - Local typing uses origin `LOCAL_EDITOR` → tracked by per-doc `Y.UndoManager`.
 - Remote applies use `REMOTE_SYNC`; FileSystemWatcher / reconcile diffs use `FS_RECONCILE` (not undo-tracked).
 - Keybindings: Ctrl/Cmd+Z / redo → `presentation.undo` / `presentation.redo` when `presentation.collaborativeEditor && editorTextFocus`.
+
+## Preview
+
+**Presentation: Open Preview** opens `{server}/p/{projectId}/preview` using
+`.presentation/workspace.json` (same metadata as Connect). The browser shows Server
+collaborative state (including unsaved CRDT text edits).
+

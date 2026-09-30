@@ -78,6 +78,15 @@ class CollaborationRoom:
             return None
         return update
 
+    def collaborative_text(self) -> str | None:
+        """Current Y.Text('content'); None only when CRDT not yet seeded."""
+        from pycrdt import Text
+
+        if self.crdt_generation <= 0:
+            return None
+        ytext = self.doc.get("content", type=Text)
+        return str(ytext)
+
     async def join(self, ws: WebSocket, client_id: str = "") -> None:
         self.clients.add(ws)
         if client_id:
@@ -137,6 +146,10 @@ class CollaborationManager:
         if project_id not in self._rooms:
             self._rooms[project_id] = CollaborationRoom(project_id)
         return self._rooms[project_id]
+
+    def collaborative_text(self, project_id: str) -> str | None:
+        """Live CRDT text for project (loads persisted blob if room cold)."""
+        return self.room(project_id).collaborative_text()
 
     def _workspace_revision(self, project_id: str) -> int:
         rev = project_service.revision(project_id)

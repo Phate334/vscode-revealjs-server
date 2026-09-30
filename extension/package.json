@@ -14,7 +14,8 @@
     "onCommand:revealjsCollab.connect",
     "workspaceContains:.presentation/workspace.json",
     "onCommand:presentation.createProject",
-    "onCommand:presentation.openProject"
+    "onCommand:presentation.openProject",
+    "onCommand:presentation.openPreview"
   ],
   "main": "./out/extension.js",
   "contributes": {
@@ -42,6 +43,10 @@
       {
         "command": "presentation.openProject",
         "title": "Presentation: Open Project"
+      },
+      {
+        "command": "presentation.openPreview",
+        "title": "Presentation: Open Preview"
       }
     ],
     "keybindings": [

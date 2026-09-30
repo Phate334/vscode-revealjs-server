@@ -11,6 +11,7 @@ import {
   readWorkspaceMeta,
   writeWorkspaceMeta,
 } from "./projectClient";
+import { openPreview } from "./preview";
 import { SyncController } from "./syncController";
 
 let client: CollaborationClient | undefined;
@@ -197,6 +198,7 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("presentation.redo", () => binding?.redo()),
     vscode.commands.registerCommand("presentation.createProject", () => cmdCreateProject()),
     vscode.commands.registerCommand("presentation.openProject", () => cmdOpenProject()),
+    vscode.commands.registerCommand("presentation.openPreview", () => openPreview()),
   );
 
   void readWorkspaceMeta().then((meta) => {

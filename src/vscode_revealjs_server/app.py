@@ -1,7 +1,11 @@
+import mimetypes
+
 from fastapi import FastAPI, HTTPException, Query, Request, Response, WebSocket
 from pydantic import BaseModel, Field
 
 from vscode_revealjs_server.collaboration.manager import manager
+from vscode_revealjs_server.presentation import preview as preview_service
+from vscode_revealjs_server.presentation.runtime import resolve_runtime_file
 from vscode_revealjs_server.projects import project_service
 from vscode_revealjs_server.projects.service import FsRejected
 
@@ -96,3 +100,42 @@ def get_asset(project_id: str, asset_path: str) -> Response:
 async def collaboration_ws(websocket: WebSocket, project_id: str) -> None:
     # ponytail: fixed PoC project_id path only; no auth. Upgrade: token + membership (M3).
     await manager.handle(websocket, project_id)
+
+
+@app.get("/runtimes/{runtime_name}/{runtime_path:path}")
+def get_runtime(runtime_name: str, runtime_path: str) -> Response:
+    """Shared reveal runtime files (Preview + future Publish)."""
+    path = resolve_runtime_file(runtime_path, name=runtime_name)
+    if path is None:
+        raise HTTPException(status_code=404, detail="runtime file not found")
+    media, _ = mimetypes.guess_type(str(path))
+    return Response(content=path.read_bytes(), media_type=media or "application/octet-stream")
+
+
+@app.get("/p/{project_id}/preview")
+def preview_index(project_id: str) -> Response:
+    """Server Preview HTML composed from collaborative state (§19)."""
+    # Trailing-slash alias keeps relative fetches consistent for clients that append /.
+    got = preview_service.compose_index(project_id)
+    if got is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    return Response(content=got.body, media_type=got.media_type)
+
+
+@app.get("/p/{project_id}/preview/")
+def preview_index_slash(project_id: str) -> Response:
+    return preview_index(project_id)
+
+
+@app.get("/p/{project_id}/preview/{preview_path:path}")
+def preview_path(project_id: str, preview_path: str) -> Response:
+    """Preview path: CRDT text for bound slide, else collaborative workspace/assets."""
+    try:
+        got = preview_service.resolve_path(project_id, preview_path)
+    except FsRejected as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    if got is None:
+        if project_service.get(project_id) is None:
+            raise HTTPException(status_code=404, detail="project not found")
+        raise HTTPException(status_code=404, detail="preview path not found")
+    return Response(content=got.body, media_type=got.media_type)
