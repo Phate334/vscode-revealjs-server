@@ -43,3 +43,9 @@ Each window auto-connects when `.presentation/workspace.json` is present, or run
 - First text frame: `{"type":"hello","client_id":"...","protocol_version":1}`
 - Server: `ready` JSON, then optional binary Yjs snapshot
 - Further binary frames: Yjs updates (`Y.Doc` text key `content`)
+
+## M0 sync notes
+
+- **External rewrite:** `FileSystemWatcher` on workspace `slide.md` reads disk, prefix/suffix-diffs into local Y.Text (skips OriginTracker remote applies + equal content; 150ms debounce).
+- **Reconnect:** WS drop → status `offline`, exp backoff retry → `syncing` → hello again → merge (apply server snapshot + push full local Yjs state).
+

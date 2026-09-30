@@ -1,8 +1,11 @@
 import * as vscode from "vscode";
+import type * as Y from "yjs";
 import type { CollaborationClient } from "./collaborationClient";
 import { OriginTracker } from "./originTracker";
 
 const SLIDE_NAME = "slide.md";
+// ponytail: single-file PoC debounce; raise / coalesce if bulk rewrite loops (open decision #4).
+const WATCHER_DEBOUNCE_MS = 150;
 
 /** Find slide.md at workspace root (or first match). */
 async function findSlideUri(): Promise<vscode.Uri | undefined> {
@@ -23,8 +26,38 @@ async function findSlideUri(): Promise<vscode.Uri | undefined> {
 }
 
 /**
+ * Apply external file text onto Y.Text via prefix/suffix diff (keeps CRDT merge on unchanged spans).
+ * Do not replace the whole string in one shot — that bypasses concurrent merge.
+ */
+function applyTextDiff(doc: Y.Doc, ytext: Y.Text, oldText: string, newText: string): void {
+  if (oldText === newText) return;
+  let start = 0;
+  const oldLen = oldText.length;
+  const newLen = newText.length;
+  while (start < oldLen && start < newLen && oldText.charCodeAt(start) === newText.charCodeAt(start)) {
+    start++;
+  }
+  let oldEnd = oldLen;
+  let newEnd = newLen;
+  while (
+    oldEnd > start &&
+    newEnd > start &&
+    oldText.charCodeAt(oldEnd - 1) === newText.charCodeAt(newEnd - 1)
+  ) {
+    oldEnd--;
+    newEnd--;
+  }
+  doc.transact(() => {
+    const del = oldEnd - start;
+    if (del > 0) ytext.delete(start, del);
+    if (newEnd > start) ytext.insert(start, newText.slice(start, newEnd));
+  });
+}
+
+/**
  * Bind one slide.md to client.ytext.
  * Local edits → Y.Text; remote Y.Text → WorkspaceEdit (OriginTracker skips echo).
+ * FileSystemWatcher: external disk rewrite → diff → local CRDT transaction.
  */
 export async function bindSlideDocument(client: CollaborationClient): Promise<() => void> {
   const uri = await findSlideUri();
@@ -89,8 +122,43 @@ export async function bindSlideDocument(client: CollaborationClient): Promise<()
     });
   });
 
+  let watchTimer: ReturnType<typeof setTimeout> | undefined;
+  const folder = vscode.workspace.getWorkspaceFolder(uri);
+  const pattern = folder
+    ? new vscode.RelativePattern(folder, SLIDE_NAME)
+    : new vscode.RelativePattern(vscode.Uri.joinPath(uri, ".."), SLIDE_NAME);
+  const watcher = vscode.workspace.createFileSystemWatcher(pattern);
+
+  const onDiskEvent = () => {
+    // Skip while our remote WorkspaceEdit is in flight (echo / save churn).
+    if (origin.isRemote()) return;
+    if (watchTimer) clearTimeout(watchTimer);
+    watchTimer = setTimeout(() => {
+      watchTimer = undefined;
+      void (async () => {
+        if (origin.isRemote()) return;
+        try {
+          const bytes = await vscode.workspace.fs.readFile(uri);
+          const diskText = Buffer.from(bytes).toString("utf8");
+          const crdtText = ytext.toString();
+          if (diskText === crdtText) return;
+          applyTextDiff(client.doc, ytext, crdtText, diskText);
+        } catch {
+          // deleted / unreadable — PoC ignores
+        }
+      })();
+    }, WATCHER_DEBOUNCE_MS);
+  };
+
+  const wChange = watcher.onDidChange(onDiskEvent);
+  const wCreate = watcher.onDidCreate(onDiskEvent);
+
   return () => {
     ytext.unobserve(yObserver);
     changeSub.dispose();
+    if (watchTimer) clearTimeout(watchTimer);
+    wChange.dispose();
+    wCreate.dispose();
+    watcher.dispose();
   };
 }
