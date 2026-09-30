@@ -99,6 +99,19 @@ def _is_under(root: Path, path: Path) -> bool:
         return False
 
 
+
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    """Temp + replace in same directory (H6)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_bytes(data)
+    tmp.replace(path)
+
+
+def _atomic_write_text(path: Path, text: str, *, encoding: str = "utf-8") -> None:
+    _atomic_write_bytes(path, text.encode(encoding))
+
+
 class ProjectService:
     def __init__(self, root: Path | None = None) -> None:
         self.root = root or _PROJECTS_DIR
@@ -121,9 +134,9 @@ class ProjectService:
     def _write_meta(self, meta: dict[str, Any]) -> None:
         pid = meta["id"]
         self._project_dir(pid).mkdir(parents=True, exist_ok=True)
-        self._meta_path(pid).write_text(
+        _atomic_write_text(
+            self._meta_path(pid),
             json.dumps(meta, indent=2, ensure_ascii=False) + "\n",
-            encoding="utf-8",
         )
 
     def revision(self, project_id: str) -> int | None:
@@ -160,7 +173,7 @@ class ProjectService:
                 raise RuntimeError(f"template path rejected: {rel}")
             dest = ws / rel
             dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.write_text(content, encoding="utf-8")
+            _atomic_write_text(dest, content)
         meta = {
             "id": project_id,
             "name": name,
@@ -288,7 +301,7 @@ class ProjectService:
             if not isinstance(content, str):
                 raise FsRejected("create content must be a string")
             # ponytail: text create only; binary goes Asset Service (Slice 3).
-            dest.write_text(content, encoding="utf-8")
+            _atomic_write_text(dest, content)
             normalized["path"] = rel
             normalized["content"] = content
 
@@ -372,7 +385,7 @@ class ProjectService:
             parent.mkdir(parents=False, exist_ok=True)
 
         payload = bytes(data)
-        dest.write_bytes(payload)
+        _atomic_write_bytes(dest, payload)
         digest = hashlib.sha256(payload).hexdigest()
         rev = self._bump_revision(meta)
         return rev, {

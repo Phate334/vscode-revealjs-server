@@ -18,6 +18,11 @@ from vscode_revealjs_server.projects.service import FsRejected, project_service
 # COLLAB_DATA_DIR for containers; else cwd/.data (repo root when started via compose/uv).
 _DATA_DIR = Path(os.environ.get("COLLAB_DATA_DIR", str(Path.cwd() / ".data" / "collaboration")))
 
+# ponytail: open-decision #5 — no op log yet, any missed topology rev is unsafe.
+# Threshold=1 forces snapshot reconcile on reconnect gap. Ceiling: reconnect thrash.
+# Upgrade: persist ops / raise threshold with Git-bulk evidence.
+REVISION_GAP_THRESHOLD = 1
+
 
 class CollaborationRoom:
     def __init__(self, project_id: str) -> None:
@@ -42,8 +47,13 @@ class CollaborationRoom:
             self.crdt_generation = 1
 
     def _persist(self) -> None:
+        """Atomic ydoc write (temp + replace) so crash mid-write keeps prior blob (H6)."""
         _DATA_DIR.mkdir(parents=True, exist_ok=True)
-        self._blob_path().write_bytes(self.doc.get_update())
+        path = self._blob_path()
+        payload = self.doc.get_update()
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_bytes(payload)
+        tmp.replace(path)
 
     def snapshot(self) -> bytes | None:
         update = self.doc.get_update()
@@ -140,13 +150,37 @@ class CollaborationManager:
             return
 
         # ponytail: protocol_version accepted but not negotiated; upgrade when clients diverge.
+        last_known = msg.get("last_known_revision")
+        last_known_rev: int | None = None
+        if isinstance(last_known, int) and not isinstance(last_known, bool):
+            last_known_rev = last_known
+        elif last_known is not None:
+            await ws.send_text(
+                proto.encode(proto.error("bad_hello", "last_known_revision must be int"))
+            )
+            await ws.close()
+            return
+
         await room.join(ws, client_id)
-        await ws.send_text(
-            proto.encode(proto.ready(revision=self._workspace_revision(project_id)))
-        )
+        server_rev = self._workspace_revision(project_id)
         snap = room.snapshot()
+        await ws.send_text(
+            proto.encode(proto.ready(revision=server_rev, has_snapshot=snap is not None))
+        )
         if snap is not None:
             await ws.send_bytes(snap)
+
+        # Revision gap → client must re-fetch workspace snapshot (topology/assets).
+        if last_known_rev is not None and server_rev - last_known_rev >= REVISION_GAP_THRESHOLD:
+            await ws.send_text(
+                proto.encode(
+                    proto.reconcile_required(
+                        revision=server_rev,
+                        reason="revision_gap",
+                        last_known_revision=last_known_rev,
+                    )
+                )
+            )
 
         try:
             while True:
@@ -213,7 +247,22 @@ class CollaborationManager:
                     base_revision=base_rev,
                 )
             except FsRejected as e:
-                await ws.send_text(proto.encode(proto.error("fs_rejected", str(e))))
+                err = str(e)
+                await ws.send_text(proto.encode(proto.error("fs_rejected", err)))
+                # Stale base → force snapshot reconcile (same path as hello gap).
+                if "stale base_revision" in err:
+                    server_rev = self._workspace_revision(project_id)
+                    known = base_rev if base_rev is not None else -1
+                    if server_rev - known >= REVISION_GAP_THRESHOLD:
+                        await ws.send_text(
+                            proto.encode(
+                                proto.reconcile_required(
+                                    revision=server_rev,
+                                    reason="stale_base_revision",
+                                    last_known_revision=base_rev,
+                                )
+                            )
+                        )
                 return
             except Exception as e:
                 await ws.send_text(proto.encode(proto.error("fs_error", str(e))))

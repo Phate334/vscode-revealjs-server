@@ -16,9 +16,21 @@ FS_OPERATION = "fs.operation"
 FS_OPERATION_ACK = "fs.operation_ack"
 WORKSPACE_REVISION = "workspace.revision"
 ASSET_CHANGED = "asset.changed"
+WORKSPACE_RECONCILE_REQUIRED = "workspace.reconcile_required"
 
 CONTROL_TYPES = frozenset(
-    {HELLO, READY, ERROR, PING, PONG, FS_OPERATION, FS_OPERATION_ACK, WORKSPACE_REVISION, ASSET_CHANGED}
+    {
+        HELLO,
+        READY,
+        ERROR,
+        PING,
+        PONG,
+        FS_OPERATION,
+        FS_OPERATION_ACK,
+        WORKSPACE_REVISION,
+        ASSET_CHANGED,
+        WORKSPACE_RECONCILE_REQUIRED,
+    }
 )
 
 
@@ -33,12 +45,19 @@ def decode(raw: str) -> dict[str, Any]:
     return data
 
 
-def ready(*, revision: int, protocol_version: int = PROTOCOL_VERSION) -> dict[str, Any]:
+def ready(
+    *,
+    revision: int,
+    has_snapshot: bool = False,
+    protocol_version: int = PROTOCOL_VERSION,
+) -> dict[str, Any]:
     # revision = workspace topology revision (project meta), not CRDT update count.
+    # has_snapshot: client must wait for one binary frame before flushReady (H1).
     return {
         "type": READY,
         "protocol_version": protocol_version,
         "revision": revision,
+        "has_snapshot": has_snapshot,
     }
 
 
@@ -92,3 +111,20 @@ def asset_changed(
         "content_hash": content_hash,
         "size": size,
     }
+
+
+def reconcile_required(
+    *,
+    revision: int,
+    reason: str,
+    last_known_revision: int | None = None,
+) -> dict[str, Any]:
+    """Client should pause fs ops, re-fetch snapshot, and rebind (FS_RECONCILE)."""
+    msg: dict[str, Any] = {
+        "type": WORKSPACE_RECONCILE_REQUIRED,
+        "revision": revision,
+        "reason": reason,
+    }
+    if last_known_revision is not None:
+        msg["last_known_revision"] = last_known_revision
+    return msg

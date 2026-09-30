@@ -29,15 +29,21 @@ export type AssetChangedEvent = {
   size: number;
 };
 
+export type ReconcileRequiredEvent = {
+  revision: number;
+  reason: string;
+  last_known_revision?: number;
+};
+
 const PROTOCOL_VERSION = 1;
 // ponytail: exp backoff capped at 30s; upgrade to jittered shared retry policy if many clients stampede.
 const BACKOFF_MS = [1000, 2000, 4000, 8000, 16000, 30000];
 const FS_ACK_TIMEOUT_MS = 10_000;
 
 /**
- * Yjs client over the PoC collaboration WebSocket.
- * Text JSON = hello/ready/ping/pong/fs.*; binary = opaque Yjs updates.
- * Dropped sockets auto-reconnect with backoff; hello again + merge on ready.
+ * Yjs client over the collaboration WebSocket.
+ * Text JSON = hello/ready/ping/pong/fs ops/reconcile; binary = opaque Yjs updates.
+ * Ready barrier: flush only after optional snapshot binary when ready.has_snapshot.
  */
 export class CollaborationClient {
   readonly doc = new Y.Doc();
@@ -48,9 +54,10 @@ export class CollaborationClient {
   private intentionalClose = false;
   private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   private reconnectAttempt = 0;
-  // ponytail: ready fires before optional snapshot binary; wait briefly or until first update.
-  private readyFlushTimer: ReturnType<typeof setTimeout> | undefined;
+  /** True after ready (+ snapshot if has_snapshot) flushed for this handshake. */
   private readyFlushed = false;
+  /** Expect one binary snapshot frame before flushReady (from ready.has_snapshot). */
+  private awaitingSnapshot = false;
   private connectWaiters: {
     resolve: () => void;
     reject: (e: Error) => void;
@@ -69,13 +76,21 @@ export class CollaborationClient {
   onWorkspaceRevision: ((revision: number) => void) | undefined;
   onAssetChanged: ((msg: AssetChangedEvent) => void) | undefined;
 
+  /** Local last-known workspace topology revision (sent on hello for gap detect). */
+  lastKnownRevision = 0;
+
+  onReconcileRequired: ((msg: ReconcileRequiredEvent) => void) | undefined;
+
   constructor(
     readonly clientId: string,
     /** WS URL from .presentation/workspace.json (server + projectId). No /poc fallback. */
     readonly url: string,
+    lastKnownRevision = 0,
   ) {
-    // Match server/pycrdt key used in tests: Doc.get("content", type=Text)
+    // Match server/pycrdt key: Doc.get("content", type=Text)
     this.ytext = this.doc.getText("content");
+    this.lastKnownRevision = lastKnownRevision;
+    this.workspaceRevision = lastKnownRevision;
   }
 
   getStatus(): CollabStatus {
@@ -90,7 +105,7 @@ export class CollaborationClient {
   connect(): Promise<void> {
     this.intentionalClose = false;
     if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
-      if (this.status === "connected") return Promise.resolve();
+      if (this.status === "connected" && this.readyFlushed) return Promise.resolve();
       return new Promise((resolve, reject) => {
         this.connectWaiters.push({ resolve, reject });
       });
@@ -113,10 +128,7 @@ export class CollaborationClient {
   private flushReady(): void {
     if (this.readyFlushed) return;
     this.readyFlushed = true;
-    if (this.readyFlushTimer) {
-      clearTimeout(this.readyFlushTimer);
-      this.readyFlushTimer = undefined;
-    }
+    this.awaitingSnapshot = false;
     this.pushFullState();
     this.onReady?.();
     this.settleConnect();
@@ -138,6 +150,7 @@ export class CollaborationClient {
           type: "hello",
           client_id: this.clientId,
           protocol_version: PROTOCOL_VERSION,
+          last_known_revision: this.lastKnownRevision,
         }),
       );
     };
@@ -147,6 +160,7 @@ export class CollaborationClient {
         let msg: {
           type?: string;
           revision?: number;
+          has_snapshot?: boolean;
           operation_id?: string;
           operation?: FsOperation;
           path?: string;
@@ -154,6 +168,8 @@ export class CollaborationClient {
           size?: number;
           code?: string;
           message?: string;
+          reason?: string;
+          last_known_revision?: number;
         };
         try {
           msg = JSON.parse(ev.data) as typeof msg;
@@ -163,16 +179,17 @@ export class CollaborationClient {
         if (msg.type === "ready") {
           this.reconnectAttempt = 0;
           this.readyFlushed = false;
+          this.awaitingSnapshot = msg.has_snapshot === true;
           if (typeof msg.revision === "number") {
             this.workspaceRevision = msg.revision;
             this.onWorkspaceRevision?.(msg.revision);
           }
           this.setStatus("connected");
           this.wireOutgoing();
-          // Snapshot binary follows ready. Flush after it, or in 50ms if none
-          // (empty room). Avoids seedOrPull duplicating into a late snapshot.
-          if (this.readyFlushTimer) clearTimeout(this.readyFlushTimer);
-          this.readyFlushTimer = setTimeout(() => this.flushReady(), 50);
+          // Deterministic barrier (H1): flush now if no snapshot follows; else wait for binary.
+          if (!this.awaitingSnapshot) {
+            this.flushReady();
+          }
         } else if (msg.type === "pong") {
           // ignore
         } else if (msg.type === "fs.operation_ack") {
@@ -219,9 +236,20 @@ export class CollaborationClient {
               size: msg.size,
             });
           }
+        } else if (msg.type === "workspace.reconcile_required") {
+          if (typeof msg.revision === "number") {
+            this.workspaceRevision = msg.revision;
+            this.onReconcileRequired?.({
+              revision: msg.revision,
+              reason: typeof msg.reason === "string" ? msg.reason : "unknown",
+              last_known_revision:
+                typeof msg.last_known_revision === "number"
+                  ? msg.last_known_revision
+                  : undefined,
+            });
+          }
         } else if (msg.type === "error") {
           const code = msg.code ?? "";
-          // Reject pending fs ack if server rejected an op (no operation_id on error — fail all? only settle connect).
           if (code === "fs_rejected" || code === "fs_error" || code === "bad_fs_op") {
             // Fail oldest waiter — ponytail: errors lack operation_id; single in-flight op assumed.
             const first = this.fsAckWaiters.keys().next().value;
@@ -239,7 +267,7 @@ export class CollaborationClient {
       const buf = ev.data instanceof ArrayBuffer ? new Uint8Array(ev.data) : new Uint8Array(ev.data as ArrayBuffer);
       // REMOTE_SYNC: not tracked by UndoManager (selective local undo).
       Y.applyUpdate(this.doc, buf, REMOTE_SYNC);
-      if (!this.readyFlushed && this.readyFlushTimer) {
+      if (!this.readyFlushed && this.awaitingSnapshot) {
         this.flushReady();
       }
     };
@@ -258,6 +286,7 @@ export class CollaborationClient {
       this.unsubUpdate?.();
       this.unsubUpdate = undefined;
       this.ws = undefined;
+      this.awaitingSnapshot = false;
       this.setStatus("offline");
       for (const [id, w] of this.fsAckWaiters) {
         w.reject(new Error("websocket closed"));
@@ -356,10 +385,7 @@ export class CollaborationClient {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = undefined;
     }
-    if (this.readyFlushTimer) {
-      clearTimeout(this.readyFlushTimer);
-      this.readyFlushTimer = undefined;
-    }
+    this.awaitingSnapshot = false;
     this.readyFlushed = false;
     this.unsubUpdate?.();
     this.unsubUpdate = undefined;
