@@ -39,18 +39,31 @@ Stack: FastAPI + uv (server) and a VS Code extension. Spec and milestones live i
 
 ## Scope
 
-- Follow the current milestone only (`docs/README.md` / `docs/milestones/`). Do not implement later phases "while you're here."
+- Follow the **current milestone only** (`docs/README.md` / `docs/milestones/`). Do not implement later phases "while you're here."
 - MVP non-goals in `docs/non-goals.md` stay out of scope unless the user overrides.
-- Do not lock decisions listed in `docs/open-decisions.md` before PoC evidence.
+- Do not lock decisions in `docs/open-decisions.md` before PoC evidence; mark temporary choices with `ponytail:` comments.
 
 ## Tooling
 
-- Python: `uv` only (`uv add` / `uv remove` / `uv sync` / `uv run`). No pip, no hand-edited dependency lists when `uv` can do it.
-- Prefer the existing package layout over inventing parallel apps or packages.
+- Python: `uv` only (`uv add` / `uv remove` / `uv sync` / `uv run`). No pip; do not hand-edit dependency lists when `uv` can do it.
+- Prefer the existing package layout (`src/vscode_revealjs_server/`) over inventing parallel apps or packages.
+- **Server runtime for tests: Docker Compose.** Package the server as an image (`Dockerfile` + `compose.yaml`). Acceptance and integration checks that talk to the server must use the published container endpoint (e.g. `localhost:8000`), not a one-off `uv run uvicorn` on the host — except tiny unit tests that do not need a live server.
+
+## Git
+
+- Commit **code and architecture spec** (`docs/collaborative-presentation-spec.md`, etc.).
+- **Never** `git add` progress / process files: `docs/README.md`, `docs/milestones/`, `docs/open-decisions.md`, `docs/dev-log/`, `*.progress.md`.
+- After a slice passes acceptance, update local progress docs; then commit only the code change.
+- Repo git identity is local (`user.name` / `user.email`); do not invent a new author.
+
+## Acceptance habits
+
+- Work **slice by slice**; verify before widening scope.
+- M0 DoD requires **two real VS Code windows** + containerized server for collaboration checks. Mock/unit tests help but do not replace that.
+- Keep progress status honest: scaffold ≠ milestone done.
 
 ## Hygiene (no leftover / no redundancy)
 
 - Every change must leave the tree cleaner or unchanged in unused surface area: no dead code, unused deps, empty stubs "for later," duplicate helpers, or abandoned experiments.
 - If you add a file, it must be required for the current task. If a task supersedes an approach, delete the old path in the same change.
-- Progress docs (`docs/README.md`, `docs/milestones/`, `docs/open-decisions.md`) stay local — never `git add` them. Keep architecture spec commits separate from progress notes.
 - Prefer one module that does the job over a layered framework of services/interfaces that nothing calls yet.
