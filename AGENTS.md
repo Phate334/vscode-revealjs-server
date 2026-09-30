@@ -52,5 +52,5 @@ Stack: FastAPI + uv (server) and a VS Code extension. Spec and milestones live i
 
 - Every change must leave the tree cleaner or unchanged in unused surface area: no dead code, unused deps, empty stubs "for later," duplicate helpers, or abandoned experiments.
 - If you add a file, it must be required for the current task. If a task supersedes an approach, delete the old path in the same change.
-- Do not expand README/docs beyond what the task needs; keep progress updates in `docs/README.md` checkboxes/status only.
+- Progress docs (`docs/README.md`, `docs/milestones/`, `docs/open-decisions.md`) stay local — never `git add` them. Keep architecture spec commits separate from progress notes.
 - Prefer one module that does the job over a layered framework of services/interfaces that nothing calls yet.
