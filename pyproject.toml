@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.142.1",
+    "pycrdt>=0.14.8",
     "uvicorn[standard]>=0.54.0",
 ]
 
@@ -15,3 +16,9 @@ vscode-revealjs-server = "vscode_revealjs_server:main"
 [build-system]
 requires = ["uv_build>=0.12.20,<0.13.0"]
 build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "pytest>=9.1.1",
+]
