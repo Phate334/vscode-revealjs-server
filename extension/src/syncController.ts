@@ -112,6 +112,19 @@ export class SyncController {
         void this.onLocalAssetWrite(uri);
       }),
     );
+
+    // External bulk (git checkout/merge): VS Code onDidCreateFiles does not fire for
+    // shell/git FS changes — watch create/delete and trip bulk → FS_RECONCILE.
+    const topo = vscode.workspace.createFileSystemWatcher(
+      new vscode.RelativePattern(this.folder, "**/*"),
+    );
+    const onExternalTopo = (uri: vscode.Uri) => {
+      if (this.origin.isRemote() || this.reconciling) return;
+      const rel = relPath(this.folder, uri);
+      if (!rel || shouldIgnore(rel) || this.suppressPaths.has(rel)) return;
+      this.noteLocalTopologyEvent();
+    };
+    this.disposables.push(topo, topo.onDidCreate(onExternalTopo), topo.onDidDelete(onExternalTopo));
   }
 
   dispose(): void {

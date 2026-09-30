@@ -39,12 +39,28 @@ class CollaborationRoom:
 
     def _load(self) -> None:
         path = self._blob_path()
-        if not path.is_file():
+        if path.is_file():
+            blob = path.read_bytes()
+            if blob:
+                self.doc.apply_update(blob)
+                self.crdt_generation = 1
+        # Empty room + known project → seed from workspace slide.md so dual clients
+        # do not both insert the same file (CRDT concat / duplicate text).
+        if self.snapshot() is None:
+            self._seed_from_project()
+
+    def _seed_from_project(self) -> None:
+        from pycrdt import Text
+
+        text = project_service.collaborative_slide_text(self.project_id)
+        if not text:
             return
-        blob = path.read_bytes()
-        if blob:
-            self.doc.apply_update(blob)
-            self.crdt_generation = 1
+        ytext = self.doc.get("content", type=Text)
+        if str(ytext):
+            return
+        ytext.insert(0, text)
+        self.crdt_generation = 1
+        self._persist()
 
     def _persist(self) -> None:
         """Atomic ydoc write (temp + replace) so crash mid-write keeps prior blob (H6)."""

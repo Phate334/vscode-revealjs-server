@@ -67,4 +67,4 @@ export function isCrdtBoundPath(rel: string): boolean {
  * (Git checkout / merge / mass rewrite). Not LOCAL_EDITOR — use FS_RECONCILE path.
  */
 export const BULK_EVENT_THRESHOLD = 8;
-export const BULK_WINDOW_MS = 400;
+export const BULK_WINDOW_MS = 2000;

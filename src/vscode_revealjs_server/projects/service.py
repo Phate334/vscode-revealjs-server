@@ -183,6 +183,20 @@ class ProjectService:
         self._write_meta(meta)
         return self._public(meta)
 
+    def collaborative_slide_text(self, project_id: str) -> str | None:
+        """Prefer nested chapter slide.md, else root — for empty-room CRDT seed."""
+        ws = self._workspace(project_id)
+        if not ws.is_dir():
+            return None
+        nested = sorted(ws.glob(f"*/slide.md"))
+        if nested:
+            return nested[0].read_text(encoding="utf-8")
+        root = ws / "slide.md"
+        if root.is_file():
+            return root.read_text(encoding="utf-8")
+        hits = sorted(ws.rglob("slide.md"))
+        return hits[0].read_text(encoding="utf-8") if hits else None
+
     def snapshot(self, project_id: str) -> dict[str, Any] | None:
         """Consistent workspace view @ current revision (JSON manifest).
 
