@@ -29,8 +29,7 @@
   },
   "scripts": {
     "compile": "tsc -p .",
-    "watch": "tsc -watch -p .",
-    "test": "npm run compile && node --test out/originTracker.test.js"
+    "watch": "tsc -watch -p ."
   },
   "dependencies": {
     "yjs": "^13.6.27"

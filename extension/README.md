@@ -9,7 +9,6 @@ Minimal VS Code extension: bind workspace `slide.md` to the compose server at
 cd extension
 npm install
 npm run compile
-npm test          # OriginTracker unit check
 ```
 
 ## Server (Docker Compose — required for live checks)
@@ -21,7 +20,6 @@ docker compose up -d --build
 ./scripts/compose-smoke.sh    # curl http://127.0.0.1:8000/health
 ```
 
-Unit tests may use in-process TestClient; any live-server check must hit the
 published compose port (`localhost:8000`), not host `uv run uvicorn`.
 
 ## Load in VS Code 1.139+

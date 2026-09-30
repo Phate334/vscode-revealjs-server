@@ -27,7 +27,7 @@ Rules:
 - Pick the edge-case-correct option when two stdlib approaches are the same size, lazy means less code, not the flimsier algorithm.
 - Mark deliberate simplifications that cut a real corner with a known ceiling (global lock, O(n²) scan, naive heuristic) with a `ponytail:` comment naming the ceiling and upgrade path.
 
-Not lazy about: understanding the problem (read it fully and trace the real flow before picking a rung, a small diff you don't understand is just laziness dressed up as efficiency), input validation at trust boundaries, error handling that prevents data loss, security, accessibility, the calibration real hardware needs (the platform is never the spec ideal, a clock drifts, a sensor reads off), anything explicitly requested. Lazy code without its check is unfinished: non-trivial logic leaves ONE runnable check behind, the smallest thing that fails if the logic breaks (an assert-based demo/self-check or one small test file; no frameworks, no fixtures). Trivial one-liners need no test.
+Not lazy about: understanding the problem (read it fully and trace the real flow before picking a rung, a small diff you don't understand is just laziness dressed up as efficiency), input validation at trust boundaries, error handling that prevents data loss, security, accessibility, the calibration real hardware needs (the platform is never the spec ideal, a clock drifts, a sensor reads off), anything explicitly requested. Do **not** write or maintain unit tests in this repo. Verify by running the real stack (Docker Compose server + VS Code extension behavior). Delete obsolete test files instead of updating them.
 
 (Yes, this file also applies to agents working on the ponytail repo itself. Especially to them.)
 
@@ -47,7 +47,7 @@ Stack: FastAPI + uv (server) and a VS Code extension. Spec and milestones live i
 
 - Python: `uv` only (`uv add` / `uv remove` / `uv sync` / `uv run`). No pip; do not hand-edit dependency lists when `uv` can do it.
 - Prefer the existing package layout (`src/vscode_revealjs_server/`) over inventing parallel apps or packages.
-- **Server runtime for tests: Docker Compose.** Package the server as an image (`Dockerfile` + `compose.yaml`). Acceptance and integration checks that talk to the server must use the published container endpoint (e.g. `localhost:8000`), not a one-off `uv run uvicorn` on the host — except tiny unit tests that do not need a live server.
+- **Server runtime for tests: Docker Compose.** Package the server as an image (`Dockerfile` + `compose.yaml`). Acceptance and integration checks that talk to the server must use the published container endpoint (e.g. `localhost:8000`), not a one-off `uv run uvicorn` on the host — Do not add a unit-test suite as a substitute.
 
 ## Git
 
@@ -58,8 +58,8 @@ Stack: FastAPI + uv (server) and a VS Code extension. Spec and milestones live i
 
 ## Acceptance habits
 
-- Work **slice by slice**; verify before widening scope.
-- M0 DoD requires **two real VS Code windows** + containerized server for collaboration checks. Mock/unit tests help but do not replace that.
+- Work **slice by slice**; verify by executing the real path (compose + VS Code), not unit tests.
+- M0 DoD requires **two real VS Code windows** + containerized server for collaboration checks.
 - Keep progress status honest: scaffold ≠ milestone done.
 
 ## Hygiene (no leftover / no redundancy)
