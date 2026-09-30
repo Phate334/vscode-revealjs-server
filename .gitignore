@@ -406,3 +406,11 @@ vite.config.ts.timestamp-*
 
 # Cursor / ponytail local hooks (may contain machine-absolute paths)
 .cursor/
+
+# Local progress / process notes (not versioned)
+docs/README.md
+docs/milestones/
+docs/open-decisions.md
+docs/_source-chatgpt-share.md
+docs/dev-log/
+*.progress.md
