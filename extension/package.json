@@ -2,7 +2,7 @@
   "name": "vscode-revealjs-collaboration",
   "displayName": "RevealJS Collaboration (PoC)",
   "description": "Collaborative Reveal.js presentations: CRDT slide sync + project snapshot",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "phate334",
   "engines": {
     "vscode": "^1.139.0"
