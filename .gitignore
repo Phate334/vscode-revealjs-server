@@ -413,6 +413,7 @@ docs/milestones/
 docs/open-decisions.md
 docs/_source-chatgpt-share.md
 docs/dev-log/
+docs/archived/
 *.progress.md
 
 # Local PoC persistence blobs
