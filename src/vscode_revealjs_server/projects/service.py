@@ -18,7 +18,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from vscode_revealjs_server.presentation.render import default_index_html
+from vscode_revealjs_server.presentation.render import (
+    default_agents_md,
+    default_index_html,
+    default_theme_css,
+)
 
 # Sibling of collaboration blobs under .data/
 _PROJECTS_DIR = Path(
@@ -154,24 +158,23 @@ def _now() -> str:
 
 
 def _default_template(title: str) -> dict[str, str]:
-    """Relative path → utf-8 text content."""
-    deck = (
-        f"title: {title}\n"
-        "runtime: reveal-v1\n"
-        "\n"
-        "chapters:\n"
-        "  - 01-introduction\n"
-        "\n"
-        "reveal:\n"
-        "  transition: slide\n"
-        "  controls: true\n"
-        "  progress: true\n"
-    )
+    """Relative path → utf-8 text content (static Reveal site)."""
     index = default_index_html(title)
-    slide = f"# {title}\n\nFirst slide.\n"
+    slide = (
+        f"# {title}\n"
+        "\n"
+        "First slide.\n"
+        "\n"
+        "---\n"
+        "\n"
+        "## Second slide\n"
+        "\n"
+        "Edit this chapter in `01-introduction/slide.md`.\n"
+    )
     return {
-        "deck.yaml": deck,
         "index.html": index,
+        "theme.css": default_theme_css(),
+        "AGENTS.md": default_agents_md(),
         "01-introduction/slide.md": slide,
     }
 

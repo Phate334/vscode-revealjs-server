@@ -88,8 +88,8 @@
 product-strategy/
 │
 ├─ index.html
-├─ deck.yaml
 ├─ theme.css
+├─ AGENTS.md
 │
 ├─ 01-introduction/
 │  ├─ slide.md
@@ -130,33 +130,15 @@ project/
 
 `index.html`：
 
-- 可由使用者直接編輯。
-- 建立新 project 時由 Server default template 產生。
-- Server 不要求使用者自行從零建立 reveal.js bootstrap。
-- Preview 與 Publish 都以同一份 `index.html` 為基礎。
+- 可由使用者直接編輯；專案是靜態網站。
+- 建立新 project 時由 Server default template 產生完整可顯示的 Reveal.js deck（含 `/runtimes/reveal-v1/` 腳本／樣式、`Reveal.initialize`、章節 `<section data-markdown>`）。
+- Reveal 設定（transition、controls、plugins 等）寫在 HTML 內，不另用設定檔。
+- 章節順序由 `index.html` 的 section 列表決定，不依賴 directory name 排序。
+- Preview 與 Publish 都直接提供這份 `index.html`（不做 deck 組裝／injection）。
 
-### 3.3 `deck.yaml`
+### 3.3 `AGENTS.md`（預設範本）
 
-`deck.yaml` 負責 project metadata 與簡報設定。
-
-範例：
-
-```yaml
-title: Product Strategy
-runtime: reveal-v1
-
-chapters:
-  - 01-introduction
-  - 02-market
-  - 03-roadmap
-
-reveal:
-  transition: slide
-  controls: true
-  progress: true
-```
-
-章節順序由 `deck.yaml` 決定，不依賴 directory name 排序。
+新建專案預設含 `AGENTS.md`：提醒以章節 Markdown 編輯內容、用 CSS 處理版面、避免在內容裡寫 HTML 標籤。
 
 ---
 
@@ -437,7 +419,7 @@ CollaborativeWorkspace
 01-introduction/slide.md
 theme.css
 index.html
-deck.yaml
+AGENTS.md
 ```
 
 Server 持有：

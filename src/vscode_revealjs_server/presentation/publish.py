@@ -1,6 +1,7 @@
 """Publish an immutable release from server collaborative state (§21–22).
 
-Reuses presentation.render and the runtime registry. Does not read a client disk.
+Projects are static sites: freeze collaborative text (including index.html) and
+pin the shared runtime. Does not read a client disk.
 
 Storage (#10):
 - Runtime shared by version at /runtimes/{name}/ (not copied into each release).
@@ -19,13 +20,8 @@ from pathlib import Path
 from typing import Any
 
 from vscode_revealjs_server.collaboration.manager import manager
-from vscode_revealjs_server.presentation.render import (
-    fallback_chapters_for,
-    parse_deck,
-    render_presentation_html,
-    rewrite_chapter_relative_urls,
-)
-from vscode_revealjs_server.presentation.runtime import runtime_dir
+from vscode_revealjs_server.presentation.render import rewrite_chapter_relative_urls
+from vscode_revealjs_server.presentation.runtime import DEFAULT_RUNTIME, runtime_dir
 from vscode_revealjs_server.projects.service import (
     FsRejected,
     _now,
@@ -79,9 +75,7 @@ def publish(project_id: str) -> dict[str, Any]:
         raise FsRejected("project not found")
     _overlay_crdt(project_id, cap)
 
-    deck = next((f["content"] for f in cap["files"] if f["path"] == "deck.yaml"), "")
-    index_html = next((f["content"] for f in cap["files"] if f["path"] == "index.html"), None)
-    _title, runtime_name, _chapters = parse_deck(deck)
+    runtime_name = DEFAULT_RUNTIME
     rt_src = runtime_dir(runtime_name)
     if rt_src is None:
         raise FsRejected(f"runtime not registered: {runtime_name}")
@@ -95,13 +89,11 @@ def publish(project_id: str) -> dict[str, Any]:
     staging.mkdir(parents=True, exist_ok=False)
 
     asset_base = f"/release/{release_id}"
-    # Shared runtime URL — same registry Preview uses (#10).
-    runtime_base = f"/runtimes/{runtime_name}"
     asset_map: dict[str, str] = {}
     try:
         for row in cap["files"]:
             rel = row["path"]
-            if rel == "index.html" or rel == _ASSETS_MANIFEST:
+            if rel == _ASSETS_MANIFEST:
                 continue
             content = row["content"]
             if rel.endswith(".md"):
@@ -126,15 +118,6 @@ def publish(project_id: str) -> dict[str, Any]:
             + "\n",
             encoding="utf-8",
         )
-        html = render_presentation_html(
-            project_id=project_id,
-            index_html=index_html,
-            deck_yaml=deck,
-            fallback_chapters=fallback_chapters_for(deck, cap.get("slide_path")),
-            asset_base=asset_base,
-            runtime_base=runtime_base,
-        )
-        (staging / "index.html").write_text(html, encoding="utf-8")
         staging.rename(final)
     except Exception:
         if staging.exists():

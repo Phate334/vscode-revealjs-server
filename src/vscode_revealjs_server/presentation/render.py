@@ -1,8 +1,7 @@
-"""Shared Preview/Publish HTML renderer: editable index.html + injection markers.
+"""Shared Preview/Publish helpers: chapter asset URL rewrite.
 
-Contract (M2/M3): load collaborative index.html; replace markers with runtime
-CSS, slide sections, and runtime JS. Publish must reuse this module — do not
-fork a second HTML assembler.
+Projects are static sites: index.html owns Reveal.initialize + slide sections.
+Preview/Publish serve collaborative index.html as-is (no deck.yaml injection).
 """
 
 from __future__ import annotations
@@ -10,19 +9,7 @@ from __future__ import annotations
 import html
 import re
 
-from vscode_revealjs_server.presentation.runtime import (
-    DEFAULT_RUNTIME,
-    resolve_runtime_name,
-)
-
-# Editable index.html injection points (default template + user edits).
-MARKER_RUNTIME_CSS = "<!-- PRESENTATION_RUNTIME_CSS -->"
-MARKER_SLIDES = "<!-- PRESENTATION_SLIDES -->"
-MARKER_RUNTIME_JS = "<!-- PRESENTATION_RUNTIME_JS -->"
-
-_CHAPTER_LINE = re.compile(r"^\s*-\s+(.+?)\s*$")
-_RUNTIME_LINE = re.compile(r"^runtime:\s*(.+?)\s*$")
-_TITLE_LINE = re.compile(r"^title:\s*(.+?)\s*$")
+from vscode_revealjs_server.presentation.runtime import DEFAULT_RUNTIME
 
 # Relative URL rewrite in chapter markdown / HTML fragments (R2).
 _MD_LINK = re.compile(r"(!?\[[^\]]*\]\()([^\s)]+)(\))")
@@ -30,35 +17,6 @@ _HTML_ATTR = re.compile(
     r"(<(?:img|video|source|a)\b[^>]*?\b(?:src|href)\s*=\s*)([\"'])([^\"']+)\2",
     re.IGNORECASE,
 )
-
-
-def parse_deck(deck: str) -> tuple[str, str, list[str]]:
-    """Minimal deck.yaml: title, runtime (registry-resolved), chapters list."""
-    title = "Presentation"
-    runtime_raw = DEFAULT_RUNTIME
-    chapters: list[str] = []
-    in_chapters = False
-    for raw in deck.splitlines():
-        line = raw.rstrip()
-        if in_chapters:
-            m = _CHAPTER_LINE.match(line)
-            if m:
-                chapters.append(m.group(1).strip().strip("\"'"))
-                continue
-            if line.startswith(" ") or line.startswith("\t") or not line or line.startswith("#"):
-                continue
-            in_chapters = False
-        if line.strip() == "chapters:":
-            in_chapters = True
-            continue
-        tm = _TITLE_LINE.match(line)
-        if tm:
-            title = tm.group(1).strip().strip("\"'")
-            continue
-        rm = _RUNTIME_LINE.match(line)
-        if rm:
-            runtime_raw = rm.group(1).strip().strip("\"'")
-    return title, resolve_runtime_name(runtime_raw), chapters
 
 
 def _is_relative_asset_url(url: str) -> bool:
@@ -83,7 +41,7 @@ def rewrite_chapter_relative_urls(
     """Rewrite relative img/video/source/a (and md links) to absolute chapter URLs.
 
     Reveal's markdown plugin resolves relative URLs against the HTML page,
-    not the markdown file. Preview pages live at `/p/{id}/preview`; Publish
+    not the markdown file. Preview pages live at `/p/{id}/preview/`; Publish
     passes `url_prefix=/release/{release_id}` so frozen markdown stays immutable.
     """
     prefix = url_prefix if url_prefix is not None else f"/p/{project_id}/preview"
@@ -113,139 +71,78 @@ def rewrite_chapter_relative_urls(
     return _HTML_ATTR.sub(html_sub, out)
 
 
-def _runtime_css_block(rt: str) -> str:
-    e = html.escape
-    return (
-        f'  <link rel="stylesheet" href="{e(rt)}/reset.css" />\n'
-        f'  <link rel="stylesheet" href="{e(rt)}/reveal.css" />\n'
-        f'  <link rel="stylesheet" href="{e(rt)}/theme/black.css" />'
-    )
-
-
-def _runtime_js_block(rt: str) -> str:
-    e = html.escape
-    return (
-        f'  <script src="{e(rt)}/reveal.js"></script>\n'
-        f'  <script src="{e(rt)}/markdown/markdown.js"></script>\n'
-        f"  <script>\n"
-        f"    Reveal.initialize({{\n"
-        f"      hash: true,\n"
-        f'      transition: "slide",\n'
-        f"      plugins: [RevealMarkdown]\n"
-        f"    }});\n"
-        f"  </script>"
-    )
-
-
-def _section_for(md_url: str) -> str:
+def _section_for(md_rel: str) -> str:
     sep = "^\\n---\\n$"
     vsep = "^\\n--\\n$"
     return (
-        f'      <section data-markdown="{html.escape(md_url, quote=True)}"\n'
+        f'      <section data-markdown="{html.escape(md_rel, quote=True)}"\n'
         f'               data-separator="{html.escape(sep, quote=True)}"\n'
         f'               data-separator-vertical="{html.escape(vsep, quote=True)}"\n'
         f'               data-charset="utf-8"></section>'
     )
 
 
-def _fallback_shell(title: str) -> str:
-    """Built-in shell when collaborative index.html lacks injection markers."""
+def default_index_html(title: str) -> str:
+    """Complete standalone Reveal.js deck for newly created projects.
+
+    Runtime assets use the shared /runtimes/{DEFAULT_RUNTIME}/ registry.
+    Chapter markdown paths are relative so Preview (/preview/) and Publish
+    (/release/{id}/) resolve correctly when served with a trailing slash.
+    """
     t = html.escape(title)
+    rt = f"/runtimes/{DEFAULT_RUNTIME}"
+    e = html.escape
     return (
         "<!DOCTYPE html>\n"
-        '<html lang="en">\n'
+        '<html lang="zh-Hant">\n'
         "<head>\n"
         '  <meta charset="utf-8" />\n'
+        '  <meta name="viewport" content="width=device-width, initial-scale=1.0" />\n'
         f"  <title>{t}</title>\n"
-        f"  {MARKER_RUNTIME_CSS}\n"
+        f'  <link rel="stylesheet" href="{e(rt)}/reset.css" />\n'
+        f'  <link rel="stylesheet" href="{e(rt)}/reveal.css" />\n'
+        f'  <link rel="stylesheet" href="{e(rt)}/theme/black.css" />\n'
+        '  <link rel="stylesheet" href="theme.css" />\n'
         "</head>\n"
         "<body>\n"
         '  <div class="reveal">\n'
         '    <div class="slides">\n'
-        f"      {MARKER_SLIDES}\n"
+        f"{_section_for('01-introduction/slide.md')}\n"
         "    </div>\n"
         "  </div>\n"
-        f"  {MARKER_RUNTIME_JS}\n"
+        f'  <script src="{e(rt)}/reveal.js"></script>\n'
+        f'  <script src="{e(rt)}/markdown/markdown.js"></script>\n'
+        "  <script>\n"
+        "    Reveal.initialize({\n"
+        "      hash: true,\n"
+        '      transition: "slide",\n'
+        "      controls: true,\n"
+        "      progress: true,\n"
+        "      plugins: [RevealMarkdown]\n"
+        "    });\n"
+        "  </script>\n"
         "</body>\n"
         "</html>\n"
     )
 
 
-def fallback_chapters_for(deck_yaml: str, slide_path: str | None) -> list[str] | None:
-    """When deck.yaml lists no chapters, infer from the CRDT-bound slide path."""
-    _title, _runtime, chapters = parse_deck(deck_yaml)
-    if chapters:
-        return None
-    if slide_path and "/" in slide_path:
-        return [slide_path.rsplit("/", 1)[0]]
-    if slide_path == "slide.md":
-        return []
-    return ["01-introduction"]
-
-
-def render_presentation_html(
-    *,
-    project_id: str,
-    index_html: str | None,
-    deck_yaml: str,
-    fallback_chapters: list[str] | None = None,
-    asset_base: str | None = None,
-    runtime_base: str | None = None,
-) -> str:
-    """Inject runtime + slides into editable index.html (Preview + Publish).
-
-    Defaults are live Preview URLs. Publish passes absolute `/release/{id}`
-    bases so the artifact does not follow later collaborative edits.
-    """
-    title, runtime, chapters = parse_deck(deck_yaml)
-    if not chapters and fallback_chapters is not None:
-        chapters = list(fallback_chapters)
-
-    base = asset_base if asset_base is not None else f"/p/{project_id}/preview"
-    rt = runtime_base if runtime_base is not None else f"/runtimes/{runtime}"
-    base = base.rstrip("/")
-    rt = rt.rstrip("/")
-
-    if chapters:
-        sections = [_section_for(f"{base}/{ch}/slide.md") for ch in chapters]
-    else:
-        sections = [_section_for(f"{base}/slide.md")]
-    slides_html = "\n".join(sections)
-
-    shell = index_html if index_html is not None else ""
-    if not (
-        MARKER_RUNTIME_CSS in shell
-        and MARKER_SLIDES in shell
-        and MARKER_RUNTIME_JS in shell
-    ):
-        shell = _fallback_shell(title)
-
-    # Preserve user <title> when present; otherwise leave fallback title.
-    out = shell.replace(MARKER_RUNTIME_CSS, _runtime_css_block(rt), 1)
-    out = out.replace(MARKER_SLIDES, slides_html, 1)
-    out = out.replace(MARKER_RUNTIME_JS, _runtime_js_block(rt), 1)
-    return out
-
-
-def default_index_html(title: str) -> str:
-    """Server create-project template with injection markers."""
-    t = html.escape(title)
+def default_agents_md() -> str:
+    """Preliminary editing guidance for agents/humans (Traditional Chinese)."""
     return (
-        "<!DOCTYPE html>\n"
-        '<html lang="en">\n'
-        "<head>\n"
-        '  <meta charset="utf-8" />\n'
-        '  <meta name="viewport" content="width=device-width, initial-scale=1.0" />\n'
-        f"  <title>{t}</title>\n"
-        f"  {MARKER_RUNTIME_CSS}\n"
-        "</head>\n"
-        "<body>\n"
-        '  <div class="reveal">\n'
-        '    <div class="slides">\n'
-        f"      {MARKER_SLIDES}\n"
-        "    </div>\n"
-        "  </div>\n"
-        f"  {MARKER_RUNTIME_JS}\n"
-        "</body>\n"
-        "</html>\n"
+        "# 簡報編輯指引\n"
+        "\n"
+        "- 在各章節的 `slide.md`（Markdown）裡編輯內容；章節順序以 `index.html` 的"
+        " `<section data-markdown=\"...\">` 為準。\n"
+        "- 版面與樣式請用 CSS（例如根目錄 `theme.css`），不要在內容裡寫 HTML 標籤。\n"
+        "- Reveal.js 設定（transition、controls、plugins 等）請直接改 `index.html` 裡的"
+        " `Reveal.initialize({...})`。\n"
+        "- 預覽與發布把專案當靜態網站提供；執行期腳本／樣式走 `/runtimes/reveal-v1/`，"
+        "章節 markdown 請用相對路徑。\n"
+    )
+
+
+def default_theme_css() -> str:
+    return (
+        "/* Project layout / theme overrides. Prefer CSS over HTML inside slide.md. */\n"
+        "\n"
     )

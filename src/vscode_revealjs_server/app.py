@@ -2,6 +2,7 @@ import mimetypes
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, WebSocket
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 
 from vscode_revealjs_server.auth import service as auth_service
@@ -429,6 +430,11 @@ def _serve_published(root: object, rel: str) -> Response:
 
 
 @app.get("/s/{slug}")
+def public_slug_root(slug: str) -> RedirectResponse:
+    """Trailing slash so relative slide/theme URLs in static index.html resolve."""
+    return RedirectResponse(url=f"/s/{slug}/", status_code=307)
+
+
 @app.get("/s/{slug}/{rel_path:path}")
 def public_slug(slug: str, rel_path: str = "") -> Response:
     """Current published release for the project slug (pointer)."""
@@ -439,6 +445,11 @@ def public_slug(slug: str, rel_path: str = "") -> Response:
 
 
 @app.get("/release/{release_id}")
+def public_release_root(release_id: str) -> RedirectResponse:
+    """Trailing slash so relative slide/theme URLs in static index.html resolve."""
+    return RedirectResponse(url=f"/release/{release_id}/", status_code=307)
+
+
 @app.get("/release/{release_id}/{rel_path:path}")
 def public_release(release_id: str, rel_path: str = "") -> Response:
     """Immutable release bytes. Content does not follow later publishes."""
@@ -461,17 +472,18 @@ def get_runtime(runtime_name: str, runtime_path: str) -> Response:
 
 
 @app.get("/p/{project_id}/preview")
+def preview_index_redirect(project_id: str) -> RedirectResponse:
+    """Trailing slash so relative slide/theme URLs in static index.html resolve."""
+    return RedirectResponse(url=f"/p/{project_id}/preview/", status_code=307)
+
+
+@app.get("/p/{project_id}/preview/")
 def preview_index(project_id: str) -> Response:
-    """Server Preview HTML — open for demo (browser Open Preview has no Bearer)."""
+    """Server Preview HTML — static collaborative index.html (open, no Bearer)."""
     got = preview_service.compose_index(project_id)
     if got is None:
         raise HTTPException(status_code=404, detail="project not found")
     return Response(content=got.body, media_type=got.media_type)
-
-
-@app.get("/p/{project_id}/preview/")
-def preview_index_slash(project_id: str) -> Response:
-    return preview_index(project_id)
 
 
 @app.get("/p/{project_id}/preview/{preview_path:path}")

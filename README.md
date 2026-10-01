@@ -38,7 +38,7 @@ Or in VS Code: **Extensions → … → Install from VSIX…**
 1. **Presentation: Sign In** — against your server (default demo accounts below).
 2. **Presentation: Create Project** or **Open Project** / **Open Shared Project** — links a local folder via `.presentation/workspace.json`.
 3. Edit bound text files (e.g. `slide.md`, chapter markdown, CSS/HTML/YAML/JSON). Changes sync through the server; Open Project warns before overwriting existing files.
-4. **Presentation: Open Preview** — server-rendered Reveal preview (no auth on preview URLs).
+4. **Presentation: Open Preview** — static Reveal preview from the project site (no auth on preview URLs).
 5. **Presentation: Share Project** — invite token for editors/viewers.
 6. **Presentation: Members** — manage project members (owner).
 7. **Presentation: Publish** — immutable public release under a slug URL.

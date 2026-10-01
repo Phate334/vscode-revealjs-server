@@ -1,8 +1,8 @@
-"""Preview Resolver: collaborative state → reveal HTML / path bytes (§19).
+"""Preview Resolver: collaborative state → static Reveal HTML / path bytes (§19).
 
-Does not read any client local filesystem. Text prefers live CRDT for the
-bound slide; other text/assets come from server collaborative workspace.
-HTML assembly lives in presentation.render (shared with future Publish).
+Does not read any client local filesystem. Text prefers live CRDT; other
+text/assets come from server collaborative workspace. index.html is served
+as-is (static site); chapter markdown still gets relative-asset rewrite.
 """
 
 from __future__ import annotations
@@ -12,11 +12,7 @@ from dataclasses import dataclass
 from pathlib import PurePosixPath
 
 from vscode_revealjs_server.collaboration.manager import manager
-from vscode_revealjs_server.presentation.render import (
-    fallback_chapters_for,
-    render_presentation_html,
-    rewrite_chapter_relative_urls,
-)
+from vscode_revealjs_server.presentation.render import rewrite_chapter_relative_urls
 from vscode_revealjs_server.projects.service import FsRejected, is_binary_rel, project_service
 
 
@@ -83,16 +79,13 @@ def resolve_path(project_id: str, rel: str) -> PreviewBytes | None:
 
 
 def compose_index(project_id: str) -> PreviewBytes | None:
-    """Render Preview HTML from collaborative index.html + deck (shared renderer)."""
+    """Serve collaborative index.html as static Preview HTML (CRDT preferred)."""
     if project_service.get(project_id) is None:
         return None
-    deck = project_service.read_workspace_text(project_id, "deck.yaml") or ""
+    crdt = manager.collaborative_text(project_id, "index.html")
+    if crdt is not None:
+        return PreviewBytes(crdt.encode("utf-8"), "text/html; charset=utf-8")
     index_html = project_service.read_workspace_text(project_id, "index.html")
-    slide = project_service.collaborative_slide_path(project_id)
-    body = render_presentation_html(
-        project_id=project_id,
-        index_html=index_html,
-        deck_yaml=deck,
-        fallback_chapters=fallback_chapters_for(deck, slide),
-    )
-    return PreviewBytes(body.encode("utf-8"), "text/html; charset=utf-8")
+    if index_html is None:
+        return None
+    return PreviewBytes(index_html.encode("utf-8"), "text/html; charset=utf-8")

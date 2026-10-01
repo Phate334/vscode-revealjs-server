@@ -101,7 +101,7 @@ echo "${PREV}" | grep -q "/runtimes/reveal-v1/" || fail "preview missing runtime
 if echo "${PREV}" | grep -q 'PRESENTATION_RUNTIME_CSS\|PRESENTATION_SLIDES\|PRESENTATION_RUNTIME_JS'; then
   fail "injection markers left unreplaced"
 fi
-pass "preview HTML injected (open)"
+pass "preview HTML static deck (open)"
 
 echo "GET /runtimes/reveal-v1/reveal.js"
 curl -sfS -o /dev/null "${BASE}/runtimes/reveal-v1/reveal.js" || fail "runtime reveal.js"
@@ -304,7 +304,7 @@ echo "${HTML1}" | grep -q "/runtimes/reveal-v1/reveal.js" || fail "release html 
 if echo "${HTML1}" | grep -q "/release/${REL1}/runtime/"; then
   fail "release html still embeds per-release runtime copy"
 fi
-echo "${HTML1}" | grep -q "/release/${REL1}/01-introduction/slide.md" || fail "release html slide url"
+echo "${HTML1}" | grep -q 'data-markdown="01-introduction/slide.md"' || fail "release html slide url"
 if echo "${HTML1}" | grep -q "/p/${PID}/preview"; then
   fail "release html still points at live preview"
 fi
@@ -314,13 +314,14 @@ curl -sfS -o /tmp/smoke-rel-hero.png "${BASE}/release/${REL1}/${ASSET_PATH}" || 
 python3 -c 'import pathlib; b=pathlib.Path("/tmp/smoke-rel-hero.png").read_bytes(); assert b[:8]==b"\x89PNG\r\n\x1a\n", b[:16]' \
   || fail "release asset not PNG"
 SLUG_HTML="$(curl -sfS "${BASE}${SLUG_PATH}")" || fail "GET slug"
-echo "${SLUG_HTML}" | grep -q "/release/${REL1}/" || fail "slug did not serve release 1"
+echo "${SLUG_HTML}" | grep -q 'data-markdown="01-introduction/slide.md"' || fail "slug missing slides"
+[[ "${SLUG_HTML}" == "${HTML1}" ]] || fail "slug html differs from release 1"
 pass "publish release ${REL1} slug ${SLUG_PATH}"
 
 if [[ ! -d "${DATA_PROJECTS}/${PID}/workspace" ]]; then
   fail "publish delta needs host project volume ${DATA_PROJECTS}/${PID}/workspace"
 fi
-echo "multi-doc: CRDT deck+delta chapter; disk-only slide marker (CRDT wins)"
+echo "multi-doc: CRDT index.html+delta chapter; disk-only slide marker (CRDT wins)"
 # Disk-only clobber of bound slide — Publish must keep CRDT text, not DISK_ONLY_MARKER.
 sudo python3 - <<DISKPY || fail "disk-only slide mutate"
 from pathlib import Path
@@ -328,7 +329,7 @@ ws = Path("${DATA_PROJECTS}/${PID}/workspace")
 (ws / "01-introduction" / "slide.md").write_text("# DISK_ONLY_MARKER\n", encoding="utf-8")
 print("disk_slide_mutated")
 DISKPY
-# Live CRDT: patch deck.yaml + create 03-delta/slide.md (path→Y.Text + fs.operation).
+# Live CRDT: patch index.html section list + create 03-delta/slide.md (path→Y.Text + fs.operation).
 uv run python - <<CRDTPY || fail "multi-doc CRDT delta"
 import asyncio, json
 import websockets
@@ -355,19 +356,25 @@ async def main() -> None:
             doc.apply_update(bytes(snap))
         docs = doc.get("documents", type=Map)
         keys = list(docs.keys())
-        assert "deck.yaml" in keys, keys
+        assert "index.html" in keys, keys
         assert any(str(k).endswith("slide.md") for k in keys), keys
-        # Patch deck.yaml in CRDT
+        # Patch index.html in CRDT: add 03-delta section
         before = doc.get_state()
-        deck = docs.get("deck.yaml")
-        assert deck is not None
-        cur = str(deck)
-        needle = "  - 01-introduction\n"
+        index = docs.get("index.html")
+        assert index is not None
+        cur = str(index)
+        needle = 'data-markdown="01-introduction/slide.md"'
         assert needle in cur, cur
-        if "03-delta" not in cur:
-            # replace whole text via delete+insert
-            deck.clear()
-            deck.insert(0, cur.replace(needle, needle + "  - 03-delta\n", 1))
+        if "03-delta/slide.md" not in cur:
+            start = cur.rfind("<section", 0, cur.find(needle))
+            end = cur.find("</section>", cur.find(needle)) + len("</section>")
+            assert start >= 0 and end > start, cur[:240]
+            sec = cur[start:end].replace(
+                "01-introduction/slide.md", "03-delta/slide.md", 1
+            )
+            new_html = cur[:end] + "\n" + sec + cur[end:]
+            index.clear()
+            index.insert(0, new_html)
         # Ensure delta slide text in documents map
         if docs.get("03-delta/slide.md") is None:
             yt = Text()
@@ -423,16 +430,20 @@ async def main() -> None:
 
 asyncio.run(main())
 CRDTPY
-# Also keep disk deck in sync for capture baselines (CRDT already has chapter).
-sudo python3 - <<DISKPY || fail "disk deck sync"
+# Also keep disk index.html in sync for capture baselines (CRDT already has chapter).
+sudo python3 - <<DISKPY || fail "disk index sync"
 from pathlib import Path
 ws = Path("${DATA_PROJECTS}/${PID}/workspace")
-deck_path = ws / "deck.yaml"
-deck = deck_path.read_text(encoding="utf-8")
-needle = "  - 01-introduction\n"
-if "03-delta" not in deck and needle in deck:
-    deck_path.write_text(deck.replace(needle, needle + "  - 03-delta\n", 1), encoding="utf-8")
-print("disk_deck_synced")
+index_path = ws / "index.html"
+cur = index_path.read_text(encoding="utf-8")
+if "03-delta/slide.md" not in cur:
+    needle = 'data-markdown="01-introduction/slide.md"'
+    start = cur.rfind("<section", 0, cur.find(needle))
+    end = cur.find("</section>", cur.find(needle)) + len("</section>")
+    assert start >= 0 and end > start
+    sec = cur[start:end].replace("01-introduction/slide.md", "03-delta/slide.md", 1)
+    index_path.write_text(cur[:end] + "\n" + sec + cur[end:], encoding="utf-8")
+print("disk_index_synced")
 DISKPY
 
 REL2_JSON="$(curl -sfS -X POST "${BASE}/api/projects/${PID}/releases" -H "$(auth_hdr)")" || fail "publish 2"
@@ -441,15 +452,13 @@ REL2="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' <<<"${RE
 HTML1B="$(curl -sfS "${BASE}/release/${REL1}")" || fail "reget release 1"
 [[ "${HTML1B}" == "${HTML1}" ]] || fail "release 1 html changed after second publish"
 HTML2="$(curl -sfS "${BASE}/release/${REL2}")" || fail "GET release 2"
-echo "${HTML2}" | grep -q "03-delta/slide.md" || fail "release 2 missing delta chapter"
+echo "${HTML2}" | grep -q 'data-markdown="03-delta/slide.md"' || fail "release 2 missing delta chapter"
 if echo "${HTML1B}" | grep -q "03-delta"; then
   fail "release 1 gained delta chapter"
 fi
 SLUG2="$(curl -sfS "${BASE}${SLUG_PATH}")" || fail "slug after republish"
-echo "${SLUG2}" | grep -q "/release/${REL2}/" || fail "slug did not move to release 2"
-if echo "${SLUG2}" | grep -q "/release/${REL1}/"; then
-  fail "slug still pinned to release 1"
-fi
+echo "${SLUG2}" | grep -q 'data-markdown="03-delta/slide.md"' || fail "slug did not move to release 2"
+[[ "${SLUG2}" == "${HTML2}" ]] || fail "slug html differs from release 2"
 S1="$(curl -sfS "${BASE}/release/${REL1}/01-introduction/slide.md")" || fail "rel1 slide"
 S2="$(curl -sfS "${BASE}/release/${REL2}/01-introduction/slide.md")" || fail "rel2 slide"
 echo "${S1}" | grep -q "First slide" || fail "rel1 slide lost collaborative text: ${S1}"

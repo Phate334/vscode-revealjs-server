@@ -1,7 +1,7 @@
 """Shared reveal.js runtime registry for Preview and Publish.
 
 ponytail: vendored reveal-v1 (reveal.js 5.1.0). Ceiling: single runtime pin.
-Upgrade: multi-runtime select from deck.yaml + release freeze (M3).
+Upgrade: multi-runtime select from project HTML / release freeze.
 
 Security: never path-join user-supplied runtime_name. Only allowlisted keys
 resolve to directories under runtimes/.
@@ -25,7 +25,7 @@ def is_supported_runtime(name: str | None) -> bool:
 
 
 def resolve_runtime_name(name: str | None) -> str:
-    """Map deck.yaml runtime to a registry key; unknown → DEFAULT_RUNTIME."""
+    """Map a runtime name to a registry key; unknown → DEFAULT_RUNTIME."""
     if is_supported_runtime(name):
         return name  # type: ignore[return-value]
     return DEFAULT_RUNTIME

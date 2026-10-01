@@ -11,7 +11,7 @@ export async function openPreview(): Promise<void> {
     return;
   }
   const base = meta.server.replace(/\/$/, "");
-  const url = `${base}/p/${encodeURIComponent(meta.projectId)}/preview`;
+  const url = `${base}/p/${encodeURIComponent(meta.projectId)}/preview/`;
   const ok = await vscode.env.openExternal(vscode.Uri.parse(url));
   if (!ok) {
     void vscode.window.showWarningMessage(`Open Preview: could not open ${url}`);
