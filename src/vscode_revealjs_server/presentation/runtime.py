@@ -1,55 +1,32 @@
-"""Shared reveal.js runtime registry for Preview and Publish.
+"""Vendored Reveal.js seed copied into each project as workspace/runtime/.
 
-ponytail: vendored reveal-v1 (reveal.js 5.1.0). Ceiling: single runtime pin.
-Upgrade: multi-runtime select from project HTML / release freeze.
-
-Security: never path-join user-supplied runtime_name. Only allowlisted keys
-resolve to directories under runtimes/.
+ponytail: single bundled reveal-v1 (reveal.js 5.1.0). Ceiling: one seed pin.
+Upgrade: optional per-project runtime upgrade without shared HTTP registry.
 """
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
-_RUNTIME_ROOT = Path(__file__).resolve().parent.parent / "runtimes"
+# Package-shipping seed (not an HTTP registry).
+_PACKAGE_SEED = Path(__file__).resolve().parent.parent / "runtimes" / "reveal-v1"
 
-# Allowlist only — values are concrete dirs, never derived from request strings.
-SUPPORTED_RUNTIMES: dict[str, Path] = {
-    "reveal-v1": _RUNTIME_ROOT / "reveal-v1",
-}
-DEFAULT_RUNTIME = "reveal-v1"
+# Workspace-relative directory name for the project-local runtime tree.
+PROJECT_RUNTIME_DIR = "runtime"
 
 
-def is_supported_runtime(name: str | None) -> bool:
-    return isinstance(name, str) and name in SUPPORTED_RUNTIMES
+def package_seed_dir() -> Path:
+    """Absolute path to the reveal-v1 seed shipped with the server package."""
+    if not _PACKAGE_SEED.is_dir():
+        raise FileNotFoundError(f"runtime seed missing: {_PACKAGE_SEED}")
+    return _PACKAGE_SEED
 
 
-def resolve_runtime_name(name: str | None) -> str:
-    """Map a runtime name to a registry key; unknown → DEFAULT_RUNTIME."""
-    if is_supported_runtime(name):
-        return name  # type: ignore[return-value]
-    return DEFAULT_RUNTIME
-
-
-def runtime_dir(name: str = DEFAULT_RUNTIME) -> Path | None:
-    """Registry lookup only; None if name not allowlisted."""
-    root = SUPPORTED_RUNTIMES.get(name)
-    if root is None or not root.is_dir():
-        return None
-    return root
-
-
-def resolve_runtime_file(rel: str, *, name: str = DEFAULT_RUNTIME) -> Path | None:
-    """Safe join under an allowlisted runtime root; None if missing/unknown/escapes."""
-    if not rel or ".." in rel.split("/") or rel.startswith(("/", "\\")):
-        return None
-    root = runtime_dir(name)
-    if root is None:
-        return None
-    root = root.resolve()
-    path = (root / rel).resolve()
-    try:
-        path.relative_to(root)
-    except ValueError:
-        return None
-    return path if path.is_file() else None
+def copy_seed_into(workspace: Path) -> Path:
+    """Copy the package seed into workspace/runtime/. Returns the dest dir."""
+    dest = workspace / PROJECT_RUNTIME_DIR
+    if dest.exists():
+        shutil.rmtree(dest)
+    shutil.copytree(package_seed_dir(), dest)
+    return dest

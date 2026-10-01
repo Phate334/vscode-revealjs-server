@@ -43,7 +43,7 @@ collaboration WebSocket (`?access_token=`). A window auto-connects only when bot
 
 **Presentation: Share Project** copies an invite token. **Presentation: Open Shared Project**
 accepts that token, then extracts the snapshot. **Presentation: Publish** returns the public
-slug URL (copied) and the immutable `/release/{id}` URL.
+slug URL (copied) and the immutable `/releases/{id}` URL.
 
 Edit `slide.md` on either side; the other should converge.
 
@@ -69,7 +69,7 @@ Edit `slide.md` on either side; the other should converge.
 
 ## Preview
 
-**Presentation: Open Preview** opens `{server}/p/{projectId}/preview` using
+**Presentation: Open Preview** opens `{server}/preview/{projectId}/` using
 `.presentation/workspace.json` (same metadata as Connect). The browser shows Server
 collaborative state (including unsaved CRDT text edits).
 

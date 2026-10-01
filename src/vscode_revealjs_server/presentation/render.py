@@ -1,7 +1,8 @@
-"""Shared Preview/Publish helpers: chapter asset URL rewrite.
+"""Shared Preview/Publish helpers: chapter asset URL rewrite + default template.
 
 Projects are static sites: index.html owns Reveal.initialize + slide sections.
 Preview/Publish serve collaborative index.html as-is (no deck.yaml injection).
+Runtime assets live under project-relative runtime/ (vendored at create).
 """
 
 from __future__ import annotations
@@ -9,7 +10,7 @@ from __future__ import annotations
 import html
 import re
 
-from vscode_revealjs_server.presentation.runtime import DEFAULT_RUNTIME
+from vscode_revealjs_server.presentation.runtime import PROJECT_RUNTIME_DIR
 
 # Relative URL rewrite in chapter markdown / HTML fragments (R2).
 _MD_LINK = re.compile(r"(!?\[[^\]]*\]\()([^\s)]+)(\))")
@@ -41,10 +42,10 @@ def rewrite_chapter_relative_urls(
     """Rewrite relative img/video/source/a (and md links) to absolute chapter URLs.
 
     Reveal's markdown plugin resolves relative URLs against the HTML page,
-    not the markdown file. Preview pages live at `/p/{id}/preview/`; Publish
-    passes `url_prefix=/release/{release_id}` so frozen markdown stays immutable.
+    not the markdown file. Preview pages live at `/preview/{id}/`; Publish
+    passes `url_prefix=/releases/{release_id}` so frozen markdown stays immutable.
     """
-    prefix = url_prefix if url_prefix is not None else f"/p/{project_id}/preview"
+    prefix = url_prefix if url_prefix is not None else f"/preview/{project_id}"
     prefix = prefix.rstrip("/")
     if chapter:
         prefix = f"{prefix}/{chapter}"
@@ -85,12 +86,11 @@ def _section_for(md_rel: str) -> str:
 def default_index_html(title: str) -> str:
     """Complete standalone Reveal.js deck for newly created projects.
 
-    Runtime assets use the shared /runtimes/{DEFAULT_RUNTIME}/ registry.
-    Chapter markdown paths are relative so Preview (/preview/) and Publish
-    (/release/{id}/) resolve correctly when served with a trailing slash.
+    Runtime assets use project-relative runtime/ paths so Preview and
+    Publish serve the same self-contained tree.
     """
     t = html.escape(title)
-    rt = f"/runtimes/{DEFAULT_RUNTIME}"
+    rt = PROJECT_RUNTIME_DIR
     e = html.escape
     return (
         "<!DOCTYPE html>\n"
@@ -136,8 +136,8 @@ def default_agents_md() -> str:
         "- 版面與樣式請用 CSS（例如根目錄 `theme.css`），不要在內容裡寫 HTML 標籤。\n"
         "- Reveal.js 設定（transition、controls、plugins 等）請直接改 `index.html` 裡的"
         " `Reveal.initialize({...})`。\n"
-        "- 預覽與發布把專案當靜態網站提供；執行期腳本／樣式走 `/runtimes/reveal-v1/`，"
-        "章節 markdown 請用相對路徑。\n"
+        "- 預覽與發布把專案當靜態網站提供；Reveal 執行期在專案內的 `runtime/`，"
+        "章節 markdown 與素材請用相對路徑。\n"
     )
 
 

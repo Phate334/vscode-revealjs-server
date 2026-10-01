@@ -21,7 +21,7 @@ function shouldIgnore(rel: string): boolean {
  * - delete local files/dirs not present on server (except ignore prefixes)
  * - CRDT-bound text converges via disk watcher → FS_RECONCILE (not LOCAL_EDITOR)
  *
- * #10: JSON manifest + per-asset GET; publish uses content-addressed blobs + shared runtime (no tar/zip).
+ * JSON manifest + per-asset GET; publish is a self-contained full-tree release (no blobs/shared /runtimes).
  */
 export async function pullAndApplySnapshot(
   folder: vscode.Uri,

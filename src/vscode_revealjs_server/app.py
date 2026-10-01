@@ -1,4 +1,3 @@
-import mimetypes
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, WebSocket
@@ -11,10 +10,6 @@ from vscode_revealjs_server.collaboration.manager import manager
 from vscode_revealjs_server.presentation import preview as preview_service
 from vscode_revealjs_server.presentation.publish import publish as publish_release
 from vscode_revealjs_server.presentation.publish import read_published
-from vscode_revealjs_server.presentation.runtime import (
-    is_supported_runtime,
-    resolve_runtime_file,
-)
 from vscode_revealjs_server.projects import project_service
 from vscode_revealjs_server.projects.service import (
     ROLE_EDITOR,
@@ -374,12 +369,12 @@ def accept_share(
         raise HTTPException(status_code=400, detail=str(e)) from e
 
 
-@app.post("/api/projects/{project_id}/releases")
-def post_release(
+@app.post("/api/projects/{project_id}/publish")
+def post_publish(
     project_id: str,
     user: Annotated[dict[str, str], Depends(require_user)],
 ) -> dict:
-    """Publish from server collaborative state. Editors and owners only."""
+    """Publish command: snapshot collaborative state into an immutable release."""
     _forbid_unless_writer(project_id, user["id"])
     try:
         return publish_release(project_id)
@@ -414,6 +409,19 @@ def get_release(
     return row
 
 
+@app.get("/api/releases/{release_id}")
+def get_release_global(
+    release_id: str,
+    user: Annotated[dict[str, str], Depends(require_user)],
+) -> dict:
+    """Release resource by id (caller must be a member of the owning project)."""
+    row = project_service.get_release_global(release_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="release not found")
+    _forbid_unless_member(str(row["project_id"]), user["id"])
+    return row
+
+
 def _serve_published(root: object, rel: str) -> Response:
     from pathlib import Path
 
@@ -429,66 +437,54 @@ def _serve_published(root: object, rel: str) -> Response:
     return Response(content=body, media_type=media)
 
 
-@app.get("/s/{slug}")
-def public_slug_root(slug: str) -> RedirectResponse:
-    """Trailing slash so relative slide/theme URLs in static index.html resolve."""
-    return RedirectResponse(url=f"/s/{slug}/", status_code=307)
+@app.get("/presentations/{slug}")
+def public_presentation_root(slug: str) -> RedirectResponse:
+    """Trailing slash so relative slide/theme/runtime URLs resolve."""
+    return RedirectResponse(url=f"/presentations/{slug}/", status_code=307)
 
 
-@app.get("/s/{slug}/{rel_path:path}")
-def public_slug(slug: str, rel_path: str = "") -> Response:
-    """Current published release for the project slug (pointer)."""
+@app.get("/presentations/{slug}/{rel_path:path}")
+def public_presentation(slug: str, rel_path: str = "") -> Response:
+    """Human-friendly alias pointing at the project's current published release."""
     root = project_service.resolve_slug_dir(slug)
     if root is None:
         raise HTTPException(status_code=404, detail="not published")
     return _serve_published(root, rel_path)
 
 
-@app.get("/release/{release_id}")
+@app.get("/releases/{release_id}")
 def public_release_root(release_id: str) -> RedirectResponse:
-    """Trailing slash so relative slide/theme URLs in static index.html resolve."""
-    return RedirectResponse(url=f"/release/{release_id}/", status_code=307)
+    """Trailing slash so relative slide/theme/runtime URLs resolve."""
+    return RedirectResponse(url=f"/releases/{release_id}/", status_code=307)
 
 
-@app.get("/release/{release_id}/{rel_path:path}")
+@app.get("/releases/{release_id}/{rel_path:path}")
 def public_release(release_id: str, rel_path: str = "") -> Response:
-    """Immutable release bytes. Content does not follow later publishes."""
+    """Immutable self-contained release bytes."""
     root = project_service.resolve_release_dir(release_id)
     if root is None:
         raise HTTPException(status_code=404, detail="release not found")
     return _serve_published(root, rel_path)
 
 
-@app.get("/runtimes/{runtime_name}/{runtime_path:path}")
-def get_runtime(runtime_name: str, runtime_path: str) -> Response:
-    """Shared reveal runtime files (Preview + future Publish). Registry only."""
-    if not is_supported_runtime(runtime_name):
-        raise HTTPException(status_code=404, detail="unknown runtime")
-    path = resolve_runtime_file(runtime_path, name=runtime_name)
-    if path is None:
-        raise HTTPException(status_code=404, detail="runtime file not found")
-    media, _ = mimetypes.guess_type(str(path))
-    return Response(content=path.read_bytes(), media_type=media or "application/octet-stream")
-
-
-@app.get("/p/{project_id}/preview")
+@app.get("/preview/{project_id}")
 def preview_index_redirect(project_id: str) -> RedirectResponse:
-    """Trailing slash so relative slide/theme URLs in static index.html resolve."""
-    return RedirectResponse(url=f"/p/{project_id}/preview/", status_code=307)
+    """Trailing slash so relative slide/theme/runtime URLs resolve."""
+    return RedirectResponse(url=f"/preview/{project_id}/", status_code=307)
 
 
-@app.get("/p/{project_id}/preview/")
+@app.get("/preview/{project_id}/")
 def preview_index(project_id: str) -> Response:
-    """Server Preview HTML — static collaborative index.html (open, no Bearer)."""
+    """Live collaborative Preview HTML (open, no Bearer)."""
     got = preview_service.compose_index(project_id)
     if got is None:
         raise HTTPException(status_code=404, detail="project not found")
     return Response(content=got.body, media_type=got.media_type)
 
 
-@app.get("/p/{project_id}/preview/{preview_path:path}")
+@app.get("/preview/{project_id}/{preview_path:path}")
 def preview_path(project_id: str, preview_path: str) -> Response:
-    """Preview path: CRDT text for bound slide, else collaborative workspace/assets."""
+    """Preview path: CRDT text preferred, else collaborative workspace/assets/runtime."""
     try:
         got = preview_service.resolve_path(project_id, preview_path)
     except FsRejected as e:

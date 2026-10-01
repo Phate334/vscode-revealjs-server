@@ -58,14 +58,15 @@ Optional env on the server:
 | `AUTH_DEMO_USER` | Extra `username:password` |
 | `AUTH_ACCESS_TTL_SEC` / `AUTH_REFRESH_TTL_SEC` | Token lifetimes |
 
-## Public URLs (after Publish)
+## Public URLs
 
 | URL | Meaning |
 |-----|---------|
-| `/s/{slug}` | Current release for that slug |
-| `/release/{release_id}/…` | Immutable release |
-| `/p/{project_id}/preview` | Live collaborative preview |
-| `/runtimes/reveal-v1/…` | Shared Reveal.js runtime |
+| `/preview/{project_id}/` | Live collaborative preview (mutable) |
+| `/releases/{release_id}/` | Immutable self-contained release |
+| `/presentations/{slug}/` | Alias to the project's current release |
+
+Publish is `POST /api/projects/{project_id}/publish` (creates a release). Each project vendors Reveal under `runtime/`; releases copy the full tree (no shared `/runtimes`, no `blobs/`).
 
 API and collaboration WebSocket require a signed-in access token (`Authorization: Bearer …`; WS also accepts `?access_token=`). Preview and published release pages stay public.
 

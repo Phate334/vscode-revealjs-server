@@ -23,25 +23,21 @@ from vscode_revealjs_server.presentation.render import (
     default_index_html,
     default_theme_css,
 )
+from vscode_revealjs_server.presentation.runtime import copy_seed_into
 
-# Sibling of collaboration blobs under .data/
+# Sibling of collaboration under .data/
 _PROJECTS_DIR = Path(
     os.environ.get(
         "PROJECTS_DATA_DIR",
         str(Path(os.environ.get("COLLAB_DATA_DIR", str(Path.cwd() / ".data" / "collaboration"))).parent / "projects"),
     )
 )
-# Content-addressed asset blobs for Publish (#10); shared across projects/releases.
-_BLOBS_DIR = Path(
-    os.environ.get(
-        "BLOBS_DATA_DIR",
-        str(_PROJECTS_DIR.parent / "blobs"),
-    )
-)
 
 _SAFE_NAME = re.compile(r"^[\w\s.\-]{1,120}$")
-# §3.1 two-level layout: root file or chapter/file
-_SAFE_REL = re.compile(r"^(?:[\w.\-]+|[\w.\-]+/[\w.\-]+)$")
+# User content: root file or chapter/file. Vendored runtime/: nested segments allowed.
+_SAFE_REL = re.compile(
+    r"^(?:[\w.\-]+|[\w.\-]+/[\w.\-]+|runtime(?:/[\w.\-]+)+)$"
+)
 _SAFE_DIR = re.compile(r"^[\w.\-]+$")
 _FS_KINDS = frozenset({"create", "delete", "rename", "move", "mkdir"})
 _BINARY_EXT = frozenset({
@@ -109,7 +105,13 @@ def is_binary_rel(rel: str) -> bool:
 
 # Collaborative text CRDT bindings (spec §9; YAGNI subset — not every non-binary).
 _COLLAB_TEXT_EXT = frozenset({".md", ".css", ".html", ".yaml", ".yml", ".json"})
-_COLLAB_IGNORE_PREFIXES = (".presentation/", ".git/", "node_modules/", ".vscode/")
+_COLLAB_IGNORE_PREFIXES = (
+    ".presentation/",
+    ".git/",
+    "node_modules/",
+    ".vscode/",
+    "runtime/",
+)
 
 
 def is_collaborative_text_rel(rel: str) -> bool:
@@ -286,6 +288,7 @@ class ProjectService:
             dest = ws / rel
             dest.parent.mkdir(parents=True, exist_ok=True)
             _atomic_write_text(dest, content)
+        copy_seed_into(ws)
         meta = {
             "id": project_id,
             "name": name,
@@ -414,7 +417,7 @@ class ProjectService:
 
         Holds mutation lock; retries if revision moves mid-build (B4).
         ponytail: text inline; binaries as path/hash/size refs (GET separately). Ceiling:
-        large assets / #10 archive format. Upgrade: tar/zip bundle (M3 publish).
+        large assets. Upgrade: opaque bundle transfer (post-MVP).
         """
         # ponytail: up to 3 rebuilds under lock if concurrent bump races the unlocked
         # re-check — lock held for whole build so mismatch should be rare.
@@ -719,32 +722,6 @@ class ProjectService:
             "size": int(info["size"]),
             "revision": int(info["revision"]),
         }
-
-    @staticmethod
-    def blob_path(content_hash: str) -> Path:
-        """Content-addressed blob path (sha256 hex)."""
-        if not isinstance(content_hash, str) or len(content_hash) != 64:
-            raise FsRejected(f"invalid content hash: {content_hash!r}")
-        if any(c not in "0123456789abcdef" for c in content_hash.lower()):
-            raise FsRejected(f"invalid content hash: {content_hash!r}")
-        return _BLOBS_DIR / f"sha256-{content_hash.lower()}"
-
-    def store_blob(self, data: bytes) -> str:
-        """Write bytes into shared blob store; return sha256 hex. Idempotent."""
-        digest = hashlib.sha256(data).hexdigest()
-        dest = self.blob_path(digest)
-        if not dest.is_file():
-            _BLOBS_DIR.mkdir(parents=True, exist_ok=True)
-            tmp = dest.with_name(dest.name + ".tmp")
-            tmp.write_bytes(data)
-            tmp.replace(dest)
-        return digest
-
-    def read_blob(self, content_hash: str) -> bytes | None:
-        dest = self.blob_path(content_hash)
-        if not dest.is_file():
-            return None
-        return dest.read_bytes()
 
     @staticmethod
     def _role_in_meta(meta: dict[str, Any], user_id: str) -> str | None:
@@ -1086,6 +1063,24 @@ class ProjectService:
                 return self._release_public(meta, r)
         return None
 
+    def get_release_global(self, release_id: str) -> dict[str, Any] | None:
+        """Lookup release metadata by id across projects (authenticated API)."""
+        if not _RELEASE_ID.match(release_id) or not self.root.is_dir():
+            return None
+        for child in self.root.iterdir():
+            if not child.is_dir():
+                continue
+            meta = self._read_meta(child.name)
+            if not meta:
+                continue
+            releases = meta.get("releases")
+            if not isinstance(releases, list):
+                continue
+            for r in releases:
+                if isinstance(r, dict) and r.get("id") == release_id:
+                    return self._release_public(meta, r)
+        return None
+
     def resolve_release_dir(self, release_id: str) -> Path | None:
         if not _RELEASE_ID.match(release_id) or not self.root.is_dir():
             return None
@@ -1129,11 +1124,10 @@ class ProjectService:
             "created_at": record.get("created_at"),
             "revision": record.get("revision", 0),
             "content_hash": record.get("content_hash"),
-            "runtime": record.get("runtime"),
             "slug": slug,
             "current": meta.get("published_release_id") == rid,
-            "public_path": f"/s/{slug}" if slug else "",
-            "release_path": f"/release/{rid}",
+            "public_path": f"/presentations/{slug}" if slug else "",
+            "release_path": f"/releases/{rid}",
         }
 
     @staticmethod

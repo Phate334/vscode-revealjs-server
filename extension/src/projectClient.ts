@@ -295,7 +295,7 @@ export type ReleaseInfo = {
 export async function publishRelease(server: string, projectId: string): Promise<ReleaseInfo> {
   const base = server.replace(/\/$/, "");
   return httpJson<ReleaseInfo>(
-    `${base}/api/projects/${encodeURIComponent(projectId)}/releases`,
+    `${base}/api/projects/${encodeURIComponent(projectId)}/publish`,
     { method: "POST" },
   );
 }

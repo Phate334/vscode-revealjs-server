@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Live smoke against compose-published port (AGENTS: no host uvicorn for live checks).
 # Covers: health, auth, JWT-gated projects/snapshot/assets/members, preview (open),
-# runtime static, chapter-relative rewrite, collaboration WS token gate,
-# share invite/accept, publish immutable release + public slug.
+# project-local runtime, chapter-relative rewrite, collaboration WS token gate,
+# share invite/accept, publish self-contained release + presentation slug.
 # CRDT unsaved-edit visibility: real VS Code EDH only.
 set -euo pipefail
 BASE="${1:-http://127.0.0.1:8000}"
@@ -93,28 +93,26 @@ echo "GET snapshot with token"
 curl -sfS "${BASE}/api/projects/${PID}/snapshot" -H "$(auth_hdr)" >/dev/null || fail "snapshot"
 pass "snapshot with Bearer"
 
-echo "GET /p/${PID}/preview (open, no token)"
-PREV="$(curl -sfS "${BASE}/p/${PID}/preview")" || fail "preview HTML"
+echo "GET /preview/${PID}/ (open, no token)"
+PREV="$(curl -sfS "${BASE}/preview/${PID}/")" || fail "preview HTML"
 echo "${PREV}" | grep -q 'reveal.js' || fail "preview missing reveal.js"
 echo "${PREV}" | grep -q 'data-markdown=' || fail "preview missing slides"
-echo "${PREV}" | grep -q "/runtimes/reveal-v1/" || fail "preview missing runtime urls"
+echo "${PREV}" | grep -q 'runtime/reveal.js' || fail "preview missing project-local runtime urls"
+if echo "${PREV}" | grep -q '/runtimes/'; then
+  fail "preview still points at shared /runtimes/"
+fi
 if echo "${PREV}" | grep -q 'PRESENTATION_RUNTIME_CSS\|PRESENTATION_SLIDES\|PRESENTATION_RUNTIME_JS'; then
   fail "injection markers left unreplaced"
 fi
 pass "preview HTML static deck (open)"
 
-echo "GET /runtimes/reveal-v1/reveal.js"
-curl -sfS -o /dev/null "${BASE}/runtimes/reveal-v1/reveal.js" || fail "runtime reveal.js"
-pass "runtime static reveal.js"
+echo "GET /preview/${PID}/runtime/reveal.js"
+curl -sfS -o /dev/null "${BASE}/preview/${PID}/runtime/reveal.js" || fail "project runtime reveal.js"
+pass "project-local runtime reveal.js"
 
-echo "GET /runtimes/not-a-runtime/reveal.js → 404"
-CODE="$(curl -sS -o /dev/null -w '%{http_code}' "${BASE}/runtimes/not-a-runtime/reveal.js" || true)"
-[[ "${CODE}" == "404" ]] || fail "expected 404 for unknown runtime, got ${CODE}"
-pass "unknown runtime 404"
-
-CODE="$(curl -sS -o /dev/null -w '%{http_code}' "${BASE}/runtimes/..evil../reveal.js" || true)"
-[[ "${CODE}" == "404" ]] || fail "expected 404 for non-registry runtime_name, got ${CODE}"
-pass "non-registry runtime_name 404"
+CODE="$(curl -sS -o /dev/null -w '%{http_code}' "${BASE}/runtimes/reveal-v1/reveal.js" || true)"
+[[ "${CODE}" == "404" ]] || fail "expected 404 for removed /runtimes, got ${CODE}"
+pass "shared /runtimes removed (404)"
 
 PNG_B64='iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=='
 ASSET_PATH='01-introduction/hero.png'
@@ -153,8 +151,8 @@ echo "${PNG_B64}" | base64 -d | curl -sfS -X PUT \
   || fail "force put asset"
 pass "asset force overwrite"
 
-echo "GET preview asset /p/${PID}/preview/${ASSET_PATH}"
-curl -sfS -o /tmp/smoke-hero.png "${BASE}/p/${PID}/preview/${ASSET_PATH}" || fail "preview asset"
+echo "GET preview asset /preview/${PID}/${ASSET_PATH}"
+curl -sfS -o /tmp/smoke-hero.png "${BASE}/preview/${PID}/${ASSET_PATH}" || fail "preview asset"
 python3 -c 'import pathlib; b=pathlib.Path("/tmp/smoke-hero.png").read_bytes(); assert b[:8]==b"\x89PNG\r\n\x1a\n", b[:16]' \
   || fail "preview asset not PNG"
 pass "preview binary asset"
@@ -175,8 +173,8 @@ MD
     --data-binary @- -H 'Content-Type: application/octet-stream' \
     -H "$(auth_hdr)" >/dev/null \
     || fail "put 02-extra asset"
-  MD_OUT="$(curl -sfS "${BASE}/p/${PID}/preview/02-extra/slide.md")" || fail "get 02-extra md"
-  echo "${MD_OUT}" | grep -q "/p/${PID}/preview/02-extra/hero.png" \
+  MD_OUT="$(curl -sfS "${BASE}/preview/${PID}/02-extra/slide.md")" || fail "get 02-extra md"
+  echo "${MD_OUT}" | grep -q "/preview/${PID}/02-extra/hero.png" \
     || fail "chapter-relative rewrite missing: ${MD_OUT}"
   pass "chapter-relative asset rewrite"
 else
@@ -282,10 +280,10 @@ CODE="$(curl -sS -o /dev/null -w '%{http_code}' "${BASE}/api/projects?scope=nope
 pass "project scope owned/shared"
 
 echo "viewer cannot publish; anonymous 401"
-CODE="$(curl -sS -o /dev/null -w '%{http_code}' -X POST "${BASE}/api/projects/${PID}/releases" \
+CODE="$(curl -sS -o /dev/null -w '%{http_code}' -X POST "${BASE}/api/projects/${PID}/publish" \
   -H "Authorization: Bearer ${ALICE_ACCESS}" || true)"
 [[ "${CODE}" == "403" ]] || fail "expected 403 viewer publish, got ${CODE}"
-CODE="$(curl -sS -o /dev/null -w '%{http_code}' -X POST "${BASE}/api/projects/${PID}/releases" || true)"
+CODE="$(curl -sS -o /dev/null -w '%{http_code}' -X POST "${BASE}/api/projects/${PID}/publish" || true)"
 [[ "${CODE}" == "401" ]] || fail "expected 401 publish no token, got ${CODE}"
 CODE="$(curl -sS -o /dev/null -w '%{http_code}' -X POST "${BASE}/api/projects/${PID}/shares" \
   -H 'Content-Type: application/json' -H "Authorization: Bearer ${ALICE_ACCESS}" \
@@ -293,27 +291,32 @@ CODE="$(curl -sS -o /dev/null -w '%{http_code}' -X POST "${BASE}/api/projects/${
 [[ "${CODE}" == "403" ]] || fail "expected 403 viewer share, got ${CODE}"
 pass "publish/share permission gates"
 
-echo "POST release from server collaborative state"
-REL1_JSON="$(curl -sfS -X POST "${BASE}/api/projects/${PID}/releases" -H "$(auth_hdr)")" || fail "publish 1"
+echo "POST publish from server collaborative state"
+REL1_JSON="$(curl -sfS -X POST "${BASE}/api/projects/${PID}/publish" -H "$(auth_hdr)")" || fail "publish 1"
 REL1="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' <<<"${REL1_JSON}")"
 SLUG_PATH="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["public_path"])' <<<"${REL1_JSON}")"
 REL1_PATH="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["release_path"])' <<<"${REL1_JSON}")"
 [[ "${REL1}" == rel_* ]] || fail "bad release id ${REL1}"
-HTML1="$(curl -sfS "${BASE}${REL1_PATH}")" || fail "GET release 1"
-echo "${HTML1}" | grep -q "/runtimes/reveal-v1/reveal.js" || fail "release html should use shared /runtimes/reveal-v1/"
-if echo "${HTML1}" | grep -q "/release/${REL1}/runtime/"; then
-  fail "release html still embeds per-release runtime copy"
+[[ "${SLUG_PATH}" == /presentations/* ]] || fail "bad public_path ${SLUG_PATH}"
+[[ "${REL1_PATH}" == "/releases/${REL1}" ]] || fail "bad release_path ${REL1_PATH}"
+HTML1="$(curl -sfS "${BASE}${REL1_PATH}/")" || fail "GET release 1"
+echo "${HTML1}" | grep -q 'runtime/reveal.js' || fail "release html should use relative runtime/"
+if echo "${HTML1}" | grep -q '/runtimes/'; then
+  fail "release html still points at shared /runtimes/"
 fi
 echo "${HTML1}" | grep -q 'data-markdown="01-introduction/slide.md"' || fail "release html slide url"
-if echo "${HTML1}" | grep -q "/p/${PID}/preview"; then
+if echo "${HTML1}" | grep -q "/preview/${PID}"; then
   fail "release html still points at live preview"
 fi
-curl -sfS -o /dev/null "${BASE}/runtimes/reveal-v1/reveal.js" || fail "shared runtime file"
-# Content-addressed asset still served at release path
-curl -sfS -o /tmp/smoke-rel-hero.png "${BASE}/release/${REL1}/${ASSET_PATH}" || fail "release asset via blob map"
+curl -sfS -o /dev/null "${BASE}${REL1_PATH}/runtime/reveal.js" || fail "release-local runtime file"
+curl -sfS -o /tmp/smoke-rel-hero.png "${BASE}${REL1_PATH}/${ASSET_PATH}" || fail "release asset inline"
 python3 -c 'import pathlib; b=pathlib.Path("/tmp/smoke-rel-hero.png").read_bytes(); assert b[:8]==b"\x89PNG\r\n\x1a\n", b[:16]' \
   || fail "release asset not PNG"
-SLUG_HTML="$(curl -sfS "${BASE}${SLUG_PATH}")" || fail "GET slug"
+# No assets.json / blobs in release tree
+if [[ -f "${DATA_PROJECTS}/${PID}/releases/${REL1}/assets.json" ]]; then
+  fail "release should not have assets.json"
+fi
+SLUG_HTML="$(curl -sfS "${BASE}${SLUG_PATH}/")" || fail "GET presentation slug"
 echo "${SLUG_HTML}" | grep -q 'data-markdown="01-introduction/slide.md"' || fail "slug missing slides"
 [[ "${SLUG_HTML}" == "${HTML1}" ]] || fail "slug html differs from release 1"
 pass "publish release ${REL1} slug ${SLUG_PATH}"
@@ -446,40 +449,40 @@ if "03-delta/slide.md" not in cur:
 print("disk_index_synced")
 DISKPY
 
-REL2_JSON="$(curl -sfS -X POST "${BASE}/api/projects/${PID}/releases" -H "$(auth_hdr)")" || fail "publish 2"
+REL2_JSON="$(curl -sfS -X POST "${BASE}/api/projects/${PID}/publish" -H "$(auth_hdr)")" || fail "publish 2"
 REL2="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' <<<"${REL2_JSON}")"
 [[ "${REL2}" != "${REL1}" ]] || fail "release id reused"
-HTML1B="$(curl -sfS "${BASE}/release/${REL1}")" || fail "reget release 1"
+HTML1B="$(curl -sfS "${BASE}/releases/${REL1}/")" || fail "reget release 1"
 [[ "${HTML1B}" == "${HTML1}" ]] || fail "release 1 html changed after second publish"
-HTML2="$(curl -sfS "${BASE}/release/${REL2}")" || fail "GET release 2"
+HTML2="$(curl -sfS "${BASE}/releases/${REL2}/")" || fail "GET release 2"
 echo "${HTML2}" | grep -q 'data-markdown="03-delta/slide.md"' || fail "release 2 missing delta chapter"
 if echo "${HTML1B}" | grep -q "03-delta"; then
   fail "release 1 gained delta chapter"
 fi
-SLUG2="$(curl -sfS "${BASE}${SLUG_PATH}")" || fail "slug after republish"
+SLUG2="$(curl -sfS "${BASE}${SLUG_PATH}/")" || fail "slug after republish"
 echo "${SLUG2}" | grep -q 'data-markdown="03-delta/slide.md"' || fail "slug did not move to release 2"
 [[ "${SLUG2}" == "${HTML2}" ]] || fail "slug html differs from release 2"
-S1="$(curl -sfS "${BASE}/release/${REL1}/01-introduction/slide.md")" || fail "rel1 slide"
-S2="$(curl -sfS "${BASE}/release/${REL2}/01-introduction/slide.md")" || fail "rel2 slide"
+S1="$(curl -sfS "${BASE}/releases/${REL1}/01-introduction/slide.md")" || fail "rel1 slide"
+S2="$(curl -sfS "${BASE}/releases/${REL2}/01-introduction/slide.md")" || fail "rel2 slide"
 echo "${S1}" | grep -q "First slide" || fail "rel1 slide lost collaborative text: ${S1}"
 echo "${S2}" | grep -q "First slide" || fail "rel2 slide did not use CRDT: ${S2}"
 if echo "${S1}${S2}" | grep -q "DISK_ONLY_MARKER"; then
   fail "publish followed disk edit instead of CRDT"
 fi
-MD2="$(curl -sfS "${BASE}/release/${REL2}/03-delta/slide.md")" || fail "delta md"
-echo "${MD2}" | grep -q "/release/${REL2}/03-delta/hero.png" || fail "publish rewrite missing: ${MD2}"
+MD2="$(curl -sfS "${BASE}/releases/${REL2}/03-delta/slide.md")" || fail "delta md"
+echo "${MD2}" | grep -q "/releases/${REL2}/03-delta/hero.png" || fail "publish rewrite missing: ${MD2}"
 LIST="$(curl -sfS "${BASE}/api/projects/${PID}/releases" -H "$(auth_hdr)")" || fail "list releases"
 echo "${LIST}" | grep -q "${REL1}" || fail "history missing rel1"
 echo "${LIST}" | grep -q "${REL2}" || fail "history missing rel2"
 ONE="$(curl -sfS "${BASE}/api/projects/${PID}/releases/${REL1}" -H "$(auth_hdr)")" || fail "get release meta"
 echo "${ONE}" | grep -q '"current":false' || fail "rel1 should not be current: ${ONE}"
-TWO="$(curl -sfS "${BASE}/api/projects/${PID}/releases/${REL2}" -H "Authorization: Bearer ${ALICE_ACCESS}")" \
-  || fail "viewer get release meta"
+TWO="$(curl -sfS "${BASE}/api/releases/${REL2}" -H "Authorization: Bearer ${ALICE_ACCESS}")" \
+  || fail "viewer get release meta via /api/releases"
 echo "${TWO}" | grep -q '"current":true' || fail "rel2 current: ${TWO}"
 CODE="$(curl -sS -o /dev/null -w '%{http_code}' --path-as-is \
-  "${BASE}/release/${REL2}/../${REL1}/index.html" || true)"
+  "${BASE}/releases/${REL2}/../${REL1}/index.html" || true)"
 [[ "${CODE}" == "400" || "${CODE}" == "404" ]] || fail "expected 400/404 traversal, got ${CODE}"
-pass "immutable release + slug pointer"
+pass "immutable release + presentation slug pointer"
 
 echo "revoke share; accept fails"
 REV="$(curl -sfS -X DELETE "${BASE}/api/projects/${PID}/shares/${SHARE_ID}" -H "$(auth_hdr)")" \

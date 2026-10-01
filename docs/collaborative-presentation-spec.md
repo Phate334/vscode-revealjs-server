@@ -53,7 +53,7 @@
 │  └─ images / videos / binary files                          │
 │                                                             │
 │  Preview Service                                            │
-│  └─ /p/{project_id}/preview                                 │
+│  └─ /preview/{project_id}/                                  │
 │                                                             │
 │  Publish Service                                            │
 │  ├─ snapshot                                                │
@@ -131,7 +131,7 @@ project/
 `index.html`：
 
 - 可由使用者直接編輯；專案是靜態網站。
-- 建立新 project 時由 Server default template 產生完整可顯示的 Reveal.js deck（含 `/runtimes/reveal-v1/` 腳本／樣式、`Reveal.initialize`、章節 `<section data-markdown>`）。
+- 建立新 project 時由 Server default template 產生完整可顯示的 Reveal.js deck（含專案內 `runtime/` 腳本／樣式、`Reveal.initialize`、章節 `<section data-markdown>`）。
 - Reveal 設定（transition、controls、plugins 等）寫在 HTML 內，不另用設定檔。
 - 章節順序由 `index.html` 的 section 列表決定，不依賴 directory name 排序。
 - Preview 與 Publish 都直接提供這份 `index.html`（不做 deck 組裝／injection）。
@@ -963,7 +963,7 @@ Presentation: Open Preview
 開啟：
 
 ```text
-https://server/p/{project_id}/preview
+https://server/preview/{project_id}/
 ```
 
 Preview 的 source of truth：
@@ -997,7 +997,7 @@ Collaborative Workspace
 例如：
 
 ```http
-GET /p/{project_id}/preview/01-market/slide.md
+GET /preview/{project_id}/01-market/slide.md
 ```
 
 resolver 直接取得：
@@ -1012,38 +1012,26 @@ current text state("01-market/slide.md")
 
 ## 20. reveal.js Runtime
 
-Runtime 由 Server 管理。
+每個 project 自帶 `runtime/`（建立時從 server package seed 複製）。沒有 shared HTTP `/runtimes` registry。
 
-Project：
-
-```yaml
-runtime: reveal-v1
-```
-
-Server：
+Project workspace：
 
 ```text
-runtimes/
-└─ reveal-v1/
-   ├─ reveal.js
-   ├─ reveal.css
-   ├─ markdown/
-   ├─ highlight/
-   ├─ notes/
-   └─ mermaid/
+workspace/
+├─ index.html          # relative href/src → runtime/...
+├─ runtime/
+│  ├─ reveal.js
+│  ├─ reveal.css
+│  ├─ markdown/
+│  ├─ highlight/
+│  ├─ notes/
+│  └─ theme/
+└─ …
 ```
 
-Preview：
+Preview：直接提供 collaborative workspace（含 `runtime/`）。
 
-```text
-Collaborative Workspace + reveal-v1
-```
-
-Publish：
-
-```text
-Snapshot + reveal-v1
-```
+Publish：把當下 snapshot（含 `runtime/` 與 binaries）完整複製到 `releases/{id}/`。
 
 必要條件：
 
@@ -1090,9 +1078,10 @@ static hosting
 API：
 
 ```http
-POST /api/projects/{project_id}/releases
+POST /api/projects/{project_id}/publish
 GET  /api/projects/{project_id}/releases
 GET  /api/projects/{project_id}/releases/{release_id}
+GET  /api/releases/{release_id}
 ```
 
 ---
@@ -1104,21 +1093,16 @@ Server 產生：
 ```text
 releases/
 ├─ rel_abc123/
-│  ├─ index.html          # runtime URLs → /runtimes/reveal-v1/
+│  ├─ index.html          # relative runtime/ URLs
 │  ├─ theme.css
-│  ├─ assets.json         # path → sha256 content hash
-│  ├─ 01-introduction/    # text snapshot only
+│  ├─ runtime/            # vendored Reveal (copied from project)
+│  ├─ 01-introduction/    # text + binaries inline
 │  └─ ...
 │
 └─ rel_def456/
-
-blobs/
-└─ sha256-{hex}           # content-addressed assets (shared)
-runtimes/
-└─ reveal-v1/             # shared by version (Preview + Publish)
 ```
 
-（決策 #10，2026-10-01：不每版複製 runtime；無 tar/zip。）
+（決策 #10 已取代，2026-10-01：每版完整樹複製含 runtime；無 blobs/、無 assets.json、無 shared /runtimes。）
 
 Release 建立後內容不可修改。
 
@@ -1131,7 +1115,7 @@ published_release_id = rel_def456
 公開 URL：
 
 ```text
-https://slides.example.com/s/product-strategy
+https://slides.example.com/presentations/product-strategy/
 ```
 
 resolved to：
@@ -1143,7 +1127,7 @@ rel_def456
 另外提供 immutable URL：
 
 ```text
-/release/rel_def456
+/releases/rel_def456
 ```
 
 重新 Publish 只更新 pointer：
@@ -1815,15 +1799,16 @@ PUT    /api/projects/{project_id}/assets/{path}
 GET    /api/projects/{project_id}/assets/{path}
 DELETE /api/projects/{project_id}/assets/{path}
 
-POST   /api/projects/{project_id}/releases
+POST   /api/projects/{project_id}/publish
 GET    /api/projects/{project_id}/releases
 GET    /api/projects/{project_id}/releases/{release_id}
+GET    /api/releases/{release_id}
 
-GET    /p/{project_id}/preview
-GET    /p/{project_id}/preview/{path}
+GET    /preview/{project_id}/
+GET    /preview/{project_id}/{path}
 
-GET    /s/{slug}
-GET    /release/{release_id}
+GET    /presentations/{slug}/
+GET    /releases/{release_id}/
 ```
 
 WebSocket：
@@ -2039,7 +2024,7 @@ MVP 不需要：
 7. **已決（PoC framing）** — JSON control + opaque Yjs binary。
 8. **可排除／MVP deferred** — presence cursor UI。
 9. **已決** — 409 AssetConflict + 使用我的／保留遠端（停止 silent LWW）。
-10. **已決** — shared `/runtimes/{pin}/` + content-addressed blobs；release 存 text + hash map + runtime pin；無 tar/zip。
+10. **已取代（superseded）** — 原 shared `/runtimes/{pin}/` + content-addressed blobs + release `assets.json` 已廢止。改為 project 自帶 `runtime/`、Publish 完整樹複製至 `releases/{id}/`；Preview=`/preview/{project_id}/`、Publish=`POST .../publish`、Release=`/releases/{id}/`、alias=`/presentations/{slug}/`。
 
 ---
 
