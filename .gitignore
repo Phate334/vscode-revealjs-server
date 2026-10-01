@@ -418,3 +418,6 @@ docs/archived/
 
 # Local PoC persistence blobs
 .data/
+
+# Local living improvement plans (not versioned)
+docs/improvement-roadmap.md
