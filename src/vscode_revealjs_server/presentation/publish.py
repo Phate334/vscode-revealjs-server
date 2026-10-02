@@ -10,19 +10,16 @@ Storage (Phase 1; supersedes decision #10):
 
 from __future__ import annotations
 
-import hashlib
 import mimetypes
 import shutil
 import uuid
 from pathlib import Path
 from typing import Any
 
-from vscode_revealjs_server.collaboration.manager import manager
 from vscode_revealjs_server.presentation.render import rewrite_chapter_relative_urls
 from vscode_revealjs_server.projects.service import (
     FsRejected,
     _now,
-    is_binary_rel,
     project_service,
 )
 
@@ -32,40 +29,11 @@ def _chapter_of(rel: str) -> str:
     return "" if parent == "." else parent
 
 
-def _content_hash(files: list[dict[str, str]], assets: list[dict[str, Any]]) -> str:
-    parts: list[str] = []
-    for f in sorted(files, key=lambda row: row["path"]):
-        digest = hashlib.sha256(f["content"].encode("utf-8")).hexdigest()
-        parts.append(f"f:{f['path']}:{digest}")
-    for a in sorted(assets, key=lambda row: row["path"]):
-        digest = hashlib.sha256(a["data"]).hexdigest()
-        parts.append(f"a:{a['path']}:{digest}")
-    return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
-
-
-def _overlay_crdt(project_id: str, cap: dict[str, Any]) -> None:
-    """Prefer live multi-doc CRDT text over workspace disk for matching paths."""
-    texts = manager.collaborative_texts(project_id)
-    if not texts:
-        return
-    by_path = {row["path"]: row for row in cap["files"]}
-    for rel, body in texts.items():
-        if is_binary_rel(rel):
-            continue
-        if rel in by_path:
-            by_path[rel]["content"] = body
-        else:
-            row = {"path": rel, "content": body}
-            cap["files"].append(row)
-            by_path[rel] = row
-
-
 def publish(project_id: str) -> dict[str, Any]:
     """Snapshot collaborative state into a self-contained release dir; update slug."""
     cap = project_service.capture_workspace(project_id)
     if cap is None:
         raise FsRejected("project not found")
-    _overlay_crdt(project_id, cap)
 
     release_id = f"rel_{uuid.uuid4().hex[:12]}"
     final, staging = project_service.release_staging_paths(project_id, release_id)
@@ -77,6 +45,8 @@ def publish(project_id: str) -> dict[str, Any]:
 
     asset_base = f"/releases/{release_id}"
     try:
+        for rel in cap["directories"]:
+            (staging / rel).mkdir(parents=True, exist_ok=True)
         for row in cap["files"]:
             rel = row["path"]
             content = row["content"]
@@ -103,8 +73,8 @@ def publish(project_id: str) -> dict[str, Any]:
     record = {
         "id": release_id,
         "created_at": _now(),
-        "revision": int(cap["revision"]),
-        "content_hash": _content_hash(cap["files"], cap["assets"]),
+        "structure_revision": int(cap["structure_revision"]),
+        "content_hash": cap["content_hash"],
     }
     try:
         return project_service.commit_release(project_id, record)

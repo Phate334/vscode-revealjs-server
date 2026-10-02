@@ -1,7 +1,7 @@
 /** Collaborative text path helpers (mirrors server is_collaborative_text_rel). */
 
 const COLLAB_TEXT_EXT = new Set([".md", ".css", ".html", ".yaml", ".yml", ".json"]);
-const IGNORE_PREFIXES = [".presentation/", ".git/", "node_modules/", ".vscode/"];
+const IGNORE_PREFIXES = [".presentation/", ".git/", "node_modules/", ".vscode/", "runtime/"];
 
 const BINARY_EXT = new Set([
   ".png",

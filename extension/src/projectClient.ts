@@ -1,19 +1,33 @@
 import * as vscode from "vscode";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { getAccessToken } from "./auth";
+import { atomicWrite, hash, localPath } from "./localState";
+import type { FsOperation, OperationsResult } from "./collaborationClient";
 
 export const DEFAULT_SERVER = "http://127.0.0.1:8000";
+export function normalizeServer(server: string): string {
+  const url = new URL(server);
+  if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.search || url.hash
+      || (url.pathname !== "/" && url.pathname !== "")) throw new Error("Server URL must be an HTTP(S) origin");
+  return url.origin;
+}
+export function configuredServer(): string {
+  return normalizeServer(vscode.workspace.getConfiguration("presentation").get<string>("serverUrl", DEFAULT_SERVER));
+}
 
 export type WorkspaceMeta = {
   version: number;
   server: string;
   projectId: string;
-  lastKnownRevision: number;
+  lastKnownStructureRevision: number;
 };
 
 export type ProjectInfo = {
   id: string;
   name: string;
   created_at: string;
-  revision: number;
+  structure_revision: number;
   role?: string;
   slug?: string;
 };
@@ -21,7 +35,8 @@ export type ProjectInfo = {
 export type Snapshot = {
   project_id: string;
   name: string;
-  revision: number;
+  structure_revision: number;
+  yjs_state: string;
   /** Workspace content fingerprint (B4); optional for older servers. */
   content_hash?: string;
   directories: string[];
@@ -29,18 +44,16 @@ export type Snapshot = {
   assets: { path: string; content_hash: string; size: number; revision?: number }[];
 };
 
-let accessTokenGetter: () => Promise<string | undefined> = async () => undefined;
-
-/** Extension wires this to SecretStorage. HTTP and WS attach the token when set. */
-export function setAccessTokenGetter(fn: () => Promise<string | undefined>): void {
-  accessTokenGetter = fn;
-}
-
-async function authHeaders(extra?: Record<string, string>): Promise<Record<string, string>> {
-  const headers: Record<string, string> = { ...extra };
-  const token = await accessTokenGetter();
-  if (token) headers.Authorization = `Bearer ${token}`;
-  return headers;
+async function authFetch(url: string, init?: RequestInit): Promise<Response> {
+  const server = new URL(url).origin;
+  const send = async (forceRefresh: boolean) => {
+    const token = await getAccessToken(server, forceRefresh);
+    const headers = new Headers(init?.headers);
+    if (token) headers.set("Authorization", `Bearer ${token}`);
+    return fetch(url, { ...init, headers });
+  };
+  const response = await send(false);
+  return response.status === 401 ? send(true) : response;
 }
 
 export async function collabWsUrl(server: string, projectId: string): Promise<string> {
@@ -48,7 +61,7 @@ export async function collabWsUrl(server: string, projectId: string): Promise<st
   const ws = base.startsWith("https")
     ? base.replace(/^https/, "wss")
     : base.replace(/^http/, "ws");
-  const token = await accessTokenGetter();
+  const token = await getAccessToken(server);
   const q = token ? `?access_token=${encodeURIComponent(token)}` : "";
   return `${ws}/api/projects/${encodeURIComponent(projectId)}/collaboration${q}`;
 }
@@ -63,15 +76,14 @@ export async function readWorkspaceMeta(
   const uri = vscode.Uri.joinPath(root, ".presentation", "workspace.json");
   try {
     const raw = Buffer.from(await vscode.workspace.fs.readFile(uri)).toString("utf8");
-    const j = JSON.parse(raw) as Partial<WorkspaceMeta> & { projectId?: string };
+    const j = JSON.parse(raw) as Partial<WorkspaceMeta> & { lastKnownRevision?: number };
     const projectId = j.projectId;
     if (!projectId || typeof projectId !== "string") return undefined;
     return {
       version: typeof j.version === "number" ? j.version : 1,
-      server: typeof j.server === "string" && j.server ? j.server : DEFAULT_SERVER,
+      server: normalizeServer(typeof j.server === "string" && j.server ? j.server : DEFAULT_SERVER),
       projectId,
-      lastKnownRevision:
-        typeof j.lastKnownRevision === "number" ? j.lastKnownRevision : 0,
+      lastKnownStructureRevision: j.lastKnownStructureRevision ?? j.lastKnownRevision ?? 0,
     };
   } catch {
     return undefined;
@@ -82,16 +94,11 @@ export async function writeWorkspaceMeta(
   folder: vscode.Uri,
   meta: WorkspaceMeta,
 ): Promise<void> {
-  const dir = vscode.Uri.joinPath(folder, ".presentation");
-  await vscode.workspace.fs.createDirectory(dir);
-  const uri = vscode.Uri.joinPath(dir, "workspace.json");
-  const body = Buffer.from(JSON.stringify(meta, null, 2) + "\n", "utf8");
-  await vscode.workspace.fs.writeFile(uri, body);
+  atomicWrite(localPath(folder, ".presentation/workspace.json", true), JSON.stringify(meta, null, 2) + "\n");
 }
 
 async function httpJson<T>(url: string, init?: RequestInit): Promise<T> {
-  const headers = await authHeaders(init?.headers as Record<string, string> | undefined);
-  const res = await fetch(url, { ...init, headers });
+  const res = await authFetch(url, init);
   if (!res.ok) {
     const detail = await res.text().catch(() => "");
     throw new Error(`HTTP ${res.status} ${url}: ${detail || res.statusText}`);
@@ -107,6 +114,7 @@ export type AssetPutResult = {
   content_hash: string;
   size: number;
   revision: number;
+  structure_revision: number;
 };
 
 /** Server 409 AssetConflict payload (#9). */
@@ -150,9 +158,9 @@ export async function putAsset(
     .split("/")
     .map(encodeURIComponent)
     .join("/")}${q}`;
-  const res = await fetch(url, {
+  const res = await authFetch(url, {
     method: "PUT",
-    headers: await authHeaders({ "Content-Type": "application/octet-stream" }),
+    headers: { "Content-Type": "application/octet-stream" },
     body: Buffer.from(data),
   });
   if (res.status === 409) {
@@ -185,18 +193,21 @@ export async function getAsset(
   server: string,
   projectId: string,
   relPath: string,
+  expectedHash?: string,
 ): Promise<Uint8Array> {
   const base = server.replace(/\/$/, "");
   const url = `${base}/api/projects/${encodeURIComponent(projectId)}/assets/${relPath
     .split("/")
     .map(encodeURIComponent)
-    .join("/")}`;
-  const res = await fetch(url, { headers: await authHeaders() });
+    .join("/")}${expectedHash ? `?content_hash=${encodeURIComponent(expectedHash)}` : ""}`;
+  const res = await authFetch(url);
   if (!res.ok) {
     const detail = await res.text().catch(() => "");
     throw new Error(`HTTP ${res.status} GET asset: ${detail || res.statusText}`);
   }
-  return new Uint8Array(await res.arrayBuffer());
+  const data = new Uint8Array(await res.arrayBuffer());
+  if (expectedHash && hash(data) !== expectedHash) throw new Error("Asset changed since snapshot");
+  return data;
 }
 
 export async function createProject(
@@ -232,11 +243,12 @@ export async function login(
   password: string,
 ): Promise<LoginResult> {
   const base = server.replace(/\/$/, "");
-  return httpJson<LoginResult>(`${base}/api/auth/login`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
+  const response = await fetch(`${base}/api/auth/login`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ username, password }),
   });
+  if (!response.ok) throw new Error(`Sign In failed (${response.status})`);
+  return await response.json() as LoginResult;
 }
 
 export type ShareInvite = {
@@ -253,7 +265,7 @@ export async function createShare(
 ): Promise<ShareInvite> {
   const base = server.replace(/\/$/, "");
   return httpJson<ShareInvite>(
-    `${base}/api/projects/${encodeURIComponent(projectId)}/shares`,
+    `${base}/api/projects/${encodeURIComponent(projectId)}/invites`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -267,7 +279,7 @@ export async function acceptShare(
   token: string,
 ): Promise<{ project: ProjectInfo; already_member: boolean }> {
   const base = server.replace(/\/$/, "");
-  return httpJson(`${base}/api/shares/accept`, {
+  return httpJson(`${base}/api/invites/${encodeURIComponent(token)}/accept`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ token }),
@@ -288,7 +300,7 @@ export type ReleaseInfo = {
   public_path: string;
   release_path: string;
   current: boolean;
-  revision: number;
+  structure_revision: number;
   slug?: string;
 };
 
@@ -310,28 +322,38 @@ export async function fetchSnapshot(
   );
 }
 
-/** Write snapshot files into folder (overwrites listed paths). */
-export async function extractSnapshot(
-  folder: vscode.Uri,
-  snap: Snapshot,
-  server?: string,
-): Promise<void> {
-  for (const dir of snap.directories) {
-    await vscode.workspace.fs.createDirectory(vscode.Uri.joinPath(folder, dir));
+/** Extract only into a newly reserved child folder; every path is validated. */
+export async function extractSnapshot(folder: vscode.Uri, snap: Snapshot, server: string): Promise<void> {
+  for (const dir of snap.directories) fs.mkdirSync(localPath(folder, dir), { recursive: true });
+  for (const file of snap.files) {
+    const dest = localPath(folder, file.path);
+    fs.mkdirSync(path.dirname(dest), { recursive: true });
+    fs.writeFileSync(dest, file.content, { flag: "wx" });
   }
-  for (const f of snap.files) {
-    const uri = vscode.Uri.joinPath(folder, f.path);
-    const parent = vscode.Uri.joinPath(uri, "..");
-    await vscode.workspace.fs.createDirectory(parent);
-    await vscode.workspace.fs.writeFile(uri, Buffer.from(f.content, "utf8"));
+  for (const asset of snap.assets) {
+    const data = await getAsset(server, snap.project_id, asset.path, asset.content_hash);
+    const dest = localPath(folder, asset.path);
+    fs.mkdirSync(path.dirname(dest), { recursive: true });
+    fs.writeFileSync(dest, data, { flag: "wx" });
   }
-  // Asset bodies are refs only in JSON snapshot; pull via GET when server known.
-  const base = server ?? DEFAULT_SERVER;
-  for (const a of snap.assets ?? []) {
-    if (!a?.path) continue;
-    const bytes = await getAsset(base, snap.project_id, a.path);
-    const uri = vscode.Uri.joinPath(folder, a.path);
-    await vscode.workspace.fs.createDirectory(vscode.Uri.joinPath(uri, ".."));
-    await vscode.workspace.fs.writeFile(uri, bytes);
-  }
+  atomicWrite(localPath(folder, ".presentation/yjs-state.bin", true), Buffer.from(snap.yjs_state, "base64"));
+}
+
+export async function sendOperations(server: string, projectId: string, base: number, operations: FsOperation[]): Promise<OperationsResult> {
+  const response = await authFetch(`${server}/api/projects/${encodeURIComponent(projectId)}/workspace/operations`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ base_revision: base, operations }),
+  });
+  const body = await response.json() as OperationsResult & { detail?: OperationsResult };
+  if (response.status === 409 && body.detail?.results) return body.detail;
+  if (!response.ok) throw new Error(`Workspace command failed (${response.status})`);
+  return body;
+}
+
+export async function previewInvite(server: string, token: string): Promise<{ project_name: string; role: string }> {
+  return httpJson(`${server}/api/invites/${encodeURIComponent(token)}`);
+}
+
+export async function previewSession(server: string, projectId: string): Promise<{ url: string; expires_at: number }> {
+  return httpJson(`${server}/api/projects/${encodeURIComponent(projectId)}/preview-session`, { method: "POST" });
 }

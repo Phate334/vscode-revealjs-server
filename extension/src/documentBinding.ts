@@ -1,382 +1,182 @@
+import * as fs from "node:fs";
 import * as vscode from "vscode";
 import * as Y from "yjs";
 import type { CollaborationClient } from "./collaborationClient";
-import { OriginTracker } from "./originTracker";
 import { FS_RECONCILE, LOCAL_EDITOR } from "./origins";
-import { COLLAB_TEXT_GLOB, isCollaborativeTextPath } from "./textPaths";
+import { isCollaborativeTextPath } from "./textPaths";
+import { atomicWrite, hash, localPath, readJson } from "./localState";
 
 const CONTEXT_KEY = "presentation.collaborativeEditor";
-// #4: trailing debounce per path (per FileBinding); no OS-specific strategy.
-const FILE_SETTLE_MS = 150;
-// ponytail: ~500ms groups keystrokes into one undo step; tune if users want finer/coarser undo.
-const UNDO_CAPTURE_TIMEOUT_MS = 500;
-
 export type DocumentsBinding = {
+  refresh: () => Promise<void>;
+  ingestDisk: (rel: string, content: string) => Promise<boolean>;
+  acceptLocal: (rel: string, content: string) => Promise<void>;
   dispose: () => void;
   undo: () => void;
   redo: () => void;
 };
 
-type FileBinding = {
-  uri: vscode.Uri;
-  rel: string;
-  doc: vscode.TextDocument;
-  ytext: Y.Text;
-  undoManager: Y.UndoManager;
-  origin: OriginTracker;
-  onDiskEvent: () => void;
-  seedOrPull: () => Promise<void>;
-  dispose: () => void;
-  undo: () => void;
-  redo: () => void;
-};
-
-/** Shared prefix/suffix span for minimal text replace (disk→Y and Y→editor). */
-function diffSpan(
-  oldText: string,
-  newText: string,
-): { start: number; oldEnd: number; newEnd: number } | undefined {
-  if (oldText === newText) return undefined;
-  let start = 0;
-  const oldLen = oldText.length;
-  const newLen = newText.length;
-  while (start < oldLen && start < newLen && oldText.charCodeAt(start) === newText.charCodeAt(start)) {
-    start++;
-  }
-  let oldEnd = oldLen;
-  let newEnd = newLen;
-  while (
-    oldEnd > start &&
-    newEnd > start &&
-    oldText.charCodeAt(oldEnd - 1) === newText.charCodeAt(newEnd - 1)
-  ) {
-    oldEnd--;
-    newEnd--;
-  }
-  return { start, oldEnd, newEnd };
+function span(before: string, after: string): { start: number; end: number; text: string } | undefined {
+  if (before === after) return undefined;
+  let start = 0, end = before.length, nextEnd = after.length;
+  while (start < end && start < nextEnd && before[start] === after[start]) start++;
+  while (end > start && nextEnd > start && before[end - 1] === after[nextEnd - 1]) { end--; nextEnd--; }
+  return { start, end, text: after.slice(start, nextEnd) };
+}
+function patch(client: CollaborationClient, text: Y.Text, next: string, origin: unknown): void {
+  const edit = span(text.toString(), next);
+  if (!edit) return;
+  client.doc.transact(() => {
+    if (edit.end > edit.start) text.delete(edit.start, edit.end - edit.start);
+    if (edit.text) text.insert(edit.start, edit.text);
+  }, origin);
 }
 
-/**
- * External reconcile (#3): single prefix/suffix patch onto Y.Text.
- * oldText = last projected known state (current Y.Text); interface stays reconcileText→patches.
- * Do not replace the whole string in one shot — that bypasses concurrent merge.
- */
-function applyTextDiff(doc: Y.Doc, ytext: Y.Text, oldText: string, newText: string): void {
-  const span = diffSpan(oldText, newText);
-  if (!span) return;
-  doc.transact(() => {
-    const del = span.oldEnd - span.start;
-    if (del > 0) ytext.delete(span.start, del);
-    if (span.newEnd > span.start) ytext.insert(span.start, newText.slice(span.start, span.newEnd));
-  }, FS_RECONCILE);
-}
-
-function applyTextDiffAsLocal(ydoc: Y.Doc, yt: Y.Text, oldText: string, newText: string): void {
-  const span = diffSpan(oldText, newText);
-  if (!span) return;
-  ydoc.transact(() => {
-    const del = span.oldEnd - span.start;
-    if (del > 0) yt.delete(span.start, del);
-    if (span.newEnd > span.start) yt.insert(span.start, newText.slice(span.start, span.newEnd));
-  }, LOCAL_EDITOR);
-}
-
-function relPath(folder: vscode.Uri, uri: vscode.Uri): string | undefined {
-  const root = folder.fsPath.replace(/[/\\]+$/, "");
-  const full = uri.fsPath;
-  if (!full.startsWith(root)) return undefined;
-  const rel = full.slice(root.length).replace(/^[/\\]+/, "").replace(/\\/g, "/");
-  return rel || undefined;
-}
-
-async function findCollaborativeUris(folder: vscode.Uri): Promise<vscode.Uri[]> {
-  const hits = await vscode.workspace.findFiles(
-    new vscode.RelativePattern(folder, COLLAB_TEXT_GLOB),
-    "{**/node_modules/**,**/.git/**,**/.presentation/**,**/.vscode/**}",
-    200,
-  );
-  return hits.filter((uri) => {
-    const rel = relPath(folder, uri);
-    return !!rel && isCollaborativeTextPath(rel);
-  });
-}
-
-/** Prefer nested chapter slide.md, else root slide.md, else first markdown. */
-function pickPrimaryUri(folder: vscode.Uri, uris: vscode.Uri[]): vscode.Uri | undefined {
-  const rels = uris.map((u) => ({ uri: u, rel: relPath(folder, u) || "" }));
-  const nested = rels.find((r) => /^[^/]+\/slide\.md$/.test(r.rel));
-  if (nested) return nested.uri;
-  const root = rels.find((r) => r.rel === "slide.md");
-  if (root) return root.uri;
-  return uris[0];
-}
-
-function bindOneFile(
-  client: CollaborationClient,
-  folder: vscode.Uri,
-  uri: vscode.Uri,
-  doc: vscode.TextDocument,
-): FileBinding {
-  const rel = relPath(folder, uri);
-  if (!rel) {
-    throw new Error(`Collab: uri outside workspace: ${uri.fsPath}`);
-  }
-  const origin = new OriginTracker();
-  const ytext = client.getText(rel);
-  const undoManager = new Y.UndoManager(ytext, {
-    trackedOrigins: new Set([LOCAL_EDITOR]),
-    captureTimeout: UNDO_CAPTURE_TIMEOUT_MS,
-  });
-
-  let applyChain: Promise<void> = Promise.resolve();
-  let recoverLocalAfterRemote = false;
-
-  const enqueueApply = (fn: () => Promise<void>): Promise<void> => {
-    applyChain = applyChain.then(fn, fn);
-    return applyChain;
-  };
-
-  const applyYToEditorCore = async (): Promise<void> => {
-    const next = ytext.toString();
-    const prev = doc.getText();
-    if (prev === next) return;
-    const span = diffSpan(prev, next);
-    if (!span) return;
-    const edit = new vscode.WorkspaceEdit();
-    const range = new vscode.Range(doc.positionAt(span.start), doc.positionAt(span.oldEnd));
-    edit.replace(uri, range, next.slice(span.start, span.newEnd));
-    recoverLocalAfterRemote = false;
-    await origin.markRemote(() => vscode.workspace.applyEdit(edit));
-    if (recoverLocalAfterRemote) {
-      recoverLocalAfterRemote = false;
-      const editorNow = doc.getText();
-      const crdtNow = ytext.toString();
-      if (editorNow !== crdtNow) {
-        applyTextDiffAsLocal(client.doc, ytext, crdtNow, editorNow);
-      }
-    }
-  };
-
-  const applyYToEditor = (): Promise<void> => enqueueApply(() => applyYToEditorCore());
-
-  const seedOrPull = async () => {
-    const fileText = doc.getText();
-    const remote = ytext.toString();
-    if (remote.length === 0 && fileText.length > 0) {
-      ytext.insert(0, fileText);
-      return;
-    }
-    if (remote !== fileText) {
-      await applyYToEditor();
-    }
-  };
-
-  const yObserver = () => {
-    void applyYToEditor();
-  };
-  ytext.observe(yObserver);
-
-  const changeSub = vscode.workspace.onDidChangeTextDocument((e) => {
-    if (e.document.uri.toString() !== uri.toString()) return;
-
-    if (origin.isRemote()) {
-      recoverLocalAfterRemote = true;
-      return;
-    }
-
-    if (e.reason === vscode.TextDocumentChangeReason.Undo) {
-      void enqueueApply(async () => {
-        undoManager.undo();
-        await applyYToEditorCore();
-      });
-      return;
-    }
-    if (e.reason === vscode.TextDocumentChangeReason.Redo) {
-      void enqueueApply(async () => {
-        undoManager.redo();
-        await applyYToEditorCore();
-      });
-      return;
-    }
-
-    const changes = [...e.contentChanges].sort((a, b) => b.rangeOffset - a.rangeOffset);
-    client.doc.transact(() => {
-      for (const c of changes) {
-        if (c.rangeLength > 0) ytext.delete(c.rangeOffset, c.rangeLength);
-        if (c.text.length > 0) ytext.insert(c.rangeOffset, c.text);
-      }
-    }, LOCAL_EDITOR);
-  });
-
-  let watchTimer: ReturnType<typeof setTimeout> | undefined;
-  const onDiskEvent = () => {
-    if (origin.isRemote()) return;
-    if (watchTimer) clearTimeout(watchTimer);
-    watchTimer = setTimeout(() => {
-      watchTimer = undefined;
-      void (async () => {
-        if (origin.isRemote()) return;
-        try {
-          const bytes = await vscode.workspace.fs.readFile(uri);
-          const diskText = Buffer.from(bytes).toString("utf8");
-          const crdtText = ytext.toString();
-          if (diskText === crdtText) return;
-          applyTextDiff(client.doc, ytext, crdtText, diskText);
-        } catch {
-          // deleted / unreadable
-        }
-      })();
-    }, FILE_SETTLE_MS);
-  };
-
-  return {
-    uri,
-    rel,
-    doc,
-    ytext,
-    undoManager,
-    origin,
-    onDiskEvent,
-    seedOrPull,
-    dispose: () => {
-      ytext.unobserve(yObserver);
-      undoManager.destroy();
-      changeSub.dispose();
-      if (watchTimer) clearTimeout(watchTimer);
-    },
-    undo: () => {
-      void enqueueApply(async () => {
-        undoManager.undo();
-        await applyYToEditorCore();
-      });
-    },
-    redo: () => {
-      void enqueueApply(async () => {
-        undoManager.redo();
-        await applyYToEditorCore();
-      });
-    },
-  };
-}
-
-/**
- * Bind all collaborative text files (path → Y.Text) with per-file UndoManager.
- * Init assumes ready/snapshot barrier already passed (H2).
- */
+/** Bind to restored Yjs before connecting, with durable saved-disk baselines independent of Auto Save. */
 export async function bindCollaborativeDocuments(
-  client: CollaborationClient,
+  client: CollaborationClient, folder: vscode.Uri, onConflict: (path: string) => void, isBlocked: (path: string) => boolean,
 ): Promise<DocumentsBinding> {
-  const folder = vscode.workspace.workspaceFolders?.[0]?.uri;
-  if (!folder) {
-    void vscode.window.showWarningMessage("Collab: no workspace folder");
-    return { dispose: () => undefined, undo: () => undefined, redo: () => undefined };
-  }
-
-  const bindings = new Map<string, FileBinding>();
-
-  const bindUri = async (uri: vscode.Uri, show = false): Promise<void> => {
-    const rel = relPath(folder, uri);
-    if (!rel || !isCollaborativeTextPath(rel)) return;
-    if (bindings.has(rel)) return;
-    const doc = await vscode.workspace.openTextDocument(uri);
-    if (show) {
-      await vscode.window.showTextDocument(doc, { preview: false });
-    }
-    const binding = bindOneFile(client, folder, uri, doc);
-    bindings.set(rel, binding);
-    if (client.getStatus() === "connected") {
-      await binding.seedOrPull();
-    }
+  const basesPath = localPath(folder, ".presentation/text-bases.json", true);
+  const bases: Record<string, string> = Object.assign(Object.create(null), readJson<Record<string, string>>(basesPath, {}));
+  const saveBases = () => atomicWrite(basesPath, JSON.stringify(bases));
+  const bindings = new Map<string, { doc: vscode.TextDocument; text: Y.Text; undo: Y.UndoManager; apply: () => void; dispose: () => void }>();
+  const output = vscode.window.createOutputChannel("Presentation Text Sync");
+  const preserve = (rel: string, content: string) => {
+    atomicWrite(localPath(folder, `.presentation/recovery/${hash(content)}/${rel}`, true), content);
+    onConflict(rel);
   };
+  let disposed = false;
+  let refreshChain: Promise<void> = Promise.resolve();
 
-  const uris = await findCollaborativeUris(folder);
-  const primary = pickPrimaryUri(folder, uris);
-  for (const uri of uris) {
-    await bindUri(uri, primary !== undefined && uri.toString() === primary.toString());
-  }
-  if (uris.length === 0) {
-    void vscode.window.showWarningMessage("Collab: no collaborative text files in workspace");
-  }
-
-  // H2: seed after ready; keep onReady for reconnect.
-  const prevReady = client.onReady;
-  client.onReady = () => {
-    prevReady?.();
-    for (const b of bindings.values()) {
-      void b.seedOrPull();
+  const bind = async (rel: string): Promise<void> => {
+    if (disposed || isBlocked(rel) || !isCollaborativeTextPath(rel)) return;
+    const filename = localPath(folder, rel);
+    if (!fs.existsSync(filename) || fs.statSync(filename).isDirectory()) return;
+    const existing = bindings.get(rel);
+    const text = client.documents.get(rel);
+    if (!text) return; // Topology owns path creation; never reseed an intentionally empty remote Y.Text.
+    if (existing?.text === text) { existing.apply(); return; }
+    if (existing) {
+      if (existing.doc.isDirty && existing.doc.getText() !== text.toString()) preserve(rel, existing.doc.getText());
+      existing.dispose(); bindings.delete(rel);
     }
-  };
-  if (client.getStatus() === "connected") {
-    for (const b of bindings.values()) {
-      void b.seedOrPull();
-    }
-  }
-
-  const updateContext = () => {
-    const ed = vscode.window.activeTextEditor;
-    let on = false;
-    if (ed) {
-      const rel = relPath(folder, ed.document.uri);
-      on = !!(rel && bindings.has(rel));
-    }
-    void vscode.commands.executeCommand("setContext", CONTEXT_KEY, on);
-  };
-  updateContext();
-  const ctxSub = vscode.window.onDidChangeActiveTextEditor(updateContext);
-
-  const watcher = vscode.workspace.createFileSystemWatcher(
-    new vscode.RelativePattern(folder, COLLAB_TEXT_GLOB),
-  );
-
-  const onDisk = (eventUri: vscode.Uri) => {
-    const rel = relPath(folder, eventUri);
-    if (!rel || !isCollaborativeTextPath(rel)) return;
-    const b = bindings.get(rel);
-    if (b) {
-      b.onDiskEvent();
-      return;
-    }
-    void bindUri(eventUri, false);
-  };
-
-  const wChange = watcher.onDidChange(onDisk);
-  const wCreate = watcher.onDidCreate(onDisk);
-
-  // Observe documents map for remote-created paths (server fs→CRDT).
-  const mapObserver = (event: Y.YMapEvent<Y.Text>) => {
-    event.keysChanged.forEach((key) => {
-      if (bindings.has(key)) return;
-      if (!isCollaborativeTextPath(key)) return;
-      const uri = vscode.Uri.joinPath(folder, key);
-      void bindUri(uri, false);
+    const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(filename));
+    if (disposed) return;
+    const undo = new Y.UndoManager(text, { trackedOrigins: new Set([LOCAL_EDITOR]), captureTimeout: 500 });
+    let expectedRemote: string | undefined;
+    let applyChain: Promise<void> = Promise.resolve();
+    const apply = () => {
+      applyChain = applyChain.then(async () => {
+        if (disposed || isBlocked(rel) || doc.isClosed || client.documents.get(rel) !== text) return;
+        const next = text.toString();
+        const edit = span(doc.getText(), next);
+        if (!edit) return;
+        const wsEdit = new vscode.WorkspaceEdit();
+        wsEdit.replace(doc.uri, new vscode.Range(doc.positionAt(edit.start), doc.positionAt(edit.end)), edit.text);
+        expectedRemote = next;
+        const applied = await vscode.workspace.applyEdit(wsEdit);
+        expectedRemote = undefined;
+        if (!applied) { preserve(rel, doc.getText()); throw new Error(`Editor update interrupted: ${rel}`); }
+        // Ordinary Save is intentionally not invoked (formatters/save hooks are user preferences).
+      }).catch((error) => { output.appendLine(String(error)); onConflict(rel); });
+    };
+    const observer = () => apply();
+    text.observe(observer);
+    const changes = vscode.workspace.onDidChangeTextDocument((event) => {
+      if (event.document.uri.toString() !== doc.uri.toString() || !event.contentChanges.length) return;
+      if (expectedRemote !== undefined && doc.getText() === expectedRemote) return;
+      if (client.documents.get(rel) !== text) { preserve(rel, doc.getText()); return; }
+      if (expectedRemote !== undefined) {
+        // A user edit raced the remote WorkspaceEdit: preserve both states instead of whole-file overwrite.
+        preserve(rel, doc.getText()); return;
+      }
+      if (event.reason === vscode.TextDocumentChangeReason.Undo) { undo.undo(); apply(); return; }
+      if (event.reason === vscode.TextDocumentChangeReason.Redo) { undo.redo(); apply(); return; }
+      client.doc.transact(() => {
+        for (const change of [...event.contentChanges].sort((a, b) => b.rangeOffset - a.rangeOffset)) {
+          if (change.rangeLength) text.delete(change.rangeOffset, change.rangeLength);
+          if (change.text) text.insert(change.rangeOffset, change.text);
+        }
+      }, LOCAL_EDITOR);
     });
+    bindings.set(rel, { doc, text, undo, apply, dispose: () => { text.unobserve(observer); changes.dispose(); undo.destroy(); } });
+    if (doc.isDirty && doc.getText() !== text.toString()) {
+      // Hot-exit buffer may be ahead of the last persisted transaction. Keep a recoverable copy.
+      preserve(rel, doc.getText());
+    }
+    apply();
+    void vscode.commands.executeCommand("setContext", CONTEXT_KEY,
+      [...bindings.values()].some((b) => b.doc.uri.toString() === vscode.window.activeTextEditor?.document.uri.toString()));
   };
-  client.documents.observe(mapObserver);
 
-  const activeBinding = (): FileBinding | undefined => {
-    const ed = vscode.window.activeTextEditor;
-    if (!ed) return undefined;
-    const rel = relPath(folder, ed.document.uri);
-    return rel ? bindings.get(rel) : undefined;
+  const refresh = (): Promise<void> => {
+    refreshChain = refreshChain.then(async () => {
+      for (const [rel, binding] of bindings) {
+        if (!client.documents.has(rel) || binding.doc.isClosed) {
+          if (binding.doc.isDirty) preserve(rel, binding.doc.getText());
+          binding.dispose(); bindings.delete(rel);
+        }
+      }
+      for (const rel of client.documents.keys()) await bind(rel);
+    }).catch((error) => { output.appendLine(String(error)); onConflict("document binding"); });
+    return refreshChain;
   };
+
+  const ingestDisk = async (rel: string, content: string): Promise<boolean> => {
+    if (!isCollaborativeTextPath(rel)) return true;
+    if (isBlocked(rel)) return false;
+    let text = client.documents.get(rel);
+    const base = bases[rel];
+    if (!text) {
+      text = client.getText(rel);
+      patch(client, text, content, FS_RECONCILE);
+    } else if (base !== undefined && base !== content && text.toString() !== content) {
+      if (text.toString() !== base) {
+        // Independent unsaved/remote changes exist: do not diff a stale disk against current Yjs.
+        preserve(rel, content);
+        return false;
+      }
+      patch(client, text, content, FS_RECONCILE);
+    } else if (base === undefined && text.toString() !== content) {
+      // Fresh clones have a matching initial disk; legacy workspaces require explicit recovery.
+      preserve(rel, content);
+      return false;
+    }
+    bases[rel] = content;
+    saveBases();
+    await bind(rel);
+    return true;
+  };
+
+  const mapChanged = () => { void refresh(); };
+  client.documents.observe(mapChanged);
+  const active = () => {
+    const filename = vscode.window.activeTextEditor?.document.uri.fsPath;
+    return [...bindings.values()].find((binding) => binding.doc.uri.fsPath === filename);
+  };
+  const updateContext = () => { void vscode.commands.executeCommand("setContext", CONTEXT_KEY, !!active()); };
+  const editorSub = vscode.window.onDidChangeActiveTextEditor(updateContext);
+  const openSub = vscode.workspace.onDidOpenTextDocument(() => { void refresh().then(updateContext); });
 
   return {
-    dispose: () => {
-      client.documents.unobserve(mapObserver);
-      client.onReady = prevReady;
-      for (const b of bindings.values()) b.dispose();
-      bindings.clear();
-      ctxSub.dispose();
-      void vscode.commands.executeCommand("setContext", CONTEXT_KEY, false);
-      wChange.dispose();
-      wCreate.dispose();
-      watcher.dispose();
+    refresh,
+    ingestDisk,
+    acceptLocal: async (rel, content) => {
+      if (!isCollaborativeTextPath(rel)) return;
+      patch(client, client.getText(rel), content, LOCAL_EDITOR);
+      const filename = localPath(folder, rel);
+      if (fs.existsSync(filename)) bases[rel] = fs.readFileSync(filename, "utf8");
+      saveBases();
+      await bind(rel);
     },
-    undo: () => activeBinding()?.undo(),
-    redo: () => activeBinding()?.redo(),
+    undo: () => active()?.undo.undo(),
+    redo: () => active()?.undo.redo(),
+    dispose: () => {
+      disposed = true;
+      client.documents.unobserve(mapChanged);
+      for (const binding of bindings.values()) binding.dispose();
+      bindings.clear(); editorSub.dispose(); openSub.dispose(); output.dispose();
+      void vscode.commands.executeCommand("setContext", CONTEXT_KEY, false);
+    },
   };
 }
-
-/** @deprecated alias — prefer bindCollaborativeDocuments */
-export const bindSlideDocument = bindCollaborativeDocuments;
-export type SlideBinding = DocumentsBinding;

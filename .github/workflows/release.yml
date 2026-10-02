@@ -14,6 +14,9 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.ver.outputs.version }}
+      extension_version: ${{ steps.ver.outputs.extension_version }}
+      prerelease: ${{ steps.ver.outputs.prerelease }}
+      image_tags: ${{ steps.ver.outputs.image_tags }}
     steps:
       - uses: actions/checkout@v4
       - id: ver
@@ -32,7 +35,23 @@ jobs:
             exit 1
           fi
           echo "version=$PY_VERSION" >> "$GITHUB_OUTPUT"
-          echo "OK: tag $TAG matches pyproject.toml $PY_VERSION"
+          python3 - <<'PYVER'
+          import os, re, tomllib
+          version = tomllib.load(open('pyproject.toml', 'rb'))['project']['version']
+          match = re.fullmatch(r'(\d+\.\d+\.\d+)(rc\d+)?', version)
+          if not match:
+              raise SystemExit('Expected X.Y.Z or X.Y.ZrcN')
+          prerelease = bool(match.group(2))
+          image = 'ghcr.io/phate334/vscode-revealjs-server'
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write(f'extension_version={match.group(1)}\n')
+              out.write(f'prerelease={str(prerelease).lower()}\n')
+              out.write('image_tags<<TAGS\n')
+              out.write(f'{image}:{version}\n')
+              if not prerelease:
+                  out.write(f'{image}:latest\n')
+              out.write('TAGS\n')
+          PYVER
 
   package-vsix:
     needs: verify-version
@@ -46,7 +65,7 @@ jobs:
           cache-dependency-path: extension/package-lock.json
       - name: Sync extension/package.json version
         env:
-          VERSION: ${{ needs.verify-version.outputs.version }}
+          VERSION: ${{ needs.verify-version.outputs.extension_version }}
         run: |
           python3 -c "
           import json, os
@@ -64,12 +83,15 @@ jobs:
         run: |
           npm ci
           npm run compile
-          npx --yes @vscode/vsce package --out "vscode-revealjs-collaboration-${{ needs.verify-version.outputs.version }}.vsix"
+          FLAGS=()
+          if [ "${{ needs.verify-version.outputs.prerelease }}" = "true" ]; then FLAGS+=(--pre-release); fi
+          npx --yes @vscode/vsce package "${FLAGS[@]}" --out "vscode-revealjs-collaboration-${{ needs.verify-version.outputs.version }}.vsix"
       - name: Create GitHub Release and upload VSIX
         uses: softprops/action-gh-release@v2
         with:
           files: extension/vscode-revealjs-collaboration-${{ needs.verify-version.outputs.version }}.vsix
           generate_release_notes: true
+          prerelease: ${{ needs.verify-version.outputs.prerelease == 'true' }}
 
   docker:
     needs: verify-version
@@ -92,8 +114,6 @@ jobs:
           context: .
           push: true
           platforms: linux/amd64,linux/arm64
-          tags: |
-            ghcr.io/phate334/vscode-revealjs-server:${{ needs.verify-version.outputs.version }}
-            ghcr.io/phate334/vscode-revealjs-server:latest
+          tags: ${{ needs.verify-version.outputs.image_tags }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

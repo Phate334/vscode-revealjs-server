@@ -44,3 +44,11 @@ Mark intentional PoC shortcuts with a `ponytail:` comment naming the ceiling and
 - To cut a release: bump that version first, keep `compose.yaml` `image:` tag on the same `X.Y.Z`, commit, push `main`, then create and push git tag `vX.Y.Z` (must match exactly). Do not push a release tag before the version bump is on the commit being tagged.
 - Tag `v*` triggers `.github/workflows/release.yml` (VSIX on GitHub Release + multi-arch image to `ghcr.io/phate334/vscode-revealjs-server`).
 - Do not invent ad-hoc version numbers in the extension or image tags that diverge from `pyproject.toml`.
+
+## Release candidates
+
+- `uv version X.Y.ZrcN --no-sync` updates the canonical Python version and lockfile.
+- Compose and git tags retain the full canonical version (`X.Y.ZrcN`, `vX.Y.ZrcN`).
+- VS Code requires a numeric `X.Y.Z` manifest version. Derive it from the canonical version; package RC builds with `vsce --pre-release`. Keep the RC suffix in the VSIX filename and GitHub Release tag.
+- RC releases are marked prerelease and must not move the stable image's `latest` tag.
+- A feature-branch version bump does not authorize creating a release tag or publishing a release.

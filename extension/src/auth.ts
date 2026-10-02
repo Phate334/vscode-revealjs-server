@@ -1,36 +1,37 @@
 import * as vscode from "vscode";
 
-/** SecretStorage session. ponytail: no refresh rotation yet; sign in again when access expires. */
+export type Session = { access_token: string; refresh_token: string; username: string };
+let secrets: vscode.SecretStorage;
+const refreshes = new Map<string, Promise<string | undefined>>();
+export function initAuth(context: vscode.ExtensionContext): void { secrets = context.secrets; }
+function key(server: string): string { return `presentation.session:${new URL(server).origin}`; }
 
-const ACCESS = "presentation.accessToken";
-const REFRESH = "presentation.refreshToken";
-const USER = "presentation.username";
-
-let secrets: vscode.SecretStorage | undefined;
-
-export function initAuth(context: vscode.ExtensionContext): void {
-  secrets = context.secrets;
+export async function saveSession(server: string, session: Session): Promise<void> {
+  await secrets.store(key(server), JSON.stringify(session));
 }
 
-export async function getAccessToken(): Promise<string | undefined> {
-  const token = await secrets?.get(ACCESS);
-  return token || undefined;
-}
-
-export async function getSignedInUsername(): Promise<string | undefined> {
-  const name = await secrets?.get(USER);
-  return name || undefined;
-}
-
-export async function saveSession(session: {
-  access_token: string;
-  refresh_token: string;
-  username: string;
-}): Promise<void> {
-  if (!secrets) {
-    throw new Error("auth not initialized");
-  }
-  await secrets.store(ACCESS, session.access_token);
-  await secrets.store(REFRESH, session.refresh_token);
-  await secrets.store(USER, session.username);
+/** Sessions and refreshes are isolated by origin; never send one server's token to another. */
+export async function getAccessToken(server: string, forceRefresh = false): Promise<string | undefined> {
+  const raw = await secrets.get(key(server));
+  if (!raw) return undefined;
+  const session = JSON.parse(raw) as Session;
+  let expiry = 0;
+  try { expiry = JSON.parse(Buffer.from(session.access_token.split(".")[1], "base64url").toString()).exp; } catch { /* refresh */ }
+  if (!forceRefresh && expiry > Date.now() / 1000 + 30) return session.access_token;
+  const origin = new URL(server).origin;
+  const existing = refreshes.get(origin);
+  if (existing) return existing;
+  const refresh = (async () => {
+    const response = await fetch(`${origin}/api/auth/refresh`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ refresh_token: session.refresh_token }),
+    });
+    if (response.status === 401) { await secrets.delete(key(origin)); return undefined; }
+    if (!response.ok) throw new Error(`Sign-in refresh failed (${response.status})`);
+    const next = await response.json() as Session;
+    await saveSession(origin, { ...next, username: session.username });
+    return next.access_token;
+  })();
+  refreshes.set(origin, refresh);
+  try { return await refresh; } finally { refreshes.delete(origin); }
 }

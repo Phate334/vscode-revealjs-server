@@ -6,6 +6,7 @@ Upgrade: §18.1 project tables + membership DB (post-MVP).
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import secrets
 import threading
@@ -16,7 +17,7 @@ import shutil
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from vscode_revealjs_server.presentation.render import (
     default_agents_md,
@@ -39,7 +40,7 @@ _SAFE_REL = re.compile(
     r"^(?:[\w.\-]+|[\w.\-]+/[\w.\-]+|runtime(?:/[\w.\-]+)+)$"
 )
 _SAFE_DIR = re.compile(r"^[\w.\-]+$")
-_FS_KINDS = frozenset({"create", "delete", "rename", "move", "mkdir"})
+_FS_KINDS = frozenset({"create", "delete", "rename", "move", "mkdir", "write"})
 _BINARY_EXT = frozenset({
     ".png",
     ".jpg",
@@ -208,8 +209,14 @@ class ProjectService:
         # ponytail: process-local mutation lock for fs/asset/snapshot consistency (B4).
         # Ceiling: multi-replica. Upgrade: DB transaction / distributed lock (M3).
         self._mut = threading.RLock()
+        # Workspace domain supplies a CRDT view while the same mutation lock is held.
+        self.collaborative_state: Callable[[str], tuple[dict[str, str], bytes | None]] = (
+            lambda _project_id: ({}, None)
+        )
 
     def _project_dir(self, project_id: str) -> Path:
+        if not re.fullmatch(r"prj_[0-9a-f]{12}", project_id):
+            raise FsRejected("invalid project id")
         return self.root / project_id
 
     def _meta_path(self, project_id: str) -> Path:
@@ -219,10 +226,15 @@ class ProjectService:
         return self._project_dir(project_id) / "workspace"
 
     def _read_meta(self, project_id: str) -> dict[str, Any] | None:
+        if not re.fullmatch(r"prj_[0-9a-f]{12}", project_id):
+            return None
         path = self._meta_path(project_id)
         if not path.is_file():
             return None
-        return json.loads(path.read_text(encoding="utf-8"))
+        meta = json.loads(path.read_text(encoding="utf-8"))
+        if "structure_revision" not in meta:
+            meta["structure_revision"] = meta.pop("revision", 0)
+        return meta
 
     def _write_meta(self, meta: dict[str, Any]) -> None:
         pid = meta["id"]
@@ -232,11 +244,11 @@ class ProjectService:
             json.dumps(meta, indent=2, ensure_ascii=False) + "\n",
         )
 
-    def revision(self, project_id: str) -> int | None:
+    def structure_revision(self, project_id: str) -> int | None:
         meta = self._read_meta(project_id)
         if meta is None:
             return None
-        return int(meta.get("revision", 0))
+        return int(meta.get("structure_revision", 0))
 
     def list_projects(
         self,
@@ -293,7 +305,7 @@ class ProjectService:
             "id": project_id,
             "name": name,
             "created_at": _now(),
-            "revision": 0,
+            "structure_revision": 0,
             "owner_id": owner_id,
             "slug": self._alloc_slug(name),
             "published_release_id": None,
@@ -361,8 +373,11 @@ class ProjectService:
             return None
         return dest.read_text(encoding="utf-8")
 
-    def _build_snapshot_unlocked(self, project_id: str, meta: dict[str, Any]) -> dict[str, Any]:
-        """Build manifest; caller holds _mut."""
+    def _build_snapshot_unlocked(
+        self, project_id: str, meta: dict[str, Any], *, include_asset_data: bool = False,
+    ) -> dict[str, Any]:
+        """Materialize topology + current CRDT text + assets under one mutation lock."""
+        texts, yjs_state = self.collaborative_state(project_id)
         ws = self._workspace(project_id)
         files: list[dict[str, str]] = []
         directories: list[str] = []
@@ -385,7 +400,7 @@ class ProjectService:
                     arev = (
                         int(arow["revision"])
                         if isinstance(arow, dict) and "revision" in arow
-                        else int(meta.get("revision", 0))
+                        else int(meta.get("structure_revision", 0))
                     )
                     assets.append(
                         {
@@ -395,9 +410,13 @@ class ProjectService:
                             "revision": arev,
                         }
                     )
+                    if include_asset_data:
+                        assets[-1]["data"] = raw
                     hash_parts.append(f"a:{rel}:{digest}")
                     continue
-                content = path.read_text(encoding="utf-8")
+                content = texts.get(rel) if is_collaborative_text_rel(rel) else None
+                if content is None:
+                    content = path.read_text(encoding="utf-8")
                 digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
                 files.append({"path": rel, "content": content})
                 hash_parts.append(f"f:{rel}:{digest}")
@@ -405,55 +424,35 @@ class ProjectService:
         return {
             "project_id": project_id,
             "name": meta["name"],
-            "revision": int(meta.get("revision", 0)),
+            "structure_revision": int(meta.get("structure_revision", 0)),
             "content_hash": content_hash,
+            "yjs_state": base64.b64encode(yjs_state or b"\x00\x00").decode("ascii"),
             "directories": directories,
             "files": files,
             "assets": assets,
         }
 
     def snapshot(self, project_id: str) -> dict[str, Any] | None:
-        """Consistent workspace view @ current revision (JSON manifest).
-
-        Holds mutation lock; retries if revision moves mid-build (B4).
-        ponytail: text inline; binaries as path/hash/size refs (GET separately). Ceiling:
-        large assets. Upgrade: opaque bundle transfer (post-MVP).
-        """
-        # ponytail: up to 3 rebuilds under lock if concurrent bump races the unlocked
-        # re-check — lock held for whole build so mismatch should be rare.
-        for _ in range(3):
-            with self._mut:
-                meta = self._read_meta(project_id)
-                if meta is None:
-                    return None
-                rev_before = int(meta.get("revision", 0))
-                snap = self._build_snapshot_unlocked(project_id, meta)
-                meta_after = self._read_meta(project_id)
-                if meta_after is None:
-                    return None
-                rev_after = int(meta_after.get("revision", 0))
-                if rev_after == rev_before and snap["revision"] == rev_before:
-                    return snap
-                # Rare: another thread wrote without lock — rebuild.
+        """Consistent materialized view; asset GETs must match its content hashes."""
         with self._mut:
             meta = self._read_meta(project_id)
-            if meta is None:
-                return None
-            return self._build_snapshot_unlocked(project_id, meta)
+            return self._build_snapshot_unlocked(project_id, meta) if meta else None
 
     def _resolve_rel(self, project_id: str, rel: str) -> Path:
         ws = self._workspace(project_id)
         if ".." in rel.split("/") or rel.startswith("/") or rel.startswith("\\"):
             raise FsRejected(f"path escapes workspace: {rel}")
+        if any(part in ("", ".", ".git", ".presentation", ".vscode", "node_modules") for part in rel.split("/")):
+            raise FsRejected(f"reserved workspace path: {rel}")
         dest = (ws / rel).resolve()
         if not _is_under(ws, dest) and dest != ws.resolve():
             raise FsRejected(f"path escapes workspace: {rel}")
         return dest
 
-    def _bump_revision(self, meta: dict[str, Any]) -> int:
-        meta["revision"] = int(meta.get("revision", 0)) + 1
+    def _bump_structure_revision(self, meta: dict[str, Any]) -> int:
+        meta["structure_revision"] = int(meta.get("structure_revision", 0)) + 1
         self._write_meta(meta)
-        return int(meta["revision"])
+        return int(meta["structure_revision"])
 
     def apply_fs_operation(
         self,
@@ -482,12 +481,17 @@ class ProjectService:
         meta = self._read_meta(project_id)
         if meta is None:
             raise FsRejected("project not found")
-        current = int(meta.get("revision", 0))
+        current = int(meta.get("structure_revision", 0))
+        if not isinstance(operation, dict):
+            raise FsRejected("operation must be an object")
+        receipt = meta.get("operation_receipts", {}).get(operation.get("id"))
+        if receipt is not None:
+            if receipt.get("request", receipt["operation"]) != operation:
+                raise FsRejected("operation id reused with different content")
+            return int(receipt["structure_revision"]), receipt["operation"]
         if base_revision is not None and int(base_revision) != current:
             raise FsRejected(f"stale base_revision {base_revision}, current {current}")
 
-        if not isinstance(operation, dict):
-            raise FsRejected("operation must be an object")
         kind = operation.get("kind")
         if kind not in _FS_KINDS:
             raise FsRejected(f"unsupported kind: {kind}")
@@ -511,6 +515,8 @@ class ProjectService:
             rel = operation.get("path")
             if not isinstance(rel, str) or not _SAFE_REL.match(rel):
                 raise FsRejected(f"invalid create path: {rel!r}")
+            if is_binary_rel(rel):
+                raise FsRejected("binary files must use the asset API")
             dest = self._resolve_rel(project_id, rel)
             if dest.exists():
                 raise FsRejected(f"already exists: {rel}")
@@ -529,28 +535,33 @@ class ProjectService:
             normalized["path"] = rel
             normalized["content"] = content
 
+        elif kind == "write":
+            rel = operation.get("path")
+            content = operation.get("content")
+            if (not isinstance(rel, str) or not _SAFE_REL.fullmatch(rel)
+                    or is_binary_rel(rel) or is_collaborative_text_rel(rel)
+                    or not isinstance(content, str)):
+                raise FsRejected("write requires an existing non-collaborative text file")
+            dest = self._resolve_rel(project_id, rel)
+            if not dest.is_file():
+                raise FsRejected(f"source missing: {rel}")
+            _atomic_write_text(dest, content)
+            normalized.update(path=rel, content=content)
+
         elif kind == "delete":
             rel = operation.get("path")
-            if not isinstance(rel, str):
-                raise FsRejected("delete path required")
-            if _SAFE_REL.match(rel):
-                dest = self._resolve_rel(project_id, rel)
-                if not dest.is_file():
-                    raise FsRejected(f"not a file: {rel}")
-                dest.unlink()
-                assets = self._asset_meta_map(meta)
-                assets.pop(rel, None)
-            elif _SAFE_DIR.match(rel):
-                dest = self._resolve_rel(project_id, rel)
-                if not dest.is_dir():
-                    raise FsRejected(f"not a directory: {rel}")
-                shutil.rmtree(dest)
-                assets = self._asset_meta_map(meta)
-                prefix = rel + "/"
-                for key in [k for k in assets if k == rel or str(k).startswith(prefix)]:
-                    assets.pop(key, None)
-            else:
+            if not isinstance(rel, str) or not _SAFE_REL.fullmatch(rel):
                 raise FsRejected(f"invalid delete path: {rel!r}")
+            dest = self._resolve_rel(project_id, rel)
+            if dest.is_file():
+                dest.unlink()
+            elif dest.is_dir():
+                shutil.rmtree(dest)
+            else:
+                raise FsRejected(f"source missing: {rel}")
+            assets = self._asset_meta_map(meta)
+            for key in [k for k in assets if k == rel or str(k).startswith(rel + "/")]:
+                assets.pop(key, None)
             normalized["path"] = rel
 
         elif kind in ("rename", "move"):
@@ -566,6 +577,8 @@ class ProjectService:
             dst = self._resolve_rel(project_id, dst_rel)
             if not src.exists():
                 raise FsRejected(f"source missing: {src_rel}")
+            if src.is_dir() and not _SAFE_DIR.fullmatch(dst_rel):
+                raise FsRejected("chapter directories must remain at workspace root")
             if dst.exists():
                 raise FsRejected(f"target exists: {dst_rel}")
             if dst.parent != ws_resolved and not dst.parent.exists():
@@ -587,7 +600,15 @@ class ProjectService:
         else:
             raise FsRejected(f"unsupported kind: {kind}")
 
-        rev = self._bump_revision(meta)
+        operation_id = operation.get("id")
+        if isinstance(operation_id, str):
+            normalized["id"] = operation_id
+            # ponytail: receipts retained for this single-node workspace's lifetime.
+            # Upgrade: acknowledged journal watermarks before compacting receipt history.
+            meta.setdefault("operation_receipts", {})[operation_id] = {
+                "operation": normalized, "request": operation, "structure_revision": current + 1,
+            }
+        rev = self._bump_structure_revision(meta)
         return rev, normalized
 
     def put_asset(
@@ -627,7 +648,7 @@ class ProjectService:
             return {
                 "path": rel,
                 "content_hash": str(row["content_hash"]),
-                "revision": int(row.get("revision", meta.get("revision", 0))),
+                "revision": int(row.get("revision", meta.get("structure_revision", 0))),
                 "size": int(row.get("size", 0)),
             }
         if dest.is_file():
@@ -635,7 +656,7 @@ class ProjectService:
             return {
                 "path": rel,
                 "content_hash": hashlib.sha256(payload).hexdigest(),
-                "revision": int(meta.get("revision", 0)),
+                "revision": int(meta.get("structure_revision", 0)),
                 "size": len(payload),
             }
         return None
@@ -670,6 +691,10 @@ class ProjectService:
             parent.mkdir(parents=False, exist_ok=True)
 
         existing = self._existing_asset_info(project_id, meta, rel, dest)
+        if existing is None and base_revision not in (None, 0) and not force:
+            raise AssetConflict(path=rel, content_hash="", revision=int(meta.get("structure_revision", 0)), size=0)
+        if dest.exists() and not dest.is_file():
+            raise FsRejected(f"asset path is not a file: {rel}")
         if existing is not None and not force:
             current_rev = int(existing["revision"])
             if base_revision is None or int(base_revision) != current_rev:
@@ -684,13 +709,13 @@ class ProjectService:
         _atomic_write_bytes(dest, payload)
         digest = hashlib.sha256(payload).hexdigest()
         assets = self._asset_meta_map(meta)
-        next_rev = int(meta.get("revision", 0)) + 1
+        next_rev = int(meta.get("structure_revision", 0)) + 1
         assets[rel] = {
             "content_hash": digest,
             "revision": next_rev,
             "size": len(payload),
         }
-        rev = self._bump_revision(meta)
+        rev = self._bump_structure_revision(meta)
         return rev, {
             "path": rel,
             "content_hash": digest,
@@ -713,7 +738,7 @@ class ProjectService:
         info = self._existing_asset_info(project_id, meta, rel, dest) or {
             "path": rel,
             "content_hash": hashlib.sha256(payload).hexdigest(),
-            "revision": int(meta.get("revision", 0)),
+            "revision": int(meta.get("structure_revision", 0)),
             "size": len(payload),
         }
         return payload, {
@@ -983,38 +1008,26 @@ class ProjectService:
             return {"project": pub, "already_member": already}
 
     def capture_workspace(self, project_id: str) -> dict[str, Any] | None:
-        """Copy collaborative workspace bytes under the mutation lock.
-
-        Text + binary from the server workspace dir only (not a client disk).
-        Caller may overlay the CRDT-bound slide before building a release.
-        """
+        """Use the snapshot builder, including frozen binary bodies, for Publish."""
         with self._mut:
             meta = self._read_meta(project_id)
-            if meta is None:
+            return self._build_snapshot_unlocked(
+                project_id, meta, include_asset_data=True,
+            ) if meta else None
+
+    def workspace_file(self, project_id: str, rel: str) -> bytes | None:
+        """Preview shares the state resolver and authoritative disk topology."""
+        with self._mut:
+            if not _SAFE_REL.fullmatch(rel) or self._read_meta(project_id) is None:
+                raise FsRejected(f"invalid workspace path: {rel!r}")
+            path = self._resolve_rel(project_id, rel)
+            if not path.is_file():
                 return None
-            ws = self._workspace(project_id)
-            files: list[dict[str, str]] = []
-            assets: list[dict[str, Any]] = []
-            if ws.is_dir():
-                for path in sorted(ws.rglob("*")):
-                    if not path.is_file():
-                        continue
-                    rel = path.relative_to(ws).as_posix()
-                    if not _SAFE_REL.match(rel):
-                        continue
-                    if is_binary_rel(rel):
-                        assets.append({"path": rel, "data": path.read_bytes()})
-                    else:
-                        files.append({"path": rel, "content": path.read_text(encoding="utf-8")})
-            slug = meta.get("slug")
-            return {
-                "revision": int(meta.get("revision", 0)),
-                "name": meta["name"],
-                "slug": slug if isinstance(slug, str) else "",
-                "files": files,
-                "assets": assets,
-                "slide_path": self.collaborative_slide_path(project_id),
-            }
+            if is_collaborative_text_rel(rel):
+                texts, _state = self.collaborative_state(project_id)
+                if rel in texts:
+                    return texts[rel].encode("utf-8")
+            return path.read_bytes()
 
     def release_staging_paths(self, project_id: str, release_id: str) -> tuple[Path, Path]:
         """Return (final_dir, staging_dir). Caller writes staging then renames."""
@@ -1122,7 +1135,7 @@ class ProjectService:
             "id": rid,
             "project_id": meta["id"],
             "created_at": record.get("created_at"),
-            "revision": record.get("revision", 0),
+            "structure_revision": record.get("structure_revision", record.get("revision", 0)),
             "content_hash": record.get("content_hash"),
             "slug": slug,
             "current": meta.get("published_release_id") == rid,
@@ -1136,7 +1149,7 @@ class ProjectService:
             "id": meta["id"],
             "name": meta["name"],
             "created_at": meta["created_at"],
-            "revision": meta.get("revision", 0),
+            "structure_revision": meta.get("structure_revision", 0),
         }
         owner_id = meta.get("owner_id")
         if isinstance(owner_id, str):
