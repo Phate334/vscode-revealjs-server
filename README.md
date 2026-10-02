@@ -28,20 +28,22 @@ Image: `ghcr.io/phate334/vscode-revealjs-server:<version>` (also `:latest`). The
 2. Install it:
 
 ```bash
-code --install-extension path/to/vscode-revealjs-collaboration-0.1.1.vsix
+code --install-extension path/to/vscode-revealjs-collaboration-0.1.2rc1.vsix
 ```
 
 Or in VS Code: **Extensions → … → Install from VSIX…**
 
 ## Use in VS Code
 
-1. **Presentation: Sign In** — against your server (default demo accounts below).
-2. **Presentation: Create Project** or **Open Project** / **Open Shared Project** — links a local folder via `.presentation/workspace.json`.
-3. Edit bound text files (e.g. `slide.md`, chapter markdown, CSS/HTML/YAML/JSON). Changes sync through the server; Open Project warns before overwriting existing files.
-4. **Presentation: Open Preview** — static Reveal preview from the project site (no auth on preview URLs).
-5. **Presentation: Share Project** — invite token for editors/viewers.
-6. **Presentation: Members** — manage project members (owner).
-7. **Presentation: Publish** — immutable public release under a slug URL.
+1. Set **presentation.serverUrl** for your server (default `http://127.0.0.1:8000`).
+2. **Presentation: Create Presentation** or **Open Presentation**. Sign-in runs inline when needed. Open lists both your own and shared presentations.
+3. Select a parent directory and a new child-folder name. Existing folders are never overwritten.
+4. Edit local files. Text synchronizes through Yjs and is persisted locally even with Auto Save off. Disconnect keeps local editing and persistence active.
+5. **Presentation: Open Preview** opens a private, short-lived preview session. **Share Presentation** creates an invitation; accepting it opens that presentation directly.
+6. **Presentation: Publish** freezes a public, immutable release and copies its link.
+7. **Presentation: Resolve Conflict** handles preserved local/remote differences. **Synchronization Details** shows diagnostic information; **Retry Synchronization** retries queued work.
+
+Local filesystem changes from Git, shell commands and external editors are synchronized to the server. Reconciliation preserves pending intent and ignores `.git/`, `.presentation/`, `.vscode/` and `node_modules/`. Do not delete `.presentation/`: it contains durable text state and the offline journal.
 
 ## Demo accounts
 
@@ -58,18 +60,22 @@ Optional env on the server:
 | `AUTH_DEMO_USER` | Extra `username:password` |
 | `AUTH_ACCESS_TTL_SEC` / `AUTH_REFRESH_TTL_SEC` | Token lifetimes |
 
-## Public URLs
+## Presentation URLs
 
 | URL | Meaning |
 |-----|---------|
-| `/preview/{project_id}/` | Live collaborative preview (mutable) |
+| `/preview/{project_id}/` | Private mutable preview; requires a preview session |
 | `/releases/{release_id}/` | Immutable self-contained release |
 | `/presentations/{slug}/` | Alias to the project's current release |
 
 Publish is `POST /api/projects/{project_id}/publish` (creates a release). Each project vendors Reveal under `runtime/`; releases copy the full tree (no shared `/runtimes`, no `blobs/`).
 
-API and collaboration WebSocket require a signed-in access token (`Authorization: Bearer …`; WS also accepts `?access_token=`). Preview and published release pages stay public.
+API and collaboration WebSocket require a signed-in access token (`Authorization: Bearer …`; WS also accepts `?access_token=`). `POST /api/projects/{id}/preview-session` issues a ten-minute preview URL; its scoped cookie protects HTML and all assets. Published release pages remain public.
 
 ## Releases
 
-Each git tag `vX.Y.Z` (must match `pyproject.toml`) publishes the VSIX on GitHub Releases and a multi-arch image to GHCR. See `AGENTS.md` for the release checklist.
+Canonical version is `pyproject.toml`. Release tags must match it exactly (including `rcN`). RC builds use a derived numeric VS Code manifest version with `--pre-release`, are marked prerelease on GitHub, and do not update the stable `latest` image tag.
+
+**0.1.2rc1 is unverified.** All compilation, testing, packaging and acceptance steps were skipped at the user's request. This branch does not publish a release. Existing 0.1.1 clients must be upgraded together with the server because synchronization now uses protocol v2.
+
+See [workspace architecture and recovery behavior](docs/workspace-architecture.md) and `AGENTS.md`.

@@ -54,7 +54,7 @@ def decode_jwt(token: str, *, secret: str | None = None) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError("payload must be object")
     exp = payload.get("exp")
-    if exp is not None and int(exp) < int(time.time()):
+    if exp is not None and int(exp) <= int(time.time()):
         raise ValueError("token expired")
     return payload
 

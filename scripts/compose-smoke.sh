@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Live smoke against compose-published port (AGENTS: no host uvicorn for live checks).
-# Covers: health, auth, JWT-gated projects/snapshot/assets/members, preview (open),
+# Covers: health, auth, JWT-gated projects/snapshot/assets/members, private preview sessions,
 # project-local runtime, chapter-relative rewrite, collaboration WS token gate,
 # share invite/accept, publish self-contained release + presentation slug.
 # CRDT unsaved-edit visibility: real VS Code EDH only.
@@ -93,8 +93,15 @@ echo "GET snapshot with token"
 curl -sfS "${BASE}/api/projects/${PID}/snapshot" -H "$(auth_hdr)" >/dev/null || fail "snapshot"
 pass "snapshot with Bearer"
 
-echo "GET /preview/${PID}/ (open, no token)"
-PREV="$(curl -sfS "${BASE}/preview/${PID}/")" || fail "preview HTML"
+COOKIE_JAR="$(mktemp)"
+trap 'rm -f "$COOKIE_JAR"' EXIT
+CODE="$(curl -sS -o /dev/null -w '%{http_code}' "${BASE}/preview/${PID}/")"
+[[ "$CODE" == "401" ]] || fail "private preview must reject anonymous access"
+SESSION="$(curl -sfS -X POST "${BASE}/api/projects/${PID}/preview-session" -H "$(auth_hdr)")"
+PREVIEW_URL="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["url"])' <<<"$SESSION")"
+curl -sfS -L -c "$COOKIE_JAR" -b "$COOKIE_JAR" "${BASE}${PREVIEW_URL}" >/dev/null || fail "preview session bootstrap"
+echo "GET authorized private preview"
+PREV="$(curl -sfS -b "${COOKIE_JAR}" "${BASE}/preview/${PID}/")" || fail "preview HTML"
 echo "${PREV}" | grep -q 'reveal.js' || fail "preview missing reveal.js"
 echo "${PREV}" | grep -q 'data-markdown=' || fail "preview missing slides"
 echo "${PREV}" | grep -q 'runtime/reveal.js' || fail "preview missing project-local runtime urls"
@@ -104,10 +111,10 @@ fi
 if echo "${PREV}" | grep -q 'PRESENTATION_RUNTIME_CSS\|PRESENTATION_SLIDES\|PRESENTATION_RUNTIME_JS'; then
   fail "injection markers left unreplaced"
 fi
-pass "preview HTML static deck (open)"
+pass "preview HTML with scoped session"
 
 echo "GET /preview/${PID}/runtime/reveal.js"
-curl -sfS -o /dev/null "${BASE}/preview/${PID}/runtime/reveal.js" || fail "project runtime reveal.js"
+curl -sfS -o /dev/null -b "${COOKIE_JAR}" "${BASE}/preview/${PID}/runtime/reveal.js" || fail "project runtime reveal.js"
 pass "project-local runtime reveal.js"
 
 CODE="$(curl -sS -o /dev/null -w '%{http_code}' "${BASE}/runtimes/reveal-v1/reveal.js" || true)"
@@ -152,7 +159,7 @@ echo "${PNG_B64}" | base64 -d | curl -sfS -X PUT \
 pass "asset force overwrite"
 
 echo "GET preview asset /preview/${PID}/${ASSET_PATH}"
-curl -sfS -o /tmp/smoke-hero.png "${BASE}/preview/${PID}/${ASSET_PATH}" || fail "preview asset"
+curl -sfS -o /tmp/smoke-hero.png -b "${COOKIE_JAR}" "${BASE}/preview/${PID}/${ASSET_PATH}" || fail "preview asset"
 python3 -c 'import pathlib; b=pathlib.Path("/tmp/smoke-hero.png").read_bytes(); assert b[:8]==b"\x89PNG\r\n\x1a\n", b[:16]' \
   || fail "preview asset not PNG"
 pass "preview binary asset"
@@ -173,7 +180,7 @@ MD
     --data-binary @- -H 'Content-Type: application/octet-stream' \
     -H "$(auth_hdr)" >/dev/null \
     || fail "put 02-extra asset"
-  MD_OUT="$(curl -sfS "${BASE}/preview/${PID}/02-extra/slide.md")" || fail "get 02-extra md"
+  MD_OUT="$(curl -sfS -b "${COOKIE_JAR}" "${BASE}/preview/${PID}/02-extra/slide.md")" || fail "get 02-extra md"
   echo "${MD_OUT}" | grep -q "/preview/${PID}/02-extra/hero.png" \
     || fail "chapter-relative rewrite missing: ${MD_OUT}"
   pass "chapter-relative asset rewrite"
@@ -219,8 +226,8 @@ async def main():
         await ws.send(json.dumps({
             "type": "hello",
             "client_id": "smoke-client",
-            "protocol_version": 1,
-            "last_known_revision": 0,
+            "protocol_version": 2,
+            "last_known_structure_revision": 0,
         }))
         ready = json.loads(await asyncio.wait_for(ws.recv(), timeout=5))
         assert ready.get("type") == "ready", ready
@@ -229,7 +236,7 @@ async def main():
             msg = await asyncio.wait_for(ws.recv(), timeout=1)
         except TimeoutError:
             msg = None
-        print("ready", ready.get("revision"))
+        print("ready", ready.get("structure_revision"))
 
 asyncio.run(main())
 PY
@@ -243,21 +250,21 @@ echo "${DEL}" | grep -q 'usr_alice' && fail "alice still present after delete"
 pass "delete member alice"
 
 echo "POST share (owner) + alice accept as viewer"
-SHARE="$(curl -sfS -X POST "${BASE}/api/projects/${PID}/shares" \
+SHARE="$(curl -sfS -X POST "${BASE}/api/projects/${PID}/invites" \
   -H 'Content-Type: application/json' -H "$(auth_hdr)" \
   -d '{"role":"viewer"}')" || fail "create share"
 TOKEN="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])' <<<"${SHARE}")"
 SHARE_ID="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' <<<"${SHARE}")"
 [[ -n "${TOKEN}" && -n "${SHARE_ID}" ]] || fail "share body: ${SHARE}"
-PREV_SHARE="$(curl -sfS "${BASE}/api/shares/${TOKEN}" -H "Authorization: Bearer ${ALICE_ACCESS}")" \
+PREV_SHARE="$(curl -sfS "${BASE}/api/invites/${TOKEN}" -H "Authorization: Bearer ${ALICE_ACCESS}")" \
   || fail "preview share"
 echo "${PREV_SHARE}" | grep -q "${PID}" || fail "preview share body: ${PREV_SHARE}"
-ACC="$(curl -sfS -X POST "${BASE}/api/shares/accept" \
+ACC="$(curl -sfS -X POST "${BASE}/api/invites/${TOKEN}/accept" \
   -H 'Content-Type: application/json' -H "Authorization: Bearer ${ALICE_ACCESS}" \
   -d "{\"token\":\"${TOKEN}\"}")" || fail "accept share"
 echo "${ACC}" | grep -q '"role":"viewer"' || fail "accept role: ${ACC}"
 echo "${ACC}" | grep -q '"already_member":false' || fail "expected new member: ${ACC}"
-OWN="$(curl -sfS -X POST "${BASE}/api/shares/accept" \
+OWN="$(curl -sfS -X POST "${BASE}/api/invites/${TOKEN}/accept" \
   -H 'Content-Type: application/json' -H "$(auth_hdr)" \
   -d "{\"token\":\"${TOKEN}\"}")" || fail "owner accept"
 echo "${OWN}" | grep -q '"already_member":true' || fail "owner already member: ${OWN}"
@@ -285,7 +292,7 @@ CODE="$(curl -sS -o /dev/null -w '%{http_code}' -X POST "${BASE}/api/projects/${
 [[ "${CODE}" == "403" ]] || fail "expected 403 viewer publish, got ${CODE}"
 CODE="$(curl -sS -o /dev/null -w '%{http_code}' -X POST "${BASE}/api/projects/${PID}/publish" || true)"
 [[ "${CODE}" == "401" ]] || fail "expected 401 publish no token, got ${CODE}"
-CODE="$(curl -sS -o /dev/null -w '%{http_code}' -X POST "${BASE}/api/projects/${PID}/shares" \
+CODE="$(curl -sS -o /dev/null -w '%{http_code}' -X POST "${BASE}/api/projects/${PID}/invites" \
   -H 'Content-Type: application/json' -H "Authorization: Bearer ${ALICE_ACCESS}" \
   -d '{"role":"editor"}' || true)"
 [[ "${CODE}" == "403" ]] || fail "expected 403 viewer share, got ${CODE}"
@@ -332,7 +339,7 @@ ws = Path("${DATA_PROJECTS}/${PID}/workspace")
 (ws / "01-introduction" / "slide.md").write_text("# DISK_ONLY_MARKER\n", encoding="utf-8")
 print("disk_slide_mutated")
 DISKPY
-# Live CRDT: patch index.html section list + create 03-delta/slide.md (path→Y.Text + fs.operation).
+# Live CRDT: patch index.html section list + create 03-delta/slide.md (path→Y.Text + HTTP workspace operations).
 uv run python - <<CRDTPY || fail "multi-doc CRDT delta"
 import asyncio, json
 import websockets
@@ -348,8 +355,8 @@ async def main() -> None:
         await ws.send(json.dumps({
             "type": "hello",
             "client_id": "smoke-multidoc",
-            "protocol_version": 1,
-            "last_known_revision": 0,
+            "protocol_version": 2,
+            "last_known_structure_revision": 0,
         }))
         ready = json.loads(await asyncio.wait_for(ws.recv(), timeout=5))
         assert ready.get("type") == "ready", ready
@@ -388,66 +395,32 @@ async def main() -> None:
         upd = doc.get_update(before)
         if upd and upd != b"\x00\x00":
             await ws.send(upd)
-        # Topology create so workspace disk has the file for capture
-        await ws.send(json.dumps({
-            "type": "fs.operation",
-            "operation_id": "smoke_delta_mkdir",
-            "base_revision": ready.get("revision", 0),
-            "operation": {"kind": "mkdir", "path": "03-delta"},
-        }))
-        ack = json.loads(await asyncio.wait_for(ws.recv(), timeout=5))
-        # may be fs ack or yjs binary from server — drain until ack
-        rev = ready.get("revision", 0)
-        for _ in range(8):
-            if isinstance(ack, dict) and ack.get("type") == "fs.operation_ack":
-                rev = ack["revision"]
+        # Ordered CRDT stream barrier before durable HTTP topology commands.
+        await ws.send(json.dumps({"type": "ping", "id": "smoke-barrier"}))
+        while True:
+            frame = await asyncio.wait_for(ws.recv(), timeout=5)
+            if isinstance(frame, str) and json.loads(frame).get("type") == "pong":
                 break
-            if isinstance(ack, dict) and ack.get("type") == "error":
-                # mkdir may already exist from a prior run — continue
-                if "already exists" in str(ack.get("message", "")):
-                    break
-                raise SystemExit(ack)
-            msg = await asyncio.wait_for(ws.recv(), timeout=5)
-            ack = json.loads(msg) if isinstance(msg, str) else msg
-        await ws.send(json.dumps({
-            "type": "fs.operation",
-            "operation_id": "smoke_delta_create",
-            "base_revision": rev,
-            "operation": {
-                "kind": "create",
-                "path": "03-delta/slide.md",
-                "content": DELTA_MD,
-            },
-        }))
-        for _ in range(8):
-            msg = await asyncio.wait_for(ws.recv(), timeout=5)
-            if isinstance(msg, str):
-                data = json.loads(msg)
-                if data.get("type") == "fs.operation_ack":
-                    break
-                if data.get("type") == "error" and "already exists" in str(data.get("message", "")):
-                    break
-                if data.get("type") == "error":
-                    raise SystemExit(data)
+        import urllib.request
+        request = urllib.request.Request(
+            "${BASE}/api/projects/${PID}/workspace/operations",
+            data=json.dumps({
+                "base_revision": ready["structure_revision"],
+                "operations": [
+                    {"id": "smoke_delta_mkdir", "kind": "mkdir", "path": "03-delta"},
+                    {"id": "smoke_delta_create", "kind": "create", "path": "03-delta/slide.md", "content": DELTA_MD},
+                ],
+            }).encode(),
+            headers={"Authorization": "Bearer ${ACCESS}", "Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request) as response:
+            result = json.load(response)
+        assert len(result["results"]) == 2, result
         print("multidoc_delta_ok", sorted(str(k) for k in docs.keys()))
 
 asyncio.run(main())
 CRDTPY
-# Also keep disk index.html in sync for capture baselines (CRDT already has chapter).
-sudo python3 - <<DISKPY || fail "disk index sync"
-from pathlib import Path
-ws = Path("${DATA_PROJECTS}/${PID}/workspace")
-index_path = ws / "index.html"
-cur = index_path.read_text(encoding="utf-8")
-if "03-delta/slide.md" not in cur:
-    needle = 'data-markdown="01-introduction/slide.md"'
-    start = cur.rfind("<section", 0, cur.find(needle))
-    end = cur.find("</section>", cur.find(needle)) + len("</section>")
-    assert start >= 0 and end > start
-    sec = cur[start:end].replace("01-introduction/slide.md", "03-delta/slide.md", 1)
-    index_path.write_text(cur[:end] + "\n" + sec + cur[end:], encoding="utf-8")
-print("disk_index_synced")
-DISKPY
 
 REL2_JSON="$(curl -sfS -X POST "${BASE}/api/projects/${PID}/publish" -H "$(auth_hdr)")" || fail "publish 2"
 REL2="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' <<<"${REL2_JSON}")"
@@ -485,12 +458,12 @@ CODE="$(curl -sS -o /dev/null -w '%{http_code}' --path-as-is \
 pass "immutable release + presentation slug pointer"
 
 echo "revoke share; accept fails"
-REV="$(curl -sfS -X DELETE "${BASE}/api/projects/${PID}/shares/${SHARE_ID}" -H "$(auth_hdr)")" \
+REV="$(curl -sfS -X DELETE "${BASE}/api/projects/${PID}/invites/${SHARE_ID}" -H "$(auth_hdr)")" \
   || fail "revoke share"
 if echo "${REV}" | grep -q "${SHARE_ID}"; then
   fail "revoked share still listed: ${REV}"
 fi
-CODE="$(curl -sS -o /dev/null -w '%{http_code}' -X POST "${BASE}/api/shares/accept" \
+CODE="$(curl -sS -o /dev/null -w '%{http_code}' -X POST "${BASE}/api/invites/${TOKEN}/accept" \
   -H 'Content-Type: application/json' -H "Authorization: Bearer ${ALICE_ACCESS}" \
   -d "{\"token\":\"${TOKEN}\"}" || true)"
 [[ "${CODE}" == "404" ]] || fail "expected 404 revoked share, got ${CODE}"

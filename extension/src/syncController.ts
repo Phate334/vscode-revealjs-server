@@ -1,619 +1,382 @@
+import * as fs from "node:fs";
+import { randomUUID } from "node:crypto";
 import * as vscode from "vscode";
-import type {
-  AssetChangedEvent,
-  CollaborationClient,
-  FsOperation,
-  ReconcileRequiredEvent,
-} from "./collaborationClient";
-import { OriginTracker } from "./originTracker";
-import {
-  appendJournal,
-  clearJournal,
-  loadJournal,
-  type JournalEntry,
-} from "./offlineJournal";
-import {
-  AssetConflictError,
-  getAsset,
-  isBinaryPath,
-  putAsset,
-  type WorkspaceMeta,
-} from "./projectClient";
-import {
-  BULK_EVENT_THRESHOLD,
-  BULK_WINDOW_MS,
-  pullAndApplySnapshot,
-} from "./reconciliation";
+import { CollaborationClient, type FsOperation } from "./collaborationClient";
+import type { DocumentsBinding } from "./documentBinding";
+import { OfflineJournal, type JournalEntry } from "./offlineJournal";
+import { atomicWrite, hash, ignoredPath, localPath, readJson } from "./localState";
+import { AssetConflictError, fetchSnapshot, getAsset, putAsset, sendOperations, writeWorkspaceMeta, type WorkspaceMeta } from "./projectClient";
+import { applyRemoteSnapshot, descriptors, loadState, readEntry, same, saveState, scanLocal, signature, snapshotEntries, type Entry, type LocalState } from "./reconciliation";
+import { isCollaborativeTextPath } from "./textPaths";
 
-const IGNORE_PREFIXES = [".presentation/", ".git/", "node_modules/", ".vscode/"];
-
-const BINARY_GLOB = "**/*.{png,jpg,jpeg,gif,webp,svg,mp4,webm,pdf,woff,woff2}";
-
-function shouldIgnore(rel: string): boolean {
-  const n = rel.replace(/\\/g, "/");
-  return IGNORE_PREFIXES.some((p) => n === p.slice(0, -1) || n.startsWith(p));
+function affected(operation: FsOperation): string[] {
+  return [operation.path, operation.from, operation.to].filter((p): p is string => !!p);
+}
+function projectOperation(entries: Record<string, Entry>, op: FsOperation): void {
+  if (op.kind === "mkdir" && op.path) entries[op.path] = { kind: "directory" };
+  if ((op.kind === "create" || op.kind === "write") && op.path) entries[op.path] = { kind: "text", hash: hash(op.content ?? "") };
+  if (op.kind === "delete" && op.path) {
+    for (const key of Object.keys(entries)) if (key === op.path || key.startsWith(op.path + "/")) delete entries[key];
+  }
+  if ((op.kind === "rename" || op.kind === "move") && op.from && op.to) {
+    for (const key of Object.keys(entries)) if (key === op.from || key.startsWith(op.from + "/")) {
+      entries[op.to + key.slice(op.from.length)] = entries[key]; delete entries[key];
+    }
+  }
 }
 
-function relPath(folder: vscode.Uri, uri: vscode.Uri): string | undefined {
-  const root = folder.fsPath.replace(/[/\\]+$/, "");
-  const full = uri.fsPath;
-  if (!full.startsWith(root)) return undefined;
-  const rel = full.slice(root.length).replace(/^[/\\]+/, "").replace(/\\/g, "/");
-  return rel || undefined;
-}
-
-/**
- * Sync Controller (M1): local FS topology → fs.operation; binary → Asset PUT;
- * remote fs.operation / asset.changed → apply with origin mark (echo suppress);
- * revision gap / bulk local change → snapshot reconcile (FS_RECONCILE, not UndoManager).
- *
- * B1: serialize local sends + ordered remote applies (skip stale rev).
- * B2: durable offline journal; flush on reconnect.
- * B5: external single create/delete sync (not only ≥8 bulk).
- *
- * H2: startRemoteHandlers before connect; startLocalWatchers after ready + document bind.
- */
+/** Local scans push durable intent; remote scans project only safely managed paths. */
 export class SyncController {
-  private readonly origin = new OriginTracker();
-  /** Per-path asset revision for optimistic concurrency (#9). */
-  private readonly assetRevisions = new Map<string, number>();
-  /** Paths suppressed while / shortly after remote apply (async FS event echo). */
-  private readonly suppressPaths = new Set<string>();
-  /** Paths recently handled by VS Code workspace FS events (dedupe external watcher). */
-  private readonly recentApiPaths = new Map<string, number>();
+  private readonly journal: OfflineJournal;
+  private readonly state: LocalState;
+  private readonly output = vscode.window.createOutputChannel("Presentation Sync");
   private readonly disposables: vscode.Disposable[] = [];
-  private workspaceRevision: number;
+  private readonly conflicts: Set<string>;
+  private readonly conflictPath: string;
+  private binding?: DocumentsBinding;
+  private queue: Promise<void> = Promise.resolve();
+  private timer?: ReturnType<typeof setTimeout>;
   private disposed = false;
-  /** Pause local→server emission during snapshot reconcile. */
-  private reconciling = false;
-  private reconcileQueued = false;
-  /** path → last event time for bulk detection (#5: ≥8 unique paths / window). */
-  private bulkPathTimes = new Map<string, number>();
-  private meta: WorkspaceMeta | undefined;
-  private localStarted = false;
+  private remoteQueued = false;
+  private online = false;
 
-  /** B1: one in-flight local send; FIFO queue. */
-  private sendChain: Promise<void> = Promise.resolve();
-  /** B1: ordered remote apply; skip rev <= lastAppliedRemoteRev. */
-  private remoteChain: Promise<void> = Promise.resolve();
-  private lastAppliedRemoteRev = 0;
-  private flushingJournal = false;
-
-  constructor(
-    private readonly client: CollaborationClient,
-    private readonly folder: vscode.Uri,
-    private readonly server: string,
-    private readonly projectId: string,
-    initialRevision: number,
-    meta?: WorkspaceMeta,
-  ) {
-    this.workspaceRevision = initialRevision;
-    this.lastAppliedRemoteRev = initialRevision;
-    this.meta = meta;
-  }
-
-  /** Register WS handlers before connect so reconcile_required is not missed. */
-  startRemoteHandlers(): void {
-    this.client.onFsOperation = (msg) => {
-      this.enqueueRemote(async () => {
-        if (this.reconciling) return;
-        if (msg.revision <= this.lastAppliedRemoteRev) return;
-        await this.applyRemote(msg.operation, msg.revision);
-      });
+  constructor(private readonly client: CollaborationClient, private readonly folder: vscode.Uri,
+    private readonly meta: WorkspaceMeta, private readonly status: (state: string) => void) {
+    const state = loadState(folder, meta);
+    if (!state) throw new Error("This workspace needs an initial snapshot before synchronization");
+    this.state = state;
+    this.journal = new OfflineJournal(folder);
+    this.conflictPath = localPath(folder, ".presentation/conflicts.json", true);
+    this.conflicts = new Set(readJson<string[]>(this.conflictPath, []));
+    client.onReady = () => { this.online = true; this.reconcileFromServer("connected"); };
+    client.onRemoteStructure = () => this.reconcileFromServer("remote change");
+    client.onStatus = (value) => {
+      this.online = value === "connected";
+      this.showStatus(value === "connected" ? "Syncing…" : value === "offline" ? "Offline · Local changes saved" : "Syncing…");
     };
-    this.client.onWorkspaceRevision = (rev) => {
-      this.workspaceRevision = Math.max(this.workspaceRevision, rev);
-      this.client.lastKnownRevision = this.workspaceRevision;
-    };
-    this.client.onAssetChanged = (msg) => {
-      this.enqueueRemote(async () => {
-        if (this.reconciling) return;
-        if (msg.revision <= this.lastAppliedRemoteRev) return;
-        await this.applyRemoteAsset(msg);
-      });
-    };
-    this.client.onReconcileRequired = (msg) => {
-      void this.onReconcileRequired(msg);
-    };
-    // B2: flush offline journal after ready/reconnect barrier.
-    const prevReady = this.client.onReady;
-    this.client.onReady = () => {
-      prevReady?.();
-      void this.flushOfflineJournal();
+    client.onError = (error) => this.report(error);
+    client.onReplacedText = (rel, content) => {
+      const rename = this.journal.entries.find((entry) => entry.operation?.from && entry.operation.to &&
+        (rel === entry.operation.to || rel.startsWith(entry.operation.to + "/")))?.operation;
+      const source = rename?.from && rename.to ? rename.from + rel.slice(rename.to.length) : rel;
+      if (this.state.remote[source]?.hash !== hash(content)) {
+        atomicWrite(localPath(this.folder, `.presentation/recovery/${hash(content)}/${rel}`, true), content);
+        this.markConflict(rel);
+      }
     };
   }
 
-  /** Local create/delete/rename/asset watchers — after ready barrier + document bind. */
-  startLocalWatchers(): void {
-    if (this.localStarted || this.disposed) return;
-    this.localStarted = true;
-    this.disposables.push(
-      vscode.workspace.onDidCreateFiles((e) => {
-        if (this.origin.isRemote() || this.reconciling) return;
-        for (const uri of e.files) {
-          this.markApiPath(uri);
-          void this.onLocalCreate(uri);
-        }
-      }),
-      vscode.workspace.onDidDeleteFiles((e) => {
-        if (this.origin.isRemote() || this.reconciling) return;
-        for (const uri of e.files) {
-          this.markApiPath(uri);
-          void this.onLocalDelete(uri);
-        }
-      }),
-      vscode.workspace.onDidRenameFiles((e) => {
-        if (this.origin.isRemote() || this.reconciling) return;
-        for (const f of e.files) {
-          this.markApiPath(f.oldUri);
-          this.markApiPath(f.newUri);
-          void this.onLocalRename(f.oldUri, f.newUri);
-        }
-      }),
-    );
+  private showStatus(value = "Synced"): void {
+    this.status(this.conflicts.size ? "Conflict" : this.journal.entries.length ? (this.online ? "Syncing…" : "Offline · Local changes saved") : value);
+  }
+  markConflict = (rel: string): void => {
+    if (!this.conflicts.has(rel)) {
+      this.output.appendLine(`Preserved local changes for ${rel}. Resolve the conflict before retrying synchronization.`);
+      this.conflicts.add(rel);
+      atomicWrite(this.conflictPath, JSON.stringify([...this.conflicts]));
+    }
+    this.showStatus();
+  };
+  private clearConflict(rel: string): void {
+    this.conflicts.delete(rel);
+    atomicWrite(this.conflictPath, JSON.stringify([...this.conflicts]));
+  }
+  private report(error: unknown): void {
+    this.output.appendLine(String(error));
+    this.showStatus(this.online ? "Sync interrupted" : "Offline · Local changes saved");
+  }
+  private enqueue(action: () => Promise<void>): Promise<void> {
+    this.queue = this.queue.then(async () => { if (!this.disposed) await action(); }).catch((error) => this.report(error));
+    return this.queue;
+  }
 
-    const watcher = vscode.workspace.createFileSystemWatcher(
-      new vscode.RelativePattern(this.folder, BINARY_GLOB),
-    );
-    this.disposables.push(
-      watcher,
-      watcher.onDidChange((uri) => {
-        if (this.origin.isRemote() || this.reconciling) return;
-        void this.onLocalAssetWrite(uri);
-      }),
-    );
-
-    // External FS (shell/git): VS Code onDidCreateFiles does not fire — watch create/delete.
-    // B5: single create/delete sync; bulk (≥8 unique paths / 1s) still → FS_RECONCILE.
-    const topo = vscode.workspace.createFileSystemWatcher(
-      new vscode.RelativePattern(this.folder, "**/*"),
-    );
-    const onExternalCreate = (uri: vscode.Uri) => {
-      if (this.origin.isRemote() || this.reconciling) return;
-      const rel = relPath(this.folder, uri);
-      if (!rel || shouldIgnore(rel) || this.suppressPaths.has(rel)) return;
-      if (this.wasApiPath(rel)) return;
-      this.noteLocalTopologyEvent(rel);
-      if (this.reconciling) return;
-      void this.onLocalCreate(uri);
+  async start(binding: DocumentsBinding): Promise<void> {
+    this.binding = binding;
+    // Capture changes made while VS Code was closed before the first remote Yjs merge.
+    await this.captureLocal(true);
+    await binding.refresh();
+    const watcher = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(this.folder, "**/*"));
+    const schedule = (uri: vscode.Uri) => {
+      const root = this.folder.fsPath.replace(/[/\\]+$/, "") + "/";
+      const filename = uri.fsPath.replace(/\\/g, "/");
+      if (!filename.startsWith(root) || ignoredPath(filename.slice(root.length))) return;
+      if (this.timer) clearTimeout(this.timer);
+      // Git/Shell/AI event bursts always rescan Local → Server; never pull a destructive snapshot.
+      this.timer = setTimeout(() => { this.timer = undefined; void this.reconcileFromLocal("filesystem change"); }, 300);
     };
-    const onExternalDelete = (uri: vscode.Uri) => {
-      if (this.origin.isRemote() || this.reconciling) return;
-      const rel = relPath(this.folder, uri);
-      if (!rel || shouldIgnore(rel) || this.suppressPaths.has(rel)) return;
-      if (this.wasApiPath(rel)) return;
-      this.noteLocalTopologyEvent(rel);
-      if (this.reconciling) return;
-      void this.onLocalDelete(uri);
-    };
-    this.disposables.push(
-      topo,
-      topo.onDidCreate(onExternalCreate),
-      topo.onDidDelete(onExternalDelete),
-    );
+    this.disposables.push(watcher, watcher.onDidChange(schedule), watcher.onDidCreate(schedule), watcher.onDidDelete(schedule));
+    this.disposables.push(vscode.workspace.onDidRenameFiles((event) => {
+      void this.enqueue(async () => {
+        for (const file of event.files) {
+          const root = this.folder.fsPath.replace(/[/\\]+$/, "") + "/";
+          const fromPath = file.oldUri.fsPath.replace(/\\/g, "/");
+          const toPath = file.newUri.fsPath.replace(/\\/g, "/");
+          if (!fromPath.startsWith(root) || !toPath.startsWith(root)) continue;
+          const from = fromPath.slice(root.length), to = toPath.slice(root.length);
+          if (ignoredPath(from) || ignoredPath(to) || !this.state.disk[from] || this.state.disk[to]) continue;
+          const op: FsOperation = { id: randomUUID(), kind: "rename", from, to };
+          const predicted = this.predictedRemote();
+          this.journal.append([this.fsEntry(op, predicted)]);
+          projectOperation(this.state.disk, op);
+          saveState(this.folder, this.state);
+        }
+        await this.captureLocal();
+        await this.synchronize();
+      });
+    }));
+    this.showStatus("Offline · Local changes saved");
+  }
 
-    // Flush any journal left from previous session once connected.
-    if (this.client.getStatus() === "connected") {
-      void this.flushOfflineJournal();
+  private predictedRemote(): Record<string, Entry> {
+    const entries = { ...this.state.remote };
+    for (const entry of this.journal.entries) {
+      if (entry.operation) projectOperation(entries, entry.operation);
+      else if (entry.path && entry.data) entries[entry.path] = { kind: "asset", hash: hash(Buffer.from(entry.data, "base64")) };
+    }
+    return entries;
+  }
+  private fsEntry(operation: FsOperation, predicted: Record<string, Entry>): JournalEntry {
+    return { id: operation.id, kind: "fs", operation, baseRevision: this.state.structureRevision, queuedAt: Date.now(),
+      expected: Object.fromEntries(affected(operation).map((rel) => [rel, signature(predicted, rel)])) };
+  }
+
+  private async captureLocal(initial = false): Promise<void> {
+    const local = scanLocal(this.folder);
+    const predicted = this.predictedRemote();
+    const entries: JournalEntry[] = [];
+    const append = (op: FsOperation) => {
+      entries.push(this.fsEntry(op, predicted));
+      projectOperation(predicted, op);
+    };
+    const removed = Object.keys(this.state.disk).filter((rel) => !local[rel]);
+    for (const rel of removed.sort((a, b) => a.length - b.length)) {
+      if (removed.some((parent) => parent !== rel && rel.startsWith(parent + "/"))) continue;
+      if (predicted[rel]) append({ id: randomUUID(), kind: "delete", path: rel });
+    }
+    for (const [rel, entry] of Object.entries(local).sort(([a], [b]) => a.length - b.length)) {
+      const previous = this.state.disk[rel];
+      if (isCollaborativeTextPath(rel) && entry.kind === "text" && (initial || !same(previous, entry))) {
+        if (!(await this.binding?.ingestDisk(rel, entry.content ?? ""))) this.markConflict(rel);
+      }
+      if (same(previous, entry)) continue;
+      if (previous && previous.kind !== entry.kind) {
+        this.markConflict(rel); continue;
+      }
+      if (entry.kind === "directory") {
+        if (!predicted[rel]) append({ id: randomUUID(), kind: "mkdir", path: rel });
+      } else if (entry.kind === "asset") {
+        if (predicted[rel]?.hash === entry.hash) continue;
+        const id = randomUUID();
+        entries.push({ id, kind: "asset", path: rel, data: Buffer.from(entry.data!).toString("base64"),
+          baseRevision: this.state.structureRevision, assetRevision: predicted[rel]?.revision ?? 0,
+          expected: { [rel]: signature(predicted, rel) }, queuedAt: Date.now() });
+        predicted[rel] = { kind: "asset", hash: entry.hash };
+      } else if (!previous) {
+        if (predicted[rel]?.kind === "text" && predicted[rel]?.hash === entry.hash) continue;
+        append({ id: randomUUID(), kind: "create", path: rel, content: entry.content ?? "" });
+      } else if (!isCollaborativeTextPath(rel)) {
+        if (predicted[rel]?.hash === entry.hash) continue;
+        append({ id: randomUUID(), kind: "write", path: rel, content: entry.content ?? "" });
+      }
+    }
+    // Write-ahead: if the process stops here, intent exists before the baseline can move.
+    if (entries.length) this.journal.append(entries);
+    this.state.disk = descriptors(local);
+    saveState(this.folder, this.state);
+  }
+
+  reconcileFromLocal(reason: string): Promise<void> {
+    return this.enqueue(async () => {
+      this.output.appendLine(`Local scan: ${reason}`);
+      await this.captureLocal();
+      await this.synchronize();
+    });
+  }
+  reconcileFromServer(reason: string): void {
+    if (this.remoteQueued || this.disposed) return;
+    this.remoteQueued = true;
+    void this.enqueue(async () => {
+      this.remoteQueued = false;
+      this.output.appendLine(`Remote merge: ${reason}`);
+      await this.captureLocal();
+      await this.synchronize();
+    });
+  }
+
+  private async replay(): Promise<void> {
+    if (!this.online || !this.client.canWrite) return;
+    let rebases = 0;
+    const blocked = new Set<string>();
+    const blockedPaths = new Set<string>();
+    const block = (entry: JournalEntry) => {
+      blocked.add(entry.id);
+      for (const rel of entry.operation ? affected(entry.operation) : [entry.path ?? "legacy journal"]) {
+        blockedPaths.add(rel); this.markConflict(rel);
+      }
+    };
+    while (this.journal.entries.length && !this.disposed) {
+      const available = this.journal.entries.filter((entry) => !blocked.has(entry.id) &&
+        !(entry.operation ? affected(entry.operation) : [entry.path ?? ""]).some((rel) =>
+          [...blockedPaths].some((p) => p === rel || p.startsWith(rel + "/") || rel.startsWith(p + "/"))));
+      const first = available[0];
+      if (!first) return;
+      if (first.kind === "asset") {
+        if (!first.path || first.data === undefined) { block(first); continue; }
+        const data = Buffer.from(first.data, "base64");
+        try {
+          const result = await putAsset(this.meta.server, this.meta.projectId, first.path, data, this.client.clientId, first.assetRevision ?? 0);
+          this.state.remote[first.path] = { kind: "asset", hash: result.content_hash, revision: result.revision };
+          this.journal.acknowledge(new Set([first.id]));
+          this.clearConflict(first.path);
+          continue;
+        } catch (error) {
+          if (!(error instanceof AssetConflictError)) throw error;
+          if (error.contentHash === hash(data)) { this.journal.acknowledge(new Set([first.id])); continue; }
+          this.markConflict(first.path);
+          const choice = await vscode.window.showWarningMessage(`資源衝突：${first.path}。本機修改已保存。`, { modal: true }, "使用我的", "保留遠端");
+          if (choice === "使用我的") {
+            first.assetRevision = error.contentHash ? error.revision : 0; this.journal.save(); continue;
+          }
+          if (choice === "保留遠端") {
+            atomicWrite(localPath(this.folder, `.presentation/recovery/${first.id}/${first.path}`, true), data);
+            this.journal.acknowledge(new Set([first.id])); this.clearConflict(first.path); continue;
+          }
+          block(first); continue;
+        }
+      }
+      if (!first.operation || !first.expected || first.baseRevision < 0) {
+        block(first); continue;
+      }
+      const batch: JournalEntry[] = [];
+      for (const entry of available) {
+        if (entry.kind !== "fs" || !entry.operation || entry.baseRevision !== first.baseRevision || batch.length >= 200) break;
+        batch.push(entry);
+      }
+      const result = await sendOperations(this.meta.server, this.meta.projectId, first.baseRevision, batch.map((entry) => entry.operation!));
+      for (const receipt of result.results) {
+        projectOperation(this.state.remote, receipt.operation);
+      }
+      this.journal.acknowledge(new Set(result.results.map((receipt) => receipt.operation.id)));
+      if (!result.failed) { rebases = 0; continue; }
+      const pending = batch.find((entry) => !result.results.some((receipt) => receipt.operation.id === entry.id));
+      if (!pending) continue;
+      if (result.failed.message.includes("stale base_revision") && rebases++ < 3) {
+        const snap = await fetchSnapshot(this.meta.server, this.meta.projectId);
+        const remote = snapshotEntries(snap);
+        const safe = pending.expected && Object.entries(pending.expected).every(([rel, expected]) => signature(remote, rel) === expected);
+        if (safe) { pending.baseRevision = snap.structure_revision; this.journal.save(); continue; }
+      }
+      this.output.appendLine(result.failed.message);
+      block(pending);
     }
   }
 
+  private async synchronize(): Promise<void> {
+    if (!this.online) { this.showStatus("Offline · Local changes saved"); return; }
+    this.showStatus("Syncing…");
+    await this.client.flushText();
+    await this.replay();
+    const snap = await fetchSnapshot(this.meta.server, this.meta.projectId);
+    this.client.mergeRemote(Buffer.from(snap.yjs_state, "base64"));
+    const protectedPaths = this.journal.protectedPaths();
+    for (const rel of this.conflicts) protectedPaths.add(rel);
+    for (const rel of await applyRemoteSnapshot(this.folder, this.meta.server, snap, this.state, protectedPaths,
+      (rel) => this.client.documents.get(rel)?.toString())) this.markConflict(rel);
+    await this.binding?.refresh();
+    this.client.lastKnownStructureRevision = snap.structure_revision;
+    this.meta.lastKnownStructureRevision = snap.structure_revision;
+    await writeWorkspaceMeta(this.folder, this.meta);
+    this.showStatus();
+  }
+
+  hasConflict(rel: string): boolean {
+    return [...this.conflicts].some((p) => p === rel || rel.startsWith(p + "/"));
+  }
+
+  resolveConflict(): Promise<void> {
+    return this.enqueue(async () => {
+      const selected = await vscode.window.showQuickPick([...this.conflicts], { title: "Presentation: Resolve Conflict" });
+      if (!selected) return;
+      const roots = new Set([selected]);
+      const overlaps = (rel: string) => [...roots].some((p) => p === rel || p.startsWith(rel + "/") || rel.startsWith(p + "/"));
+      const related = this.journal.entries.filter((entry) =>
+        (entry.operation ? affected(entry.operation) : [entry.path ?? ""]).some(overlaps));
+      for (const entry of related) for (const rel of entry.operation ? affected(entry.operation) : [entry.path ?? selected]) roots.add(rel);
+      const choice = await vscode.window.showWarningMessage(
+        `Resolve ${[...roots].join(", ")}. A recovery copy will be retained.`, { modal: true }, "Keep Local", "Use Remote");
+      if (!choice) return;
+      const local = scanLocal(this.folder);
+      const buffers = new Map<string, { text: string; version: number }>();
+      for (const rel of Object.keys(local).filter(overlaps)) {
+        const doc = vscode.workspace.textDocuments.find((d) => d.uri.fsPath === localPath(this.folder, rel));
+        if (doc?.isDirty) buffers.set(rel, { text: doc.getText(), version: doc.version });
+      }
+      const recovery = randomUUID();
+      atomicWrite(localPath(this.folder, `.presentation/recovery/${recovery}/journal.json`, true), JSON.stringify(related));
+      for (const [rel, entry] of Object.entries(local).filter(([rel]) => overlaps(rel))) {
+        if (entry.kind !== "directory") atomicWrite(localPath(this.folder, `.presentation/recovery/${recovery}/${rel}`, true),
+          buffers.get(rel)?.text ?? entry.data ?? entry.content ?? "");
+      }
+      const snap = await fetchSnapshot(this.meta.server, this.meta.projectId);
+      const remote = snapshotEntries(snap);
+      const bodies = new Map<string, Uint8Array>();
+      if (choice === "Use Remote") {
+        for (const file of snap.files.filter((f) => overlaps(f.path))) bodies.set(file.path, Buffer.from(file.content));
+        for (const asset of snap.assets.filter((a) => overlaps(a.path))) {
+          bodies.set(asset.path, await getAsset(this.meta.server, this.meta.projectId, asset.path, asset.content_hash));
+        }
+      }
+      for (const rel of Object.keys(local).filter(overlaps)) {
+        const doc = vscode.workspace.textDocuments.find((d) => d.uri.fsPath === localPath(this.folder, rel));
+        if (!same(readEntry(this.folder, rel), local[rel]) || (buffers.has(rel) && doc?.version !== buffers.get(rel)!.version)) {
+          throw new Error("Local changes arrived while resolving the conflict; retry with the updated files");
+        }
+      }
+      this.client.mergeRemote(Buffer.from(snap.yjs_state, "base64"));
+      const protectedPaths = this.journal.protectedPaths();
+      for (const rel of [...this.conflicts, ...roots]) protectedPaths.add(rel);
+      for (const rel of await applyRemoteSnapshot(this.folder, this.meta.server, snap, this.state, protectedPaths,
+        (rel) => this.client.documents.get(rel)?.toString())) this.markConflict(rel);
+      this.journal.acknowledge(new Set(related.map((entry) => entry.id)));
+      const resolving = [...this.conflicts].filter(overlaps);
+      for (const rel of Object.keys(this.state.disk).filter(overlaps)) delete this.state.disk[rel];
+      for (const [rel, entry] of Object.entries(remote)) if (overlaps(rel)) this.state.disk[rel] = entry;
+      if (choice === "Use Remote") {
+        for (const rel of Object.keys(local).filter(overlaps).sort((a, b) => b.length - a.length)) {
+          if (remote[rel]?.kind === local[rel].kind) continue;
+          if (local[rel].kind === "directory") fs.rmdirSync(localPath(this.folder, rel));
+          else fs.unlinkSync(localPath(this.folder, rel));
+        }
+        for (const rel of snap.directories.filter(overlaps)) fs.mkdirSync(localPath(this.folder, rel), { recursive: true });
+        for (const [rel, data] of bodies) {
+          atomicWrite(localPath(this.folder, rel), data);
+          if (isCollaborativeTextPath(rel)) await this.binding?.acceptLocal(rel, Buffer.from(data).toString("utf8"));
+        }
+      } else {
+        for (const [rel, entry] of Object.entries(local)) {
+          if (overlaps(rel) && entry.kind === "text" && isCollaborativeTextPath(rel)) {
+            await this.binding?.acceptLocal(rel, buffers.get(rel)?.text ?? entry.content ?? "");
+          }
+        }
+      }
+      for (const rel of resolving) this.clearConflict(rel);
+      await this.binding?.refresh();
+      saveState(this.folder, this.state);
+      await this.captureLocal();
+      await this.synchronize();
+    });
+  }
+
+  async flush(): Promise<void> {
+    await this.reconcileFromLocal("user command");
+    if (!this.online || this.journal.entries.length || this.conflicts.size) throw new Error("Resolve pending synchronization before continuing");
+    await this.client.flushText();
+  }
+  showDetails(): void { this.output.show(); }
   dispose(): void {
     this.disposed = true;
-    for (const d of this.disposables) d.dispose();
-    this.disposables.length = 0;
-    if (this.client.onFsOperation) this.client.onFsOperation = undefined;
-    if (this.client.onWorkspaceRevision) this.client.onWorkspaceRevision = undefined;
-    if (this.client.onAssetChanged) this.client.onAssetChanged = undefined;
-    if (this.client.onReconcileRequired) this.client.onReconcileRequired = undefined;
-  }
-
-  /** Server or bulk-change triggered: pause → snapshot → resume. */
-  async runReconcile(reason: string): Promise<void> {
-    if (this.disposed) return;
-    if (this.reconciling) {
-      this.reconcileQueued = true;
-      return;
-    }
-    this.reconciling = true;
-    this.reconcileQueued = false;
-    try {
-      void vscode.window.setStatusBarMessage(`Collab: reconciling (${reason})…`, 5000);
-      const snap = await pullAndApplySnapshot(
-        this.folder,
-        this.server,
-        this.projectId,
-        this.origin,
-        this.suppressPaths,
-        this.meta,
-      );
-      this.workspaceRevision = snap.revision;
-      this.lastAppliedRemoteRev = snap.revision;
-      this.client.lastKnownRevision = snap.revision;
-      this.client.workspaceRevision = snap.revision;
-      this.assetRevisions.clear();
-      for (const a of snap.assets ?? []) {
-        if (typeof a.revision === "number") this.assetRevisions.set(a.path, a.revision);
-        else this.assetRevisions.set(a.path, snap.revision);
-      }
-      if (this.meta) {
-        this.meta = { ...this.meta, lastKnownRevision: snap.revision };
-      }
-      // Server state is authoritative — drop pending offline ops that would fight it.
-      await clearJournal(this.folder);
-      void vscode.window.showInformationMessage(
-        `Collab reconciled @ rev ${snap.revision} (${reason})`,
-      );
-    } catch (err) {
-      void vscode.window.showWarningMessage(`Collab reconcile failed: ${String(err)}`);
-    } finally {
-      this.reconciling = false;
-      if (this.reconcileQueued && !this.disposed) {
-        this.reconcileQueued = false;
-        void this.runReconcile("queued");
-      }
-    }
-  }
-
-  private onReconcileRequired(msg: ReconcileRequiredEvent): void {
-    void this.runReconcile(msg.reason || "reconcile_required");
-  }
-
-  /** Record a local topology event; trigger reconcile on bulk burst (#5). */
-  private noteLocalTopologyEvent(rel?: string): void {
-    // Offline: journal only — bulk snapshot reconcile would delete unsynced local ops (B2).
-    if (!this.clientIsOpen()) return;
-    const now = Date.now();
-    const key = rel && rel.length > 0 ? rel : `__anon_${now}_${this.bulkPathTimes.size}`;
-    this.bulkPathTimes.set(key, now);
-    for (const [p, t] of [...this.bulkPathTimes.entries()]) {
-      if (now - t > BULK_WINDOW_MS) this.bulkPathTimes.delete(p);
-    }
-    if (this.bulkPathTimes.size >= BULK_EVENT_THRESHOLD) {
-      this.bulkPathTimes.clear();
-      void this.runReconcile("bulk_local_change");
-    }
-  }
-
-  private markApiPath(uri: vscode.Uri): void {
-    const rel = relPath(this.folder, uri);
-    if (rel) this.recentApiPaths.set(rel, Date.now());
-  }
-
-  private wasApiPath(rel: string): boolean {
-    const t = this.recentApiPaths.get(rel);
-    if (t === undefined) return false;
-    if (Date.now() - t > 800) {
-      this.recentApiPaths.delete(rel);
-      return false;
-    }
-    return true;
-  }
-
-  private enqueueSend(fn: () => Promise<void>): void {
-    this.sendChain = this.sendChain.then(fn, fn);
-  }
-
-  private enqueueRemote(fn: () => Promise<void>): void {
-    this.remoteChain = this.remoteChain.then(fn, fn);
-  }
-
-  private async onLocalCreate(uri: vscode.Uri): Promise<void> {
-    const rel = relPath(this.folder, uri);
-    if (!rel || shouldIgnore(rel) || this.suppressPaths.has(rel)) return;
-    this.noteLocalTopologyEvent(rel);
-    if (this.reconciling) return;
-    this.enqueueSend(async () => {
-      if (this.disposed || this.reconciling) return;
-      try {
-        const stat = await vscode.workspace.fs.stat(uri);
-        if (stat.type & vscode.FileType.Directory) {
-          await this.sendOrJournal({ kind: "mkdir", path: rel });
-          return;
-        }
-        if (isBinaryPath(rel)) {
-          await this.uploadAssetOrJournal(uri, rel);
-          return;
-        }
-        const bytes = await vscode.workspace.fs.readFile(uri);
-        const content = Buffer.from(bytes).toString("utf8");
-        await this.sendOrJournal({ kind: "create", path: rel, content });
-      } catch (err) {
-        void vscode.window.showWarningMessage(`Collab fs create failed: ${String(err)}`);
-      }
-    });
-  }
-
-  private async onLocalAssetWrite(uri: vscode.Uri): Promise<void> {
-    const rel = relPath(this.folder, uri);
-    if (!rel || shouldIgnore(rel) || this.suppressPaths.has(rel)) return;
-    if (!isBinaryPath(rel)) return;
-    this.enqueueSend(async () => {
-      if (this.disposed || this.reconciling) return;
-      try {
-        await this.uploadAssetOrJournal(uri, rel);
-      } catch (err) {
-        void vscode.window.showWarningMessage(`Collab asset upload failed: ${String(err)}`);
-      }
-    });
-  }
-
-  private async uploadAssetOrJournal(uri: vscode.Uri, rel: string): Promise<void> {
-    if (this.disposed || this.reconciling) return;
-    if (!this.clientIsOpen()) {
-      await appendJournal(this.folder, {
-        kind: "asset",
-        path: rel,
-        queuedAt: Date.now(),
-      });
-      return;
-    }
-    await this.uploadAsset(uri, rel);
-  }
-
-  private async uploadAsset(uri: vscode.Uri, rel: string, force = false): Promise<void> {
-    if (this.disposed || this.reconciling) return;
-    const bytes = await vscode.workspace.fs.readFile(uri);
-    this.suppressPaths.add(rel);
-    try {
-      const baseRevision = this.assetRevisions.has(rel) ? this.assetRevisions.get(rel) : 0;
-      try {
-        const result = await putAsset(
-          this.server,
-          this.projectId,
-          rel,
-          bytes,
-          this.client.clientId,
-          force ? undefined : baseRevision,
-          force,
-        );
-        this.assetRevisions.set(rel, result.revision);
-        this.workspaceRevision = result.revision;
-        this.client.lastKnownRevision = result.revision;
-        this.lastAppliedRemoteRev = Math.max(this.lastAppliedRemoteRev, result.revision);
-      } catch (err) {
-        if (!(err instanceof AssetConflictError) || force) throw err;
-        const choice = await vscode.window.showWarningMessage(
-          `資源衝突：${rel}（遠端 revision ${err.revision}）`,
-          { modal: true },
-          "使用我的",
-          "保留遠端",
-        );
-        if (choice === "使用我的") {
-          this.assetRevisions.set(rel, err.revision);
-          await this.uploadAsset(uri, rel, true);
-        } else if (choice === "保留遠端") {
-          await this.applyRemoteAsset({
-            path: rel,
-            revision: err.revision,
-            content_hash: err.contentHash,
-            size: err.size,
-          });
-        }
-        // dismiss → leave local as-is; next upload will conflict again
-      }
-    } finally {
-      await new Promise((r) => setTimeout(r, 250));
-      this.suppressPaths.delete(rel);
-    }
-  }
-
-  private async onLocalDelete(uri: vscode.Uri): Promise<void> {
-    const rel = relPath(this.folder, uri);
-    if (!rel || shouldIgnore(rel) || this.suppressPaths.has(rel)) return;
-    this.noteLocalTopologyEvent(rel);
-    if (this.reconciling) return;
-    this.enqueueSend(async () => {
-      if (this.disposed || this.reconciling) return;
-      try {
-        await this.sendOrJournal({ kind: "delete", path: rel });
-      } catch (err) {
-        void vscode.window.showWarningMessage(`Collab fs delete failed: ${String(err)}`);
-      }
-    });
-  }
-
-  private async onLocalRename(oldUri: vscode.Uri, newUri: vscode.Uri): Promise<void> {
-    const from = relPath(this.folder, oldUri);
-    const to = relPath(this.folder, newUri);
-    if (!from || !to || shouldIgnore(from) || shouldIgnore(to)) return;
-    if (this.suppressPaths.has(from) || this.suppressPaths.has(to)) return;
-    this.noteLocalTopologyEvent(from);
-    this.noteLocalTopologyEvent(to);
-    if (this.reconciling) return;
-    const kind =
-      from.includes("/") !== to.includes("/") || from.split("/")[0] !== to.split("/")[0]
-        ? "move"
-        : "rename";
-    this.enqueueSend(async () => {
-      if (this.disposed || this.reconciling) return;
-      try {
-        await this.sendOrJournal({ kind, from, to });
-      } catch (err) {
-        void vscode.window.showWarningMessage(`Collab fs rename failed: ${String(err)}`);
-      }
-    });
-  }
-
-  private clientIsOpen(): boolean {
-    return this.client.getStatus() === "connected";
-  }
-
-  private async sendOrJournal(operation: FsOperation): Promise<void> {
-    if (this.disposed || this.reconciling) return;
-    if (!this.clientIsOpen()) {
-      await appendJournal(this.folder, {
-        kind: "fs",
-        operation,
-        queuedAt: Date.now(),
-      });
-      return;
-    }
-    await this.send(operation);
-  }
-
-  private async send(operation: FsOperation): Promise<void> {
-    if (this.disposed || this.reconciling) return;
-    try {
-      const ack = await this.client.sendFsOperation(operation, this.workspaceRevision);
-      this.workspaceRevision = ack.revision;
-      this.client.lastKnownRevision = ack.revision;
-      this.lastAppliedRemoteRev = Math.max(this.lastAppliedRemoteRev, ack.revision);
-    } catch (err) {
-      const msg = String(err);
-      if (msg.includes("not connected") || msg.includes("websocket closed")) {
-        await appendJournal(this.folder, {
-          kind: "fs",
-          operation,
-          queuedAt: Date.now(),
-        });
-        return;
-      }
-      if (msg.includes("stale base_revision")) {
-        void this.runReconcile("stale_base_revision");
-        return;
-      }
-      throw err;
-    }
-  }
-
-  /** B2: replay durable journal after reconnect (serialized). */
-  private async flushOfflineJournal(): Promise<void> {
-    if (this.disposed || this.flushingJournal || this.reconciling) return;
-    if (!this.clientIsOpen()) return;
-    this.flushingJournal = true;
-    try {
-      const entries = await loadJournal(this.folder);
-      if (entries.length === 0) return;
-      await clearJournal(this.folder);
-      for (const entry of entries) {
-        if (this.disposed) {
-          for (const rest of entries.slice(entries.indexOf(entry))) {
-            await appendJournal(this.folder, rest);
-          }
-          return;
-        }
-        // Reconcile (stale/gap) is server-authoritative and clears journal — stop flush.
-        if (this.reconciling) return;
-        await this.replayJournalEntry(entry);
-      }
-    } catch (err) {
-      void vscode.window.showWarningMessage(`Collab journal flush failed: ${String(err)}`);
-    } finally {
-      this.flushingJournal = false;
-    }
-  }
-
-  private async replayJournalEntry(entry: JournalEntry): Promise<void> {
-    if (entry.kind === "asset") {
-      const uri = vscode.Uri.joinPath(this.folder, entry.path);
-      try {
-        await this.uploadAsset(uri, entry.path);
-      } catch (err) {
-        // File may be gone after offline delete — drop.
-        if (!String(err).includes("EntryNotFound") && !String(err).includes("ENOENT")) {
-          await appendJournal(this.folder, entry);
-          throw err;
-        }
-      }
-      return;
-    }
-    try {
-      await this.send(entry.operation);
-    } catch (err) {
-      const msg = String(err);
-      if (msg.includes("already exists") || msg.includes("not a file") || msg.includes("missing")) {
-        // Topology already matches or race — skip.
-        return;
-      }
-      throw err;
-    }
-  }
-
-  private async applyRemoteAsset(msg: AssetChangedEvent): Promise<void> {
-    if (this.disposed || this.reconciling) return;
-    const rel = msg.path;
-    if (!rel || shouldIgnore(rel) || this.suppressPaths.has(rel)) return;
-    this.suppressPaths.add(rel);
-    try {
-      await this.origin.markRemote(async () => {
-        const bytes = await getAsset(this.server, this.projectId, rel);
-        const uri = vscode.Uri.joinPath(this.folder, rel);
-        await vscode.workspace.fs.createDirectory(vscode.Uri.joinPath(uri, ".."));
-        await vscode.workspace.fs.writeFile(uri, bytes);
-      });
-      this.assetRevisions.set(rel, msg.revision);
-      await new Promise((r) => setTimeout(r, 250));
-    } catch (err) {
-      void vscode.window.showWarningMessage(`資源下載失敗：${String(err)}`);
-    } finally {
-      this.suppressPaths.delete(rel);
-    }
-    this.workspaceRevision = msg.revision;
-    this.client.lastKnownRevision = msg.revision;
-    this.lastAppliedRemoteRev = Math.max(this.lastAppliedRemoteRev, msg.revision);
-  }
-
-  private async applyRemote(operation: FsOperation, revision: number): Promise<void> {
-    if (this.disposed || this.reconciling) return;
-    if (revision <= this.lastAppliedRemoteRev) return;
-    const paths: string[] = [];
-    if (operation.path) paths.push(operation.path);
-    if (operation.from) paths.push(operation.from);
-    if (operation.to) paths.push(operation.to);
-    for (const p of paths) this.suppressPaths.add(p);
-    try {
-      await this.origin.markRemote(async () => {
-        switch (operation.kind) {
-          case "mkdir": {
-            const path = operation.path;
-            if (!path) return;
-            await vscode.workspace.fs.createDirectory(vscode.Uri.joinPath(this.folder, path));
-            break;
-          }
-          case "create": {
-            const path = operation.path;
-            if (!path) return;
-            const uri = vscode.Uri.joinPath(this.folder, path);
-            await vscode.workspace.fs.createDirectory(vscode.Uri.joinPath(uri, ".."));
-            await vscode.workspace.fs.writeFile(
-              uri,
-              Buffer.from(operation.content ?? "", "utf8"),
-            );
-            break;
-          }
-          case "delete": {
-            const path = operation.path;
-            if (!path) return;
-            try {
-              await vscode.workspace.fs.delete(vscode.Uri.joinPath(this.folder, path), {
-                recursive: true,
-                useTrash: false,
-              });
-            } catch {
-              // already gone
-            }
-            break;
-          }
-          case "rename":
-          case "move": {
-            const from = operation.from;
-            const to = operation.to;
-            if (!from || !to) return;
-            const src = vscode.Uri.joinPath(this.folder, from);
-            const dst = vscode.Uri.joinPath(this.folder, to);
-            await vscode.workspace.fs.createDirectory(vscode.Uri.joinPath(dst, ".."));
-            await vscode.workspace.fs.rename(src, dst, { overwrite: false });
-            break;
-          }
-        }
-      });
-      await new Promise((r) => setTimeout(r, 250));
-    } finally {
-      for (const p of paths) this.suppressPaths.delete(p);
-    }
-    this.workspaceRevision = revision;
-    this.client.lastKnownRevision = revision;
-    this.lastAppliedRemoteRev = Math.max(this.lastAppliedRemoteRev, revision);
+    if (this.timer) clearTimeout(this.timer);
+    for (const disposable of this.disposables) disposable.dispose();
+    this.output.dispose();
   }
 }

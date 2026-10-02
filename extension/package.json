@@ -1,8 +1,8 @@
 {
   "name": "vscode-revealjs-collaboration",
-  "displayName": "RevealJS Collaboration (PoC)",
-  "description": "Collaborative Reveal.js presentations: CRDT slide sync + project snapshot",
-  "version": "0.1.1",
+  "displayName": "RevealJS Collaboration",
+  "description": "Collaborative presentations with durable local workspaces and private live preview",
+  "version": "0.1.2",
   "publisher": "phate334",
   "engines": {
     "vscode": "^1.139.0"
@@ -17,21 +17,21 @@
     "onCommand:presentation.openProject",
     "onCommand:presentation.openPreview",
     "onCommand:presentation.signIn",
-    "onCommand:presentation.openSharedProject",
     "onCommand:presentation.shareProject",
     "onCommand:presentation.projectMembers",
-    "onCommand:presentation.publish"
+    "onCommand:presentation.publish",
+    "onCommand:presentation.acceptInvitation"
   ],
   "main": "./out/extension.js",
   "contributes": {
     "commands": [
       {
         "command": "revealjsCollab.connect",
-        "title": "RevealJS Collab: Connect"
+        "title": "Presentation: Connect"
       },
       {
         "command": "revealjsCollab.disconnect",
-        "title": "RevealJS Collab: Disconnect"
+        "title": "Presentation: Disconnect"
       },
       {
         "command": "presentation.undo",
@@ -43,23 +43,19 @@
       },
       {
         "command": "presentation.createProject",
-        "title": "Presentation: Create Project"
+        "title": "Presentation: Create Presentation"
       },
       {
         "command": "presentation.openProject",
-        "title": "Presentation: Open Project"
+        "title": "Presentation: Open Presentation"
       },
       {
         "command": "presentation.signIn",
         "title": "Presentation: Sign In"
       },
       {
-        "command": "presentation.openSharedProject",
-        "title": "Presentation: Open Shared Project"
-      },
-      {
         "command": "presentation.shareProject",
-        "title": "Presentation: Share Project"
+        "title": "Presentation: Share Presentation"
       },
       {
         "command": "presentation.projectMembers",
@@ -72,6 +68,22 @@
       {
         "command": "presentation.openPreview",
         "title": "Presentation: Open Preview"
+      },
+      {
+        "command": "presentation.acceptInvitation",
+        "title": "Presentation: Accept Invitation"
+      },
+      {
+        "command": "presentation.syncDetails",
+        "title": "Presentation: Synchronization Details"
+      },
+      {
+        "command": "presentation.retrySync",
+        "title": "Presentation: Retry Synchronization"
+      },
+      {
+        "command": "presentation.resolveConflict",
+        "title": "Presentation: Resolve Conflict"
       }
     ],
     "keybindings": [
@@ -92,7 +104,17 @@
         "key": "ctrl+shift+z",
         "when": "presentation.collaborativeEditor && editorTextFocus"
       }
-    ]
+    ],
+    "configuration": {
+      "title": "Presentation",
+      "properties": {
+        "presentation.serverUrl": {
+          "type": "string",
+          "default": "http://127.0.0.1:8000",
+          "description": "Server origin for sign-in, creating and opening presentations. Existing workspaces retain their recorded origin."
+        }
+      }
+    }
   },
   "scripts": {
     "compile": "tsc -p .",

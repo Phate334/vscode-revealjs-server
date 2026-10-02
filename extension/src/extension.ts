@@ -1,406 +1,224 @@
+import * as fs from "node:fs";
 import * as vscode from "vscode";
+import { randomUUID } from "node:crypto";
 import { CollaborationClient } from "./collaborationClient";
-import { bindSlideDocument, type SlideBinding } from "./documentBinding";
+import { bindCollaborativeDocuments, type DocumentsBinding } from "./documentBinding";
 import { getAccessToken, initAuth, saveSession } from "./auth";
 import {
-  DEFAULT_SERVER,
-  collabWsUrl,
-  acceptShare,
-  createProject,
-  createShare,
-  extractSnapshot,
-  fetchSnapshot,
-  listMembers,
-  listProjects,
-  login,
-  publishRelease,
-  readWorkspaceMeta,
-  setAccessTokenGetter,
-  writeWorkspaceMeta,
-  type ProjectInfo,
+  collabWsUrl, configuredServer, normalizeServer, acceptShare, createProject, createShare,
+  extractSnapshot, fetchSnapshot, listMembers, listProjects, login, previewInvite,
+  publishRelease, readWorkspaceMeta, writeWorkspaceMeta, type ProjectInfo, type WorkspaceMeta,
 } from "./projectClient";
+import { atomicWrite, hash, localPath } from "./localState";
+import { initializeState, loadState, scanLocal, same, snapshotEntries } from "./reconciliation";
 import { openPreview } from "./preview";
 import { SyncController } from "./syncController";
+import { YjsPersistence } from "./yjsPersistence";
 
 let client: CollaborationClient | undefined;
-let binding: SlideBinding | undefined;
+let binding: DocumentsBinding | undefined;
 let sync: SyncController | undefined;
-let statusItem: vscode.StatusBarItem | undefined;
+let persistence: YjsPersistence | undefined;
+let statusItem: vscode.StatusBarItem;
+let connecting = false;
 
-function setStatus(s: string): void {
-  if (!statusItem) return;
-  statusItem.text = `$(radio-tower) Collab: ${s}`;
+function setStatus(status: string): void {
+  statusItem.text = `$(radio-tower) Presentation: ${status}`;
   statusItem.show();
 }
 
-/**
- * H2 init order:
- * 1. create client + SyncController remote handlers (catch reconcile_required)
- * 2. connect → ready/snapshot barrier
- * 3. bind documents (seed after barrier)
- * 4. start local FS watchers
- */
-async function connect(): Promise<void> {
-  if (client) {
-    void vscode.window.showInformationMessage("Collab already connected");
-    return;
-  }
-  if (!(await getAccessToken())) {
-    void vscode.window.showErrorMessage("Sign in first (Presentation: Sign In)");
-    return;
-  }
+async function signIn(server: string): Promise<boolean> {
+  const username = await vscode.window.showInputBox({ title: "Presentation: Sign In", prompt: `Username · ${server}`, ignoreFocusOut: true });
+  if (!username) return false;
+  const password = await vscode.window.showInputBox({ title: "Presentation: Sign In", prompt: "Password", password: true, ignoreFocusOut: true });
+  if (!password) return false;
+  const session = await login(server, username.trim(), password);
+  await saveSession(server, { access_token: session.access_token, refresh_token: session.refresh_token, username: session.user.username });
+  return true;
+}
+async function requireSession(server: string): Promise<boolean> {
+  return !!(await getAccessToken(server)) || await signIn(server);
+}
+
+async function connect(interactive = true): Promise<void> {
+  if (connecting) return;
   const meta = await readWorkspaceMeta();
-  if (!meta) {
-    void vscode.window.showErrorMessage(
-      "Collab: missing .presentation/workspace.json (Create or Open Project first)",
-    );
-    return;
-  }
   const folder = vscode.workspace.workspaceFolders?.[0]?.uri;
-  if (!folder) {
-    void vscode.window.showErrorMessage("Collab: no workspace folder open");
-    return;
+  if (!meta || !folder) throw new Error("Open a presentation workspace first");
+  if (client) {
+    if (interactive && !(await requireSession(meta.server))) return;
+    await client.connect(); return;
   }
-  const id = `vscode-${vscode.env.sessionId.slice(0, 8)}`;
-  const url = await collabWsUrl(meta.server, meta.projectId);
-  client = new CollaborationClient(id, url, meta.lastKnownRevision);
-  client.onStatus = setStatus;
-  sync = new SyncController(
-    client,
-    folder,
-    meta.server,
-    meta.projectId,
-    meta.lastKnownRevision,
-    meta,
-  );
-  sync.startRemoteHandlers();
+  connecting = true;
   try {
-    await client.connect();
-    binding = await bindSlideDocument(client);
-    sync.startLocalWatchers();
-    if (client.workspaceRevision !== meta.lastKnownRevision) {
-      await writeWorkspaceMeta(folder, {
-        ...meta,
-        lastKnownRevision: client.workspaceRevision,
-      });
+    if (interactive && !(await requireSession(meta.server))) return;
+    if (!loadState(folder, meta)) {
+      // Migration preserves every local file. Differing text is kept in recovery, not treated as server-wins.
+      const snap = await fetchSnapshot(meta.server, meta.projectId);
+      const local = scanLocal(folder);
+      const bases = Object.fromEntries(snap.files.map((file) => [file.path, file.content]));
+      for (const [rel, entry] of Object.entries(local)) {
+        if (entry.kind === "text" && hash(bases[rel] ?? "") !== entry.hash) {
+          atomicWrite(localPath(folder, `.presentation/recovery/migration/${rel}`, true), entry.content ?? "");
+        }
+      }
+      atomicWrite(localPath(folder, ".presentation/text-bases.json", true), JSON.stringify(bases));
+      // Seed CRDT identity from the server before applying differences in the local replica.
+      const yjsPath = localPath(folder, ".presentation/yjs-state.bin", true);
+      if (!fs.existsSync(yjsPath)) atomicWrite(yjsPath, Buffer.from(snap.yjs_state, "base64"));
+      initializeState(folder, meta, snap);
+      const remote = snapshotEntries(snap);
+      const conflicts = [...new Set([...Object.keys(local), ...Object.keys(remote)])]
+        .filter((rel) => !same(local[rel], remote[rel]));
+      atomicWrite(localPath(folder, ".presentation/conflicts.json", true), JSON.stringify(conflicts));
+      if (conflicts.length) void vscode.window.showWarningMessage("Existing local differences were preserved. Use Presentation: Resolve Conflict before synchronizing them.");
     }
-    void vscode.window.showInformationMessage(
-      `Collab connected as ${id} → ${meta.projectId}`,
-    );
-  } catch (err) {
-    sync?.dispose();
-    sync = undefined;
-    binding?.dispose();
-    binding = undefined;
-    client.disconnect();
-    client = undefined;
-    setStatus("offline");
-    void vscode.window.showErrorMessage(`Collab connect failed: ${String(err)}`);
-  }
+    client = new CollaborationClient(`vscode-${randomUUID()}`, () => collabWsUrl(meta.server, meta.projectId), meta.lastKnownStructureRevision);
+    persistence = new YjsPersistence(folder, client.doc);
+    sync = new SyncController(client, folder, meta, setStatus);
+    binding = await bindCollaborativeDocuments(client, folder, sync.markConflict, (rel) => sync?.hasConflict(rel) ?? true);
+    await sync.start(binding);
+    await client.connect();
+  } catch (error) {
+    dispose();
+    setStatus("Offline");
+    throw error;
+  } finally { connecting = false; }
 }
 
 function disconnect(): void {
-  sync?.dispose();
-  sync = undefined;
-  binding?.dispose();
-  binding = undefined;
+  // Keep document bindings and persistence active during an intentional offline period.
   client?.disconnect();
-  client = undefined;
-  setStatus("offline");
+  setStatus("Offline · Local changes saved");
+}
+function dispose(): void {
+  sync?.dispose(); sync = undefined;
+  binding?.dispose(); binding = undefined;
+  persistence?.dispose(); persistence = undefined;
+  client?.dispose(); client = undefined;
 }
 
-async function pickLocalFolder(openLabel: string): Promise<vscode.Uri | undefined> {
-  const current = vscode.workspace.workspaceFolders?.[0]?.uri;
-  const items: { label: string; description?: string; uri?: vscode.Uri; pick?: "dialog" }[] = [];
-  if (current) {
-    items.push({
-      label: "Use current folder",
-      description: current.fsPath,
-      uri: current,
-    });
-  }
-  items.push({ label: "Choose folder…", pick: "dialog" });
-  const chosen = await vscode.window.showQuickPick(items, {
-    title: openLabel,
-    placeHolder: "Where should local files go?",
-  });
-  if (!chosen) return undefined;
-  if (chosen.uri) return chosen.uri;
-  const picked = await vscode.window.showOpenDialog({
-    canSelectFiles: false,
-    canSelectFolders: true,
-    canSelectMany: false,
-    openLabel,
-  });
-  return picked?.[0];
+async function reserveFolder(name: string): Promise<vscode.Uri | undefined> {
+  const parents = await vscode.window.showOpenDialog({ canSelectFiles: false, canSelectFolders: true, canSelectMany: false, openLabel: "Select parent folder" });
+  if (!parents?.[0]) return undefined;
+  const suggested = name.trim().replace(/[^\p{L}\p{N}_.-]+/gu, "-").replace(/^[.-]+|[.-]+$/g, "") || "presentation";
+  const child = await vscode.window.showInputBox({ title: "Presentation folder", value: suggested,
+    prompt: "Create a new child folder inside the selected parent",
+    validateInput: (value) => /^[\p{L}\p{N}_-][\p{L}\p{N}_.-]*$/u.test(value) ? undefined : "Enter a folder name without path separators" });
+  if (!child) return undefined;
+  const folder = vscode.Uri.joinPath(parents[0], child);
+  // mkdir without recursive/exists-ok is the exclusive reservation; existing directories are never overwritten.
+  fs.mkdirSync(folder.fsPath);
+  return folder;
 }
 
-
-/** Refuse silent clobber: warn when snapshot paths already exist in the target folder. */
-async function confirmOpenTarget(
-  folder: vscode.Uri,
-  snap: { files: { path: string }[]; assets?: { path: string }[] },
-): Promise<boolean> {
-  const check = [
-    ...snap.files.map((f) => f.path),
-    ...(snap.assets ?? []).map((a) => a.path),
-    ".presentation/workspace.json",
-  ];
-  const conflicts: string[] = [];
-  for (const rel of check) {
-    try {
-      await vscode.workspace.fs.stat(vscode.Uri.joinPath(folder, rel));
-      conflicts.push(rel);
-    } catch {
-      // missing — ok
-    }
-  }
-  if (conflicts.length === 0) return true;
-  const sample = conflicts.slice(0, 5).join(", ");
-  const more = conflicts.length > 5 ? ` (+${conflicts.length - 5} more)` : "";
-  const pick = await vscode.window.showWarningMessage(
-    `Open Project: folder already has ${conflicts.length} file(s) that would be overwritten (${sample}${more}). Continue?`,
-    { modal: true },
-    "Overwrite",
-    "Cancel",
-  );
-  return pick === "Overwrite";
-}
-
-async function cmdCreateProject(): Promise<void> {
-  const name = await vscode.window.showInputBox({
-    title: "Presentation: Create Project",
-    prompt: "Project name",
-    validateInput: (v) => (v.trim() ? undefined : "Name required"),
-  });
-  if (!name) return;
-
-  const parentUri = await pickLocalFolder("Select parent folder");
-  if (!parentUri) return;
-  const parent = [parentUri];
-
-  if (!(await requireAccess())) return;
-  const server = DEFAULT_SERVER;
-  try {
-    const project = await createProject(server, name.trim());
-    const snap = await fetchSnapshot(server, project.id);
-    const folderName = name.trim().replace(/[^\w.\-]+/g, "-").replace(/^-+|-+$/g, "") || project.id;
-    const folder = vscode.Uri.joinPath(parent[0], folderName);
-    await vscode.workspace.fs.createDirectory(folder);
-    await extractSnapshot(folder, snap, server);
-    await writeWorkspaceMeta(folder, {
-      version: 1,
-      server,
-      projectId: project.id,
-      lastKnownRevision: snap.revision,
-    });
-    await vscode.commands.executeCommand("vscode.openFolder", folder, {
-      forceNewWindow: false,
-    });
-  } catch (err) {
-    void vscode.window.showErrorMessage(`Create Project failed: ${String(err)}`);
-  }
-}
-
-async function requireAccess(): Promise<boolean> {
-  if (await getAccessToken()) return true;
-  void vscode.window.showErrorMessage("Sign in first (Presentation: Sign In)");
-  return false;
-}
-
-async function cmdSignIn(): Promise<void> {
-  const username = await vscode.window.showInputBox({
-    title: "Presentation: Sign In",
-    prompt: "Username (demo users: demo / alice)",
-    ignoreFocusOut: true,
-  });
-  if (!username) return;
-  const password = await vscode.window.showInputBox({
-    title: "Presentation: Sign In",
-    prompt: "Password",
-    password: true,
-    ignoreFocusOut: true,
-  });
-  if (!password) return;
-  try {
-    const session = await login(DEFAULT_SERVER, username.trim(), password);
-    await saveSession({
-      access_token: session.access_token,
-      refresh_token: session.refresh_token,
-      username: session.user.username,
-    });
-    void vscode.window.showInformationMessage(`Signed in as ${session.user.username}`);
-    if (!client && (await readWorkspaceMeta())) await connect();
-  } catch (err) {
-    void vscode.window.showErrorMessage(`Sign In failed: ${String(err)}`);
-  }
-}
-
-async function openListedProject(title: string, scope: "owned" | "shared"): Promise<void> {
-  if (!(await requireAccess())) return;
-  const server = DEFAULT_SERVER;
-  let projects: ProjectInfo[];
-  try {
-    projects = await listProjects(server, scope);
-  } catch (err) {
-    void vscode.window.showErrorMessage(`List projects failed: ${String(err)}`);
-    return;
-  }
-  if (projects.length === 0) {
-    const hint = scope === "shared" ? "No shared projects — accept a share token first" : "No projects — Create Project first";
-    void vscode.window.showInformationMessage(hint);
-    return;
-  }
-  const picked = await vscode.window.showQuickPick(
-    projects.map((proj) => ({
-      label: proj.name,
-      description: proj.id,
-      detail: `rev ${proj.revision} · ${proj.created_at}`,
-      project: proj,
-    })),
-    { title },
-  );
-  if (!picked) return;
-  const folder = await pickLocalFolder("Select local folder for snapshot");
+async function downloadProject(server: string, project: ProjectInfo, folder?: vscode.Uri): Promise<void> {
+  folder ??= await reserveFolder(project.name);
   if (!folder) return;
-  try {
-    const snap = await fetchSnapshot(server, picked.project.id);
-    if (!(await confirmOpenTarget(folder, snap))) {
-      void vscode.window.showInformationMessage("Open Project cancelled — folder not modified");
-      return;
-    }
-    await extractSnapshot(folder, snap, server);
-    await writeWorkspaceMeta(folder, {
-      version: 1,
-      server,
-      projectId: picked.project.id,
-      lastKnownRevision: snap.revision,
-    });
-    await vscode.commands.executeCommand("vscode.openFolder", folder, {
-      forceNewWindow: false,
-    });
-  } catch (err) {
-    void vscode.window.showErrorMessage(`Open Project failed: ${String(err)}`);
-  }
+  const snap = await fetchSnapshot(server, project.id);
+  await extractSnapshot(folder, snap, server);
+  const meta: WorkspaceMeta = { version: 2, server, projectId: project.id, lastKnownStructureRevision: snap.structure_revision };
+  atomicWrite(localPath(folder, ".presentation/text-bases.json", true), JSON.stringify(Object.fromEntries(snap.files.map((f) => [f.path, f.content]))));
+  initializeState(folder, meta, snap);
+  // Metadata is written last: a failed download cannot auto-connect as a completed workspace.
+  await writeWorkspaceMeta(folder, meta);
+  await vscode.commands.executeCommand("vscode.openFolder", folder, { forceNewWindow: false });
 }
 
-async function cmdShareProject(): Promise<void> {
-  if (!(await requireAccess())) return;
+async function create(): Promise<void> {
+  const server = configuredServer();
+  if (!(await requireSession(server))) return;
+  const name = await vscode.window.showInputBox({ title: "Presentation: Create Presentation", prompt: "Presentation name", validateInput: (s) => s.trim() ? undefined : "Name required" });
+  if (!name) return;
+  const folder = await reserveFolder(name);
+  if (!folder) return;
+  await downloadProject(server, await createProject(server, name.trim()), folder);
+}
+
+async function open(): Promise<void> {
+  const server = configuredServer();
+  if (!(await requireSession(server))) return;
+  const projects = await listProjects(server);
+  type Pick = vscode.QuickPickItem & { project?: ProjectInfo; invite?: boolean };
+  const picks: Pick[] = [{ label: "Accept invitation…", invite: true }];
+  for (const [title, owned] of [["My Presentations", true], ["Shared with Me", false]] as const) {
+    picks.push({ label: title, kind: vscode.QuickPickItemKind.Separator });
+    picks.push(...projects.filter((project) => (project.role === "owner") === owned)
+      .map((project) => ({ label: project.name, description: project.role, project })));
+  }
+  const chosen = await vscode.window.showQuickPick(picks, { title: "Presentation: Open Presentation" });
+  if (chosen?.invite) await acceptInvitation(server);
+  else if (chosen?.project) await downloadProject(server, chosen.project);
+}
+
+async function acceptInvitation(server = configuredServer()): Promise<void> {
+  const input = await vscode.window.showInputBox({ title: "Presentation: Accept Invitation", prompt: "Paste invitation", ignoreFocusOut: true });
+  if (!input) return;
+  let token = input.trim();
+  if (token.startsWith("{")) {
+    const invite = JSON.parse(token) as { server: string; token: string };
+    server = normalizeServer(invite.server); token = invite.token;
+  }
+  if (!(await requireSession(server))) return;
+  const info = await previewInvite(server, token);
+  const choice = await vscode.window.showInformationMessage(`${info.project_name} · ${info.role}`, { modal: true }, "Accept and Open");
+  if (choice !== "Accept and Open") return;
+  const result = await acceptShare(server, token);
+  await downloadProject(server, result.project);
+}
+
+async function workspaceAction(action: (meta: WorkspaceMeta) => Promise<void>): Promise<void> {
   const meta = await readWorkspaceMeta();
-  if (!meta) {
-    void vscode.window.showErrorMessage("Share: open a presentation workspace first");
-    return;
-  }
-  const rolePick = await vscode.window.showQuickPick(
-    [
-      { label: "viewer", description: "Can open and preview" },
-      { label: "editor", description: "Can edit and publish" },
-    ],
-    { title: "Presentation: Share Project" },
-  );
-  if (!rolePick) return;
-  const role = rolePick.label === "editor" ? "editor" : "viewer";
-  try {
-    const invite = await createShare(meta.server, meta.projectId, role);
-    await vscode.env.clipboard.writeText(invite.token);
-    void vscode.window.showInformationMessage(
-      `Share token copied (${role}). Open Shared Project on the other window and paste it.`,
-    );
-  } catch (err) {
-    void vscode.window.showErrorMessage(`Share Project failed: ${String(err)}`);
-  }
-}
-
-async function cmdOpenShared(): Promise<void> {
-  // Join via token, then pick from shared list (same snapshot flow as Open).
-  if (!(await requireAccess())) return;
-  const token = await vscode.window.showInputBox({
-    title: "Presentation: Open Shared Project",
-    prompt: "Paste share token (empty to skip and pick an already-accepted project)",
-    ignoreFocusOut: true,
-  });
-  if (token === undefined) return;
-  if (token.trim()) {
-    try {
-      const joined = await acceptShare(DEFAULT_SERVER, token.trim());
-      void vscode.window.showInformationMessage(
-        joined.already_member
-          ? `Already a member of ${joined.project.name}`
-          : `Joined ${joined.project.name} as ${joined.project.role ?? "member"}`,
-      );
-    } catch (err) {
-      void vscode.window.showErrorMessage(`Accept share failed: ${String(err)}`);
-      return;
-    }
-  }
-  await openListedProject("Presentation: Open Shared Project", "shared");
-}
-
-async function cmdPublish(): Promise<void> {
-  if (!(await requireAccess())) return;
-  const meta = await readWorkspaceMeta();
-  if (!meta) {
-    void vscode.window.showErrorMessage("Publish: open a presentation workspace first");
-    return;
-  }
-  try {
-    const rel = await publishRelease(meta.server, meta.projectId);
-    const origin = meta.server.replace(/\/$/, "");
-    const msg = `Published ${rel.id}\n${origin}${rel.public_path}\n${origin}${rel.release_path}`;
-    await vscode.env.clipboard.writeText(`${origin}${rel.public_path}`);
-    void vscode.window.showInformationMessage(msg);
-  } catch (err) {
-    void vscode.window.showErrorMessage(`Publish failed: ${String(err)}`);
-  }
-}
-
-async function cmdMembers(): Promise<void> {
-  if (!(await requireAccess())) return;
-  const meta = await readWorkspaceMeta();
-  if (!meta) {
-    void vscode.window.showErrorMessage("Members: open a presentation workspace first");
-    return;
-  }
-  try {
-    const members = await listMembers(meta.server, meta.projectId);
-    await vscode.window.showQuickPick(
-      members.map((m) => ({ label: m.username, description: m.role, detail: m.user_id })),
-      { title: "Presentation: Project Members" },
-    );
-  } catch (err) {
-    void vscode.window.showErrorMessage(`Project Members failed: ${String(err)}`);
-  }
+  if (!meta) throw new Error("Open a presentation workspace first");
+  if (await requireSession(meta.server)) await action(meta);
 }
 
 export function activate(context: vscode.ExtensionContext): void {
   initAuth(context);
-  setAccessTokenGetter(getAccessToken);
   statusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
-  statusItem.text = "$(radio-tower) Collab: offline";
-  statusItem.command = "revealjsCollab.connect";
-  statusItem.show();
-
-  context.subscriptions.push(
-    statusItem,
-    vscode.commands.registerCommand("revealjsCollab.connect", () => connect()),
-    vscode.commands.registerCommand("revealjsCollab.disconnect", () => disconnect()),
-    vscode.commands.registerCommand("presentation.undo", () => binding?.undo()),
-    vscode.commands.registerCommand("presentation.redo", () => binding?.redo()),
-    vscode.commands.registerCommand("presentation.signIn", () => cmdSignIn()),
-    vscode.commands.registerCommand("presentation.createProject", () => cmdCreateProject()),
-    vscode.commands.registerCommand("presentation.openProject", () => openListedProject("Presentation: Open Project", "owned")),
-    vscode.commands.registerCommand("presentation.openSharedProject", () => cmdOpenShared()),
-    vscode.commands.registerCommand("presentation.shareProject", () => cmdShareProject()),
-    vscode.commands.registerCommand("presentation.projectMembers", () => cmdMembers()),
-    vscode.commands.registerCommand("presentation.publish", () => cmdPublish()),
-    vscode.commands.registerCommand("presentation.openPreview", () => openPreview()),
+  statusItem.command = "presentation.syncDetails";
+  setStatus("Offline");
+  const command = (name: string, action: () => unknown) => vscode.commands.registerCommand(name, async () => {
+    try { await action(); } catch (error) { void vscode.window.showErrorMessage(String(error)); }
+  });
+  context.subscriptions.push(statusItem,
+    command("revealjsCollab.connect", () => connect()),
+    command("revealjsCollab.disconnect", () => disconnect()),
+    command("presentation.undo", () => binding?.undo()), command("presentation.redo", () => binding?.redo()),
+    command("presentation.syncDetails", () => sync?.showDetails()),
+    command("presentation.retrySync", () => sync?.reconcileFromLocal("retry")),
+    command("presentation.resolveConflict", () => sync?.resolveConflict()),
+    command("presentation.signIn", async () => {
+      const meta = await readWorkspaceMeta();
+      if (await signIn(meta?.server ?? configuredServer())) { if (meta) await connect(false); }
+    }),
+    command("presentation.createProject", create), command("presentation.openProject", open),
+    command("presentation.acceptInvitation", () => acceptInvitation()),
+    command("presentation.shareProject", () => workspaceAction(async (meta) => {
+      const role = await vscode.window.showQuickPick(["viewer", "editor"], { title: "Presentation: Share Presentation" });
+      if (!role) return;
+      const invite = await createShare(meta.server, meta.projectId, role as "viewer" | "editor");
+      await vscode.env.clipboard.writeText(JSON.stringify({ server: meta.server, token: invite.token }));
+      void vscode.window.showInformationMessage("Invitation copied. Use Open Presentation → Accept invitation on the other computer.");
+    })),
+    command("presentation.projectMembers", () => workspaceAction(async (meta) => {
+      const members = await listMembers(meta.server, meta.projectId);
+      await vscode.window.showQuickPick(members.map((member) => ({ label: member.username, description: member.role })), { title: "Presentation: Members" });
+    })),
+    command("presentation.publish", () => workspaceAction(async (meta) => {
+      if (sync) await sync.flush();
+      const release = await publishRelease(meta.server, meta.projectId);
+      await vscode.env.clipboard.writeText(`${meta.server}${release.public_path}`);
+      void vscode.window.showInformationMessage(`Published. Link copied: ${meta.server}${release.public_path}`);
+    })),
+    command("presentation.openPreview", () => workspaceAction(async (meta) => {
+      if (sync) await sync.flush();
+      await openPreview(meta);
+    })),
   );
-
-  void readWorkspaceMeta().then(async (meta) => {
-    if (meta && (await getAccessToken())) void connect();
+  void readWorkspaceMeta().then((meta) => { if (meta) return connect(false); }).catch((error) => {
+    setStatus("Offline"); void vscode.window.showWarningMessage(`Local files preserved: ${String(error)}`);
   });
 }
 
-export function deactivate(): void {
-  disconnect();
-}
+export function deactivate(): void { dispose(); }

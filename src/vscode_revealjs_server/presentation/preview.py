@@ -11,9 +11,8 @@ import mimetypes
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 
-from vscode_revealjs_server.collaboration.manager import manager
 from vscode_revealjs_server.presentation.render import rewrite_chapter_relative_urls
-from vscode_revealjs_server.projects.service import FsRejected, is_binary_rel, project_service
+from vscode_revealjs_server.projects.service import FsRejected, project_service
 
 
 @dataclass(frozen=True)
@@ -56,36 +55,10 @@ def resolve_path(project_id: str, rel: str) -> PreviewBytes | None:
             )
         return text.encode("utf-8")
 
-    # Prefer live multi-doc CRDT for any collaborative text path.
-    crdt = manager.collaborative_text(project_id, rel)
-    if crdt is not None:
-        if rel.endswith(".md"):
-            return PreviewBytes(maybe_rewrite_md(crdt), "text/markdown; charset=utf-8")
-        return PreviewBytes(crdt.encode("utf-8"), _guess_media(rel))
-
-    if is_binary_rel(rel):
-        got = project_service.get_asset(project_id, rel)
-        if got is None:
-            return None
-        payload, _info = got
-        return PreviewBytes(payload, _guess_media(rel))
-
-    text = project_service.read_workspace_text(project_id, rel)
-    if text is None:
+    payload = project_service.workspace_file(project_id, rel)
+    if payload is None:
         return None
     if rel.endswith(".md"):
-        return PreviewBytes(maybe_rewrite_md(text), "text/markdown; charset=utf-8")
-    return PreviewBytes(text.encode("utf-8"), _guess_media(rel))
+        return PreviewBytes(maybe_rewrite_md(payload.decode("utf-8")), "text/markdown; charset=utf-8")
+    return PreviewBytes(payload, _guess_media(rel))
 
-
-def compose_index(project_id: str) -> PreviewBytes | None:
-    """Serve collaborative index.html as static Preview HTML (CRDT preferred)."""
-    if project_service.get(project_id) is None:
-        return None
-    crdt = manager.collaborative_text(project_id, "index.html")
-    if crdt is not None:
-        return PreviewBytes(crdt.encode("utf-8"), "text/html; charset=utf-8")
-    index_html = project_service.read_workspace_text(project_id, "index.html")
-    if index_html is None:
-        return None
-    return PreviewBytes(index_html.encode("utf-8"), "text/html; charset=utf-8")

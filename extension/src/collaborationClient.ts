@@ -2,410 +2,174 @@ import * as Y from "yjs";
 import { REMOTE_SYNC } from "./origins";
 
 export type CollabStatus = "offline" | "connecting" | "syncing" | "connected";
-
 export type FsOperation = {
-  kind: "create" | "delete" | "rename" | "move" | "mkdir";
+  id: string;
+  kind: "create" | "delete" | "rename" | "move" | "mkdir" | "write";
   path?: string;
   from?: string;
   to?: string;
   content?: string;
 };
-
-export type FsOperationEvent = {
-  operation_id: string;
-  revision: number;
-  operation: FsOperation;
+export type OperationResult = { operation: FsOperation; structure_revision: number };
+export type OperationsResult = {
+  structure_revision: number;
+  results: OperationResult[];
+  failed?: { index: number; message: string };
 };
 
-export type FsOperationAck = {
-  operation_id: string;
-  revision: number;
-};
-
-export type AssetChangedEvent = {
-  path: string;
-  revision: number;
-  content_hash: string;
-  size: number;
-};
-
-export type ReconcileRequiredEvent = {
-  revision: number;
-  reason: string;
-  last_known_revision?: number;
-};
-
-const PROTOCOL_VERSION = 1;
-// ponytail: exp backoff capped at 30s; upgrade to jittered shared retry policy if many clients stampede.
 const BACKOFF_MS = [1000, 2000, 4000, 8000, 16000, 30000];
-const FS_ACK_TIMEOUT_MS = 10_000;
 
-/**
- * Yjs client over the collaboration WebSocket.
- * Text JSON = hello/ready/ping/pong/fs ops/reconcile; binary = opaque Yjs updates.
- * Ready barrier: flush only after optional snapshot binary when ready.has_snapshot.
- */
+/** HTTP owns durable commands. This socket only carries CRDT updates and notifications. */
 export class CollaborationClient {
   readonly doc = new Y.Doc();
-  /** path → Y.Text collaborative documents (spec §8.1). */
-  readonly documents: Y.Map<Y.Text>;
-  private ws: WebSocket | undefined;
+  readonly documents = this.doc.getMap<Y.Text>("documents");
+  canWrite = false;
+  lastKnownStructureRevision: number;
+  structureRevision: number;
+  onStatus?: (status: CollabStatus) => void;
+  onReady?: () => void;
+  onRemoteStructure?: (revision: number) => void;
+  onError?: (error: unknown) => void;
+  onReplacedText?: (path: string, content: string) => void;
+  private ws?: WebSocket;
   private status: CollabStatus = "offline";
-  private unsubUpdate: (() => void) | undefined;
   private intentionalClose = false;
-  private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   private reconnectAttempt = 0;
-  /** True after ready (+ snapshot if has_snapshot) flushed for this handshake. */
-  private readyFlushed = false;
-  /** Expect one binary snapshot frame before flushReady (from ready.has_snapshot). */
+  private reconnectTimer?: ReturnType<typeof setTimeout>;
   private awaitingSnapshot = false;
-  private connectWaiters: {
-    resolve: () => void;
-    reject: (e: Error) => void;
-  }[] = [];
-  private fsAckWaiters = new Map<
-    string,
-    { resolve: (a: FsOperationAck) => void; reject: (e: Error) => void }
-  >();
-  private opSeq = 0;
-  /** Last workspace topology revision from ready / ack / broadcast. */
-  workspaceRevision = 0;
-
-  onStatus: ((s: CollabStatus) => void) | undefined;
-  onReady: (() => void) | undefined;
-  onFsOperation: ((msg: FsOperationEvent) => void) | undefined;
-  onWorkspaceRevision: ((revision: number) => void) | undefined;
-  onAssetChanged: ((msg: AssetChangedEvent) => void) | undefined;
-
-  /** Local last-known workspace topology revision (sent on hello for gap detect). */
-  lastKnownRevision = 0;
-
-  onReconcileRequired: ((msg: ReconcileRequiredEvent) => void) | undefined;
-
-  constructor(
-    readonly clientId: string,
-    /** WS URL from .presentation/workspace.json (server + projectId). No /poc fallback. */
-    readonly url: string,
-    lastKnownRevision = 0,
-  ) {
-    // Match server/pycrdt: Doc.get("documents", type=Map) of Y.Text
-    this.documents = this.doc.getMap("documents");
-    this.lastKnownRevision = lastKnownRevision;
-    this.workspaceRevision = lastKnownRevision;
-  }
-
-  /** Get or create Y.Text for a collaborative path (shared with server documents map). */
-  getText(path: string): Y.Text {
-    const existing = this.documents.get(path);
-    if (existing) return existing;
-    const ytext = new Y.Text();
-    this.documents.set(path, ytext);
-    return ytext;
-  }
-
-  getStatus(): CollabStatus {
-    return this.status;
-  }
-
-  private setStatus(s: CollabStatus): void {
-    this.status = s;
-    this.onStatus?.(s);
-  }
-
-  connect(): Promise<void> {
-    this.intentionalClose = false;
-    if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
-      if (this.status === "connected" && this.readyFlushed) return Promise.resolve();
-      return new Promise((resolve, reject) => {
-        this.connectWaiters.push({ resolve, reject });
-      });
+  private readyFlushed = false;
+  private barriers = new Map<string, { resolve: () => void; reject: (err: Error) => void }>();
+  private readonly outgoing = (update: Uint8Array, origin: unknown) => {
+    if (origin !== REMOTE_SYNC && this.readyFlushed && this.canWrite && this.ws?.readyState === WebSocket.OPEN) {
+      this.ws.send(update);
     }
-    return new Promise((resolve, reject) => {
-      this.connectWaiters.push({ resolve, reject });
-      this.openSocket();
-    });
+  };
+
+  constructor(readonly clientId: string, private readonly socketUrl: () => Promise<string>, revision = 0) {
+    this.lastKnownStructureRevision = revision;
+    this.structureRevision = revision;
+    this.doc.on("update", this.outgoing);
   }
 
-  private settleConnect(err?: Error): void {
-    const waiters = this.connectWaiters;
-    this.connectWaiters = [];
-    for (const w of waiters) {
-      if (err) w.reject(err);
-      else w.resolve();
+  getText(path: string): Y.Text {
+    let text = this.documents.get(path);
+    if (!text) { text = new Y.Text(); this.documents.set(path, text); }
+    return text;
+  }
+
+  mergeRemote(update: Uint8Array): void {
+    const before = new Map([...this.documents].map(([rel, text]) => [rel, { text, content: text.toString() }]));
+    Y.applyUpdate(this.doc, update, REMOTE_SYNC);
+    for (const [rel, old] of before) {
+      if (this.documents.get(rel) !== old.text && this.documents.get(rel)?.toString() !== old.content) {
+        this.onReplacedText?.(rel, old.content);
+      }
+    }
+  }
+
+  getStatus(): CollabStatus { return this.status; }
+  private setStatus(status: CollabStatus): void { this.status = status; this.onStatus?.(status); }
+
+  async connect(): Promise<void> {
+    this.intentionalClose = false;
+    if (this.ws || this.status === "connecting") return;
+    this.setStatus("connecting");
+    try {
+      const url = await this.socketUrl();
+      if (this.intentionalClose) return;
+      const ws = new WebSocket(url);
+      this.ws = ws;
+      ws.binaryType = "arraybuffer";
+      ws.onopen = () => {
+        this.setStatus("syncing");
+        ws.send(JSON.stringify({ type: "hello", protocol_version: 2, client_id: this.clientId,
+          last_known_structure_revision: this.lastKnownStructureRevision }));
+      };
+      ws.onmessage = (event) => {
+        if (this.ws !== ws) return;
+        try {
+          if (typeof event.data !== "string") {
+            this.mergeRemote(new Uint8Array(event.data as ArrayBuffer));
+            if (this.awaitingSnapshot) this.flushReady();
+            return;
+          }
+          const msg = JSON.parse(event.data);
+          if (msg.type === "ready") {
+            if (msg.protocol_version !== 2) throw new Error("Server protocol upgrade required");
+            this.structureRevision = msg.structure_revision;
+            this.canWrite = msg.can_write === true;
+            this.awaitingSnapshot = msg.has_snapshot === true;
+            if (!this.awaitingSnapshot) this.flushReady();
+          } else if (["workspace.operations", "asset.changed", "reconcile_required"].includes(msg.type)) {
+            this.structureRevision = Math.max(this.structureRevision, msg.structure_revision);
+            this.onRemoteStructure?.(msg.structure_revision);
+          } else if (msg.type === "pong") {
+            this.barriers.get(msg.id)?.resolve();
+            this.barriers.delete(msg.id);
+          } else if (msg.type === "error") {
+            this.onError?.(new Error(msg.message));
+            if (msg.code === "protocol_version" || msg.code === "forbidden") this.disconnect();
+          }
+        } catch (error) { this.onError?.(error); this.disconnect(); }
+      };
+      ws.onerror = () => { /* onclose schedules retry; URLs may contain credentials. */ };
+      ws.onclose = () => {
+        if (this.ws !== ws) return;
+        this.ws = undefined;
+        this.readyFlushed = false;
+        this.awaitingSnapshot = false;
+        for (const barrier of this.barriers.values()) barrier.reject(new Error("Connection closed"));
+        this.barriers.clear();
+        this.setStatus("offline");
+        this.scheduleReconnect();
+      };
+    } catch (error) {
+      this.setStatus("offline");
+      this.onError?.(error);
+      this.scheduleReconnect();
     }
   }
 
   private flushReady(): void {
-    if (this.readyFlushed) return;
-    this.readyFlushed = true;
     this.awaitingSnapshot = false;
-    this.pushFullState();
+    this.readyFlushed = true;
+    this.reconnectAttempt = 0;
+    if (this.canWrite) this.ws?.send(Y.encodeStateAsUpdate(this.doc));
+    this.setStatus("connected");
     this.onReady?.();
-    this.settleConnect();
   }
 
-  private openSocket(): void {
-    if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
-      return;
-    }
-    this.setStatus(this.reconnectAttempt > 0 ? "syncing" : "connecting");
-    const ws = new WebSocket(this.url);
-    this.ws = ws;
-    ws.binaryType = "arraybuffer";
-
-    ws.onopen = () => {
-      this.setStatus("syncing");
-      ws.send(
-        JSON.stringify({
-          type: "hello",
-          client_id: this.clientId,
-          protocol_version: PROTOCOL_VERSION,
-          last_known_revision: this.lastKnownRevision,
-        }),
-      );
-    };
-
-    ws.onmessage = (ev) => {
-      if (typeof ev.data === "string") {
-        let msg: {
-          type?: string;
-          revision?: number;
-          has_snapshot?: boolean;
-          operation_id?: string;
-          operation?: FsOperation;
-          path?: string;
-          content_hash?: string;
-          size?: number;
-          code?: string;
-          message?: string;
-          reason?: string;
-          last_known_revision?: number;
-        };
-        try {
-          msg = JSON.parse(ev.data) as typeof msg;
-        } catch {
-          return;
-        }
-        if (msg.type === "ready") {
-          this.reconnectAttempt = 0;
-          this.readyFlushed = false;
-          this.awaitingSnapshot = msg.has_snapshot === true;
-          if (typeof msg.revision === "number") {
-            this.workspaceRevision = msg.revision;
-            this.onWorkspaceRevision?.(msg.revision);
-          }
-          this.setStatus("connected");
-          this.wireOutgoing();
-          // Deterministic barrier (H1): flush now if no snapshot follows; else wait for binary.
-          if (!this.awaitingSnapshot) {
-            this.flushReady();
-          }
-        } else if (msg.type === "pong") {
-          // ignore
-        } else if (msg.type === "fs.operation_ack") {
-          const id = msg.operation_id;
-          if (id && typeof msg.revision === "number") {
-            const w = this.fsAckWaiters.get(id);
-            if (w) {
-              this.fsAckWaiters.delete(id);
-              this.workspaceRevision = msg.revision;
-              w.resolve({ operation_id: id, revision: msg.revision });
-            }
-          }
-        } else if (msg.type === "fs.operation") {
-          if (
-            msg.operation_id &&
-            typeof msg.revision === "number" &&
-            msg.operation &&
-            typeof msg.operation.kind === "string"
-          ) {
-            this.workspaceRevision = msg.revision;
-            this.onFsOperation?.({
-              operation_id: msg.operation_id,
-              revision: msg.revision,
-              operation: msg.operation,
-            });
-          }
-        } else if (msg.type === "workspace.revision") {
-          if (typeof msg.revision === "number") {
-            this.workspaceRevision = msg.revision;
-            this.onWorkspaceRevision?.(msg.revision);
-          }
-        } else if (msg.type === "asset.changed") {
-          if (
-            typeof msg.path === "string" &&
-            typeof msg.revision === "number" &&
-            typeof msg.content_hash === "string" &&
-            typeof msg.size === "number"
-          ) {
-            this.workspaceRevision = msg.revision;
-            this.onAssetChanged?.({
-              path: msg.path,
-              revision: msg.revision,
-              content_hash: msg.content_hash,
-              size: msg.size,
-            });
-          }
-        } else if (msg.type === "workspace.reconcile_required") {
-          if (typeof msg.revision === "number") {
-            this.workspaceRevision = msg.revision;
-            this.onReconcileRequired?.({
-              revision: msg.revision,
-              reason: typeof msg.reason === "string" ? msg.reason : "unknown",
-              last_known_revision:
-                typeof msg.last_known_revision === "number"
-                  ? msg.last_known_revision
-                  : undefined,
-            });
-          }
-        } else if (msg.type === "error") {
-          const code = msg.code ?? "";
-          if (code === "fs_rejected" || code === "fs_error" || code === "bad_fs_op") {
-            // Fail oldest waiter — ponytail: errors lack operation_id; single in-flight op assumed.
-            const first = this.fsAckWaiters.keys().next().value;
-            if (first) {
-              const w = this.fsAckWaiters.get(first);
-              this.fsAckWaiters.delete(first);
-              w?.reject(new Error(msg.message ?? ev.data));
-            }
-          } else {
-            this.settleConnect(new Error(ev.data));
-          }
-        }
-        return;
-      }
-      const buf = ev.data instanceof ArrayBuffer ? new Uint8Array(ev.data) : new Uint8Array(ev.data as ArrayBuffer);
-      // REMOTE_SYNC: not tracked by UndoManager (selective local undo).
-      Y.applyUpdate(this.doc, buf, REMOTE_SYNC);
-      if (!this.readyFlushed && this.awaitingSnapshot) {
-        this.flushReady();
-      }
-    };
-
-    ws.onerror = () => {
-      // onclose handles retry; reject only if this was the initial connect wait.
-      if (this.status === "connecting" || this.status === "syncing") {
-        // leave settle to onclose / ready
-      }
-    };
-
-    ws.onclose = () => {
-      // ponytail: ignore close from a superseded socket so reconnect race
-      // doesn't clear the live ws / stick status at offline (open decision #7 framing).
-      if (this.ws !== ws) return;
-      this.unsubUpdate?.();
-      this.unsubUpdate = undefined;
-      this.ws = undefined;
-      this.awaitingSnapshot = false;
-      this.setStatus("offline");
-      for (const [id, w] of this.fsAckWaiters) {
-        w.reject(new Error("websocket closed"));
-        this.fsAckWaiters.delete(id);
-      }
-      if (this.intentionalClose) {
-        this.settleConnect(new Error("disconnected"));
-        return;
-      }
-      // Initial connect failed before ready: reject waiters, still retry.
-      if (this.connectWaiters.length > 0 && this.reconnectAttempt === 0) {
-        this.settleConnect(new Error(`WebSocket closed connecting to ${this.url}`));
-      }
-      this.scheduleReconnect();
-    };
+  /** Ping is an ordered stream barrier before Snapshot/Publish commands, not an FS RPC. */
+  flushText(): Promise<void> {
+    if (!this.readyFlushed || this.ws?.readyState !== WebSocket.OPEN) return Promise.reject(new Error("Presentation is offline"));
+    const id = crypto.randomUUID();
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => { this.barriers.delete(id); reject(new Error("Sync interrupted")); }, 15000);
+      this.barriers.set(id, {
+        resolve: () => { clearTimeout(timer); resolve(); },
+        reject: (err) => { clearTimeout(timer); reject(err); },
+      });
+      this.ws!.send(JSON.stringify({ type: "ping", id }));
+    });
   }
 
   private scheduleReconnect(): void {
     if (this.intentionalClose || this.reconnectTimer) return;
-    const delay = BACKOFF_MS[Math.min(this.reconnectAttempt, BACKOFF_MS.length - 1)];
-    this.reconnectAttempt++;
-    // Stay offline during backoff; openSocket sets syncing/connecting on retry.
-    this.reconnectTimer = setTimeout(() => {
-      this.reconnectTimer = undefined;
-      if (this.intentionalClose) return;
-      this.openSocket();
-    }, delay);
-  }
-
-  private wireOutgoing(): void {
-    this.unsubUpdate?.();
-    const handler = (update: Uint8Array, origin: unknown) => {
-      if (origin === REMOTE_SYNC) return;
-      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-      this.ws.send(update);
-    };
-    this.doc.on("update", handler);
-    this.unsubUpdate = () => this.doc.off("update", handler);
-  }
-
-  /** Send full local Yjs state so server merges offline edits after reconnect. */
-  private pushFullState(): void {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-    const update = Y.encodeStateAsUpdate(this.doc);
-    if (update.byteLength <= 2) return;
-    this.ws.send(update);
-  }
-
-  /** Queue an authoritative fs.operation; resolves on fs.operation_ack. */
-  sendFsOperation(
-    operation: FsOperation,
-    baseRevision?: number,
-  ): Promise<FsOperationAck> {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      return Promise.reject(new Error("not connected"));
-    }
-    this.opSeq += 1;
-    const operation_id = `op_${this.clientId}_${this.opSeq}`;
-    const base =
-      typeof baseRevision === "number" ? baseRevision : this.workspaceRevision;
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.fsAckWaiters.delete(operation_id);
-        reject(new Error(`fs.operation_ack timeout for ${operation_id}`));
-      }, FS_ACK_TIMEOUT_MS);
-      this.fsAckWaiters.set(operation_id, {
-        resolve: (a) => {
-          clearTimeout(timer);
-          resolve(a);
-        },
-        reject: (e) => {
-          clearTimeout(timer);
-          reject(e);
-        },
-      });
-      this.ws!.send(
-        JSON.stringify({
-          type: "fs.operation",
-          operation_id,
-          base_revision: base,
-          operation,
-        }),
-      );
-    });
-  }
-
-  ping(): void {
-    if (this.ws?.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify({ type: "ping" }));
-    }
+    const delay = BACKOFF_MS[Math.min(this.reconnectAttempt++, BACKOFF_MS.length - 1)];
+    this.reconnectTimer = setTimeout(() => { this.reconnectTimer = undefined; void this.connect(); }, delay);
   }
 
   disconnect(): void {
     this.intentionalClose = true;
-    if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = undefined;
-    }
-    this.awaitingSnapshot = false;
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = undefined;
     this.readyFlushed = false;
-    this.unsubUpdate?.();
-    this.unsubUpdate = undefined;
-    for (const [id, w] of this.fsAckWaiters) {
-      w.reject(new Error("disconnected"));
-      this.fsAckWaiters.delete(id);
-    }
     this.ws?.close();
     this.ws = undefined;
-    this.reconnectAttempt = 0;
+    for (const barrier of this.barriers.values()) barrier.reject(new Error("Disconnected"));
+    this.barriers.clear();
     this.setStatus("offline");
   }
+
+  dispose(): void { this.disconnect(); this.doc.off("update", this.outgoing); this.doc.destroy(); }
 }

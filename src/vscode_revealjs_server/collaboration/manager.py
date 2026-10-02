@@ -170,14 +170,14 @@ class CollaborationRoom:
                     if content:
                         ytext.insert(0, content)
                     changed = True
-                elif not str(existing) and content:
-                    existing.insert(0, content)
-                    changed = True
+
         elif kind == "delete":
             path = operation.get("path")
-            if isinstance(path, str) and path in list(docs.keys()):
-                del docs[path]
-                changed = True
+            if isinstance(path, str):
+                for key in list(docs.keys()):
+                    if key == path or key.startswith(path + "/"):
+                        del docs[key]
+                        changed = True
         elif kind in ("rename", "move"):
             frm = operation.get("from")
             to = operation.get("to")
@@ -225,14 +225,15 @@ class CollaborationRoom:
         self.client_ids.pop(ws, None)
 
     async def apply_and_broadcast(self, update: bytes, sender: WebSocket) -> None:
-        self.doc.apply_update(update)
-        self.crdt_generation += 1
-        self._persist()
+        with project_service._mut:
+            self.doc.apply_update(update)
+            self.crdt_generation += 1
+            self._persist()
         await self.broadcast_bytes(update, exclude=sender)
 
     async def broadcast_bytes(self, data: bytes, *, exclude: WebSocket | None = None) -> None:
         dead: list[WebSocket] = []
-        for client in self.clients:
+        for client in tuple(self.clients):
             if client is exclude:
                 continue
             if client.client_state != WebSocketState.CONNECTED:
@@ -248,7 +249,7 @@ class CollaborationRoom:
 
     async def broadcast_text(self, data: str, *, exclude: WebSocket | None = None) -> None:
         dead: list[WebSocket] = []
-        for client in self.clients:
+        for client in tuple(self.clients):
             if client is exclude:
                 continue
             if client.client_state != WebSocketState.CONNECTED:
@@ -269,24 +270,50 @@ class CollaborationManager:
         # ponytail: one lock for all projects' fs ops. Ceiling: cross-project contention.
         # Upgrade: per-project lock or DB transaction (M3).
         self._fs_lock = asyncio.Lock()
+        project_service.collaborative_state = self.collaborative_state
 
     def room(self, project_id: str) -> CollaborationRoom:
-        if project_id not in self._rooms:
-            self._rooms[project_id] = CollaborationRoom(project_id)
-        return self._rooms[project_id]
+        with project_service._mut:
+            if project_id not in self._rooms:
+                self._rooms[project_id] = CollaborationRoom(project_id)
+            return self._rooms[project_id]
 
-    def collaborative_text(self, project_id: str, path: str | None = None) -> str | None:
-        """Live CRDT text for path (default primary slide); loads blob if room cold."""
-        return self.room(project_id).collaborative_text(path)
+    def collaborative_state(self, project_id: str) -> tuple[dict[str, str], bytes | None]:
+        with project_service._mut:
+            room = self.room(project_id)
+            return room.collaborative_texts(), room.snapshot()
 
-    def collaborative_texts(self, project_id: str) -> dict[str, str]:
-        """All live CRDT path→text for project."""
-        return self.room(project_id).collaborative_texts()
-
-    def _workspace_revision(self, project_id: str) -> int:
-        rev = project_service.revision(project_id)
-        # Fixtures may use synthetic project_id (e.g. "poc") without meta → 0.
-        return 0 if rev is None else rev
+    async def apply_operations(self, project_id: str, operations: list[dict], base: int) -> dict:
+        """Commit a prefix in order. Return receipts plus the first failure; never hide partial success."""
+        async with self._fs_lock:
+            room = self.room(project_id)
+            result: dict = {"results": [], "structure_revision": project_service.structure_revision(project_id)}
+            updates: list[bytes] = []
+            with project_service._mut:
+                for index, operation in enumerate(operations):
+                    before = project_service.structure_revision(project_id)
+                    try:
+                        revision, normalized = project_service.apply_fs_operation(
+                            project_id, operation, base_revision=base,
+                        )
+                    except (FsRejected, OSError) as exc:
+                        result["failed"] = {"index": index, "message": str(exc)}
+                        break
+                    result["results"].append({"structure_revision": revision, "operation": normalized})
+                    # Replayed HTTP receipts must not reapply a rename/delete to the Y.Doc.
+                    if project_service.structure_revision(project_id) != before:
+                        update = room.apply_fs_to_documents(normalized)
+                        if update is not None:
+                            updates.append(update)
+                    base = project_service.structure_revision(project_id) or 0
+                result["structure_revision"] = project_service.structure_revision(project_id)
+            for update in updates:
+                await room.broadcast_bytes(update)
+            if result["results"]:
+                await room.broadcast_text(proto.encode({
+                    "type": "workspace.operations", **result,
+                }))
+            return result
 
     async def handle(
         self,
@@ -318,35 +345,40 @@ class CollaborationManager:
             await ws.close()
             return
 
-        # ponytail: protocol_version accepted but not negotiated; upgrade when clients diverge.
-        last_known = msg.get("last_known_revision")
+        if msg.get("protocol_version") != proto.PROTOCOL_VERSION:
+            await ws.send_text(proto.encode(proto.error("protocol_version", "upgrade to protocol v2")))
+            await ws.close(code=4400)
+            return
+        last_known = msg.get("last_known_structure_revision")
         last_known_rev: int | None = None
         if isinstance(last_known, int) and not isinstance(last_known, bool):
             last_known_rev = last_known
         elif last_known is not None:
             await ws.send_text(
-                proto.encode(proto.error("bad_hello", "last_known_revision must be int"))
+                proto.encode(proto.error("bad_hello", "last_known_structure_revision must be int"))
             )
             await ws.close()
             return
 
-        await room.join(ws, client_id)
-        server_rev = self._workspace_revision(project_id)
-        snap = room.snapshot()
+        with project_service._mut:
+            server_rev = project_service.structure_revision(project_id) or 0
+            snap = room.snapshot()
         await ws.send_text(
-            proto.encode(proto.ready(revision=server_rev, has_snapshot=snap is not None))
+            proto.encode(proto.ready(structure_revision=server_rev, has_snapshot=snap is not None, can_write=can_write))
         )
         if snap is not None:
             await ws.send_bytes(snap)
 
-        # Revision gap → client must re-fetch workspace snapshot (topology/assets).
+        await room.join(ws, client_id)
+        # The ready frame never advances the client's last-applied structure cursor.
+        server_rev = project_service.structure_revision(project_id) or 0
+        # Revision gap requires a safe snapshot merge, preserving local pending intent.
         if last_known_rev is not None and server_rev - last_known_rev >= REVISION_GAP_THRESHOLD:
             await ws.send_text(
                 proto.encode(
                     proto.reconcile_required(
-                        revision=server_rev,
+                        structure_revision=server_rev,
                         reason="revision_gap",
-                        last_known_revision=last_known_rev,
                     )
                 )
             )
@@ -374,16 +406,9 @@ class CollaborationManager:
                     continue
                 ctype = control.get("type")
                 if ctype == proto.PING:
-                    await ws.send_text(proto.encode(proto.pong()))
+                    await ws.send_text(proto.encode({**proto.pong(), "id": control.get("id")}))
                 elif ctype == proto.HELLO:
                     await ws.send_text(proto.encode(proto.error("already_joined", "hello already sent")))
-                elif ctype == proto.FS_OPERATION:
-                    if not can_write:
-                        await ws.send_text(
-                            proto.encode(proto.error("forbidden", "write permission required"))
-                        )
-                        continue
-                    await self._handle_fs_operation(ws, room, project_id, control)
                 else:
                     await ws.send_text(
                         proto.encode(proto.error("unknown_type", f"unsupported type: {ctype}"))
@@ -392,80 +417,6 @@ class CollaborationManager:
             pass
         finally:
             await room.leave(ws)
-
-    async def _handle_fs_operation(
-        self,
-        ws: WebSocket,
-        room: CollaborationRoom,
-        project_id: str,
-        control: dict,
-    ) -> None:
-        op_id = control.get("operation_id")
-        operation = control.get("operation")
-        if not isinstance(op_id, str) or not op_id:
-            await ws.send_text(proto.encode(proto.error("bad_fs_op", "operation_id required")))
-            return
-        if not isinstance(operation, dict):
-            await ws.send_text(proto.encode(proto.error("bad_fs_op", "operation object required")))
-            return
-        base = control.get("base_revision")
-        base_rev: int | None
-        if base is None:
-            base_rev = None
-        elif isinstance(base, int) and not isinstance(base, bool):
-            base_rev = base
-        else:
-            await ws.send_text(proto.encode(proto.error("bad_fs_op", "base_revision must be int")))
-            return
-
-        async with self._fs_lock:
-            try:
-                rev, normalized = project_service.apply_fs_operation(
-                    project_id,
-                    operation,
-                    base_revision=base_rev,
-                )
-            except FsRejected as e:
-                err = str(e)
-                await ws.send_text(proto.encode(proto.error("fs_rejected", err)))
-                # Stale base → force snapshot reconcile (same path as hello gap).
-                if "stale base_revision" in err:
-                    server_rev = self._workspace_revision(project_id)
-                    known = base_rev if base_rev is not None else -1
-                    if server_rev - known >= REVISION_GAP_THRESHOLD:
-                        await ws.send_text(
-                            proto.encode(
-                                proto.reconcile_required(
-                                    revision=server_rev,
-                                    reason="stale_base_revision",
-                                    last_known_revision=base_rev,
-                                )
-                            )
-                        )
-                return
-            except Exception as e:
-                await ws.send_text(proto.encode(proto.error("fs_error", str(e))))
-                return
-
-            await ws.send_text(
-                proto.encode(proto.fs_operation_ack(operation_id=op_id, revision=rev))
-            )
-            # Keep path→Y.Text in sync for Preview/Publish (broadcast before fs event).
-            yupdate = room.apply_fs_to_documents(normalized)
-            if yupdate is not None:
-                await room.broadcast_bytes(yupdate, exclude=None)
-            event = proto.encode(
-                proto.fs_operation_event(
-                    operation_id=op_id,
-                    revision=rev,
-                    operation=normalized,
-                )
-            )
-            await room.broadcast_text(event, exclude=ws)
-            await room.broadcast_text(
-                proto.encode(proto.workspace_revision(revision=rev)),
-                exclude=None,
-            )
 
     async def notify_asset_changed(
         self,
@@ -477,27 +428,12 @@ class CollaborationManager:
         size: int,
         exclude_client_id: str | None = None,
     ) -> None:
-        """Broadcast asset.changed + workspace.revision after HTTP PUT."""
+        """Notify every client, including the writer, without a second revision message."""
         room = self.room(project_id)
-        exclude: WebSocket | None = None
-        if exclude_client_id:
-            for ws, cid in room.client_ids.items():
-                if cid == exclude_client_id:
-                    exclude = ws
-                    break
-        event = proto.encode(
-            proto.asset_changed(
-                path=path,
-                revision=revision,
-                content_hash=content_hash,
-                size=size,
-            )
-        )
-        await room.broadcast_text(event, exclude=exclude)
-        await room.broadcast_text(
-            proto.encode(proto.workspace_revision(revision=revision)),
-            exclude=None,
-        )
+        await room.broadcast_text(proto.encode({
+            "type": "asset.changed", "path": path, "revision": revision,
+            "structure_revision": revision, "content_hash": content_hash, "size": size,
+        }))
 
 
 
