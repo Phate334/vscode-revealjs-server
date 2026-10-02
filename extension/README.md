@@ -11,6 +11,6 @@ A VS Code client for the collaborative presentation server. Work in real local f
 
 Keep `.presentation/`: it contains the local Yjs state, saved-disk baselines, pending journal and recovery copies. Git metadata, VS Code preferences and node_modules are excluded from synchronization. Legacy local differences are preserved for explicit conflict resolution.
 
-Server and extension must both support protocol v2. Canonical RC version is `0.1.2rc1`; VS Code manifest version is derived as `0.1.2` and the VSIX is packaged with `--pre-release`.
+Server and extension must both support protocol v2. The stable release version is `0.1.2` for both components.
 
-All verification, compilation and packaging were skipped for this implementation at the user's request. See the repository's `docs/workspace-architecture.md` for the protocol, limitations and deferred acceptance scenarios.
+The maintainer has completed validation for `0.1.2`. See the repository's `docs/workspace-architecture.md` for the protocol and operating limits.

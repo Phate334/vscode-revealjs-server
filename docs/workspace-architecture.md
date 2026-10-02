@@ -1,4 +1,4 @@
-# Workspace architecture — 0.1.2rc1
+# Workspace architecture — 0.1.2
 
 This implementation follows the [architecture correction plan](https://chatgpt.com/s/t_6abeef68735c8191a9183d3544ba8e22). It supersedes the synchronization, onboarding, preview access and protocol sections of `collaborative-presentation-spec.md`.
 
@@ -59,10 +59,10 @@ A successful response contains `structure_revision` and ordered `results`. A rej
 
 Invites use `/api/projects/{id}/invites`, `/api/invites/{token}` and `/api/invites/{token}/accept`. Private preview sessions use `POST /api/projects/{id}/preview-session`.
 
-## RC status
+## Release status
 
-Canonical version: `0.1.2rc1`, updated with `uv version 0.1.2rc1 --no-sync`. Compose uses the same version. VS Code accepts numeric extension versions only: the manifest derives `0.1.2` and RC packaging uses `vsce --pre-release`; the VSIX filename retains `0.1.2rc1`. RC image publication does not update `latest`.
+Canonical version: `0.1.2`, updated with `uv version 0.1.2 --no-sync`. Compose and the VS Code manifest use the same version. Tag `v0.1.2` triggers stable packaging without `--pre-release`, publishes `vscode-revealjs-collaboration-0.1.2.vsix` on GitHub Release, and publishes image tags `0.1.2` and `latest`.
 
-At the user's request, **all validation was skipped**: environment setup, Phase 0 regression execution, compilation, linting, tests, Docker Compose smoke checks, two real VS Code Extension Development Hosts, E2E acceptance and packaging. The existing smoke script was migrated to protocol v2 but was not run. No milestone is claimed to have passed acceptance, and no release tag was created. The branch is an unverified release candidate.
+The maintainer confirmed that validation is complete before promoting this version from RC to a stable release. This release preparation updates version metadata and documentation without repeating validation.
 
-Before a stable release, run the plan's A–L scenarios using the Compose published endpoint and two real Extension Development Hosts, including restart/crash recovery, autosave off/on, bulk changes, concurrent topology and binary conflicts, preview expiry, and release immutability. No PostgreSQL, object storage, presence, web editor or later-phase product features are included.
+Future synchronization changes should continue to cover the plan's A–L scenarios using the Compose published endpoint and two real Extension Development Hosts, including restart/crash recovery, autosave off/on, bulk changes, concurrent topology and binary conflicts, preview expiry, and release immutability. No PostgreSQL, object storage, presence, web editor or later-phase product features are included.

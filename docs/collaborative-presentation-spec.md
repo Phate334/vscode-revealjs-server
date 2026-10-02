@@ -1,4 +1,4 @@
-> Synchronization, onboarding, preview security and protocol updates for 0.1.2rc1 are defined in [workspace-architecture.md](workspace-architecture.md). Older examples below are historical design context.
+> Synchronization, onboarding, preview security and protocol updates for 0.1.2 are defined in [workspace-architecture.md](workspace-architecture.md). Older examples below are historical design context.
 
 # Collaborative Presentation Platform — Architecture & MVP Specification
 
