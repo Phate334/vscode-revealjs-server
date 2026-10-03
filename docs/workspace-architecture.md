@@ -1,6 +1,6 @@
-# Workspace architecture — 0.1.2
+# Workspace architecture
 
-This implementation follows the [architecture correction plan](https://chatgpt.com/s/t_6abeef68735c8191a9183d3544ba8e22). It supersedes the synchronization, onboarding, preview access and protocol sections of `collaborative-presentation-spec.md`.
+Current workspace synchronization, onboarding, preview access, and protocol behavior. Supersedes the matching sections of `collaborative-presentation-spec.md` where they conflict.
 
 ## State ownership
 
@@ -59,10 +59,6 @@ A successful response contains `structure_revision` and ordered `results`. A rej
 
 Invites use `/api/projects/{id}/invites`, `/api/invites/{token}` and `/api/invites/{token}/accept`. Private preview sessions use `POST /api/projects/{id}/preview-session`.
 
-## Release status
+## Versioning
 
-Canonical version: `0.1.2`, updated with `uv version 0.1.2 --no-sync`. Compose and the VS Code manifest use the same version. Tag `v0.1.2` triggers stable packaging without `--pre-release`, publishes `vscode-revealjs-collaboration-0.1.2.vsix` on GitHub Release, and publishes image tags `0.1.2` and `latest`.
-
-The maintainer confirmed that validation is complete before promoting this version from RC to a stable release. This release preparation updates version metadata and documentation without repeating validation.
-
-Future synchronization changes should continue to cover the plan's A–L scenarios using the Compose published endpoint and two real Extension Development Hosts, including restart/crash recovery, autosave off/on, bulk changes, concurrent topology and binary conflicts, preview expiry, and release immutability. No PostgreSQL, object storage, presence, web editor or later-phase product features are included.
+Canonical package version is `pyproject.toml` (currently `0.1.2`). Compose and the VS Code extension manifest use the same stable `X.Y.Z`. Tag `v0.1.2` publishes the VSIX and image tags `0.1.2` and `latest`. RC builds (when used) keep the `rcN` suffix in tags/filenames, use `--pre-release`, and must not move stable `latest`. See `AGENTS.md` for release rules.
