@@ -39,7 +39,7 @@ Or in VS Code: **Extensions → … → Install from VSIX…**
 3. Pick a parent directory and a new child-folder name. Existing folders are not overwritten.
 4. Edit local files. Text synchronizes through Yjs and is saved locally even with Auto Save off. **Disconnect** keeps local editing and saving.
 5. **Open Preview** opens a private, short-lived preview session.
-6. **Share Presentation** copies an invitation. The other person signs in with their own account and runs **Accept Invitation**, which opens that presentation. **Project Members** lists who has joined.
+6. **Share Presentation** copies an invite link (`{server}/join#{token}`). The other person signs in with their own account, runs **Accept Invitation**, and pastes that link in the quick input. **Project Members** lists who has joined. Details: [account and invites](docs/account-invite.md).
 7. **Publish** freezes a public, immutable release and copies its link.
 8. **Resolve Conflict**, **Synchronization Details**, and **Retry Synchronization** cover preserved differences and queued work.
 

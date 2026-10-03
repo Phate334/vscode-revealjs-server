@@ -279,7 +279,11 @@ SHARE="$(curl -sfS -X POST "${BASE}/api/projects/${PID}/invites" \
   -d '{"role":"viewer"}')" || fail "create share"
 TOKEN="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])' <<<"${SHARE}")"
 SHARE_ID="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' <<<"${SHARE}")"
+INVITE_URL="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["url"])' <<<"${SHARE}")"
 [[ -n "${TOKEN}" && -n "${SHARE_ID}" ]] || fail "share body: ${SHARE}"
+echo "${INVITE_URL}" | grep -Fq "/join#${TOKEN}" || fail "invite url missing token: ${INVITE_URL}"
+CODE="$(curl -sS -o /dev/null -w '%{http_code}' "${BASE}/join" || true)"
+[[ "${CODE}" == "200" ]] || fail "expected 200 GET /join, got ${CODE}"
 PREV_SHARE="$(curl -sfS "${BASE}/api/invites/${TOKEN}" -H "Authorization: Bearer ${GUEST_ACCESS}")" \
   || fail "preview share"
 echo "${PREV_SHARE}" | grep -q "${PID}" || fail "preview share body: ${PREV_SHARE}"

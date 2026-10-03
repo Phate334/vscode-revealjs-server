@@ -5,7 +5,7 @@ import { CollaborationClient } from "./collaborationClient";
 import { bindCollaborativeDocuments, type DocumentsBinding } from "./documentBinding";
 import { getAccessToken, initAuth, saveSession } from "./auth";
 import {
-  collabWsUrl, configuredServer, normalizeServer, acceptShare, createProject, createShare,
+  collabWsUrl, configuredServer, acceptShare, createProject, createShare, parseInviteInput,
   extractSnapshot, fetchSnapshot, listMembers, listProjects, login, previewInvite,
   publishRelease, readWorkspaceMeta, writeWorkspaceMeta, type ProjectInfo, type WorkspaceMeta,
 } from "./projectClient";
@@ -152,17 +152,24 @@ async function open(): Promise<void> {
 }
 
 async function acceptInvitation(server = configuredServer()): Promise<void> {
-  const input = await vscode.window.showInputBox({ title: "Presentation: Accept Invitation", prompt: "Paste invitation", ignoreFocusOut: true });
+  const input = await vscode.window.showInputBox({
+    title: "Presentation: Accept Invitation",
+    prompt: "Paste invite link",
+    placeHolder: "http://host/join#token",
+    ignoreFocusOut: true,
+  });
   if (!input) return;
-  let token = input.trim();
-  if (token.startsWith("{")) {
-    const invite = JSON.parse(token) as { server: string; token: string };
-    server = normalizeServer(invite.server); token = invite.token;
-  }
+  const parsed = parseInviteInput(input, server);
+  server = parsed.server;
+  const token = parsed.token;
+  // Same floating input boxes as Sign In: username, then masked password. Does not create an account.
   if (!(await requireSession(server))) return;
   const info = await previewInvite(server, token);
-  const choice = await vscode.window.showInformationMessage(`${info.project_name} · ${info.role}`, { modal: true }, "Accept and Open");
-  if (choice !== "Accept and Open") return;
+  const choice = await vscode.window.showQuickPick(
+    [{ label: "Accept and Open", description: `${info.project_name} · ${info.role}` }],
+    { title: "Presentation: Accept Invitation", placeHolder: `${info.project_name} · ${info.role}` },
+  );
+  if (choice?.label !== "Accept and Open") return;
   const result = await acceptShare(server, token);
   await downloadProject(server, result.project);
 }
@@ -198,8 +205,9 @@ export function activate(context: vscode.ExtensionContext): void {
       const role = await vscode.window.showQuickPick(["viewer", "editor"], { title: "Presentation: Share Presentation" });
       if (!role) return;
       const invite = await createShare(meta.server, meta.projectId, role as "viewer" | "editor");
-      await vscode.env.clipboard.writeText(JSON.stringify({ server: meta.server, token: invite.token }));
-      void vscode.window.showInformationMessage("Invitation copied. Use Open Presentation → Accept invitation on the other computer.");
+      const link = invite.url ?? `${meta.server.replace(/\/$/, "")}/join#${encodeURIComponent(invite.token)}`;
+      await vscode.env.clipboard.writeText(link);
+      void vscode.window.showInformationMessage("Invite link copied. The other person signs in, then runs Accept Invitation and pastes the link.");
     })),
     command("presentation.projectMembers", () => workspaceAction(async (meta) => {
       const members = await listMembers(meta.server, meta.projectId);

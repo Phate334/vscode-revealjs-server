@@ -1,9 +1,10 @@
 import secrets
 import time
+from urllib.parse import quote
 from typing import Annotated, Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, WebSocket
-from fastapi.responses import RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
 from vscode_revealjs_server.auth import service as auth_service
@@ -264,22 +265,41 @@ async def collaboration_ws(
 
 
 
+def _invite_url(request: Request, token: str) -> str:
+    """Canonical invite link. Token stays in the fragment so a browser does not send it."""
+    base = str(request.base_url).rstrip("/")
+    return f"{base}/join#{quote(token, safe='')}"
+
+
+@app.get("/join", response_class=HTMLResponse)
+def join_hint() -> HTMLResponse:
+    """Hint page for an invite link. Joining happens in VS Code, not here."""
+    return HTMLResponse(
+        "<!doctype html><meta charset=utf-8><title>Join presentation</title>"
+        "<p>In VS Code, run <strong>Presentation: Accept Invitation</strong> and paste this link. "
+        "Sign in with your existing account. This page does not create an account.</p>"
+    )
+
+
 @app.post("/api/projects/{project_id}/invites")
 def post_share(
     project_id: str,
     body: CreateShareBody,
+    request: Request,
     user: Annotated[dict[str, str], Depends(require_user)],
 ) -> dict:
-    """Owner creates a reusable invite (Presentation: Share Project)."""
+    """Owner creates a reusable invite link (Presentation: Share Presentation)."""
     _forbid_unless_member(project_id, user["id"])
     if not project_service.can_manage_members(project_id, user["id"]):
         raise HTTPException(status_code=403, detail="owner permission required")
     try:
-        return project_service.create_share(project_id, role=body.role)
+        share = project_service.create_share(project_id, role=body.role)
     except FsRejected as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
+    share["url"] = _invite_url(request, share["token"])
+    return share
 
 
 @app.get("/api/projects/{project_id}/invites")

@@ -256,7 +256,28 @@ export type ShareInvite = {
   token: string;
   role: string;
   project_id: string;
+  /** `{origin}/join#{token}` when the server built it. */
+  url?: string;
 };
+
+/** Invite link, legacy JSON `{server, token}`, or a bare token (uses fallbackServer). */
+export function parseInviteInput(input: string, fallbackServer: string): { server: string; token: string } {
+  const raw = input.trim();
+  if (!raw) throw new Error("Invitation link required");
+  if (raw.startsWith("{")) {
+    const invite = JSON.parse(raw) as { server?: string; token?: string };
+    if (!invite.server || !invite.token) throw new Error("Invitation must include a server and token");
+    return { server: normalizeServer(invite.server), token: invite.token.trim() };
+  }
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(raw)) {
+    const url = new URL(raw);
+    const fromHash = url.hash.length > 1 ? decodeURIComponent(url.hash.slice(1)) : "";
+    const token = (fromHash || url.searchParams.get("token") || "").trim();
+    if (!token) throw new Error("Invitation link is missing a token");
+    return { server: normalizeServer(url.origin), token };
+  }
+  return { server: normalizeServer(fallbackServer), token: raw };
+}
 
 export async function createShare(
   server: string,
