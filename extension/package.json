@@ -17,6 +17,7 @@
     "onCommand:presentation.openProject",
     "onCommand:presentation.openPreview",
     "onCommand:presentation.signIn",
+    "onCommand:presentation.register",
     "onCommand:presentation.shareProject",
     "onCommand:presentation.projectMembers",
     "onCommand:presentation.publish",
@@ -52,6 +53,10 @@
       {
         "command": "presentation.signIn",
         "title": "Presentation: Sign In"
+      },
+      {
+        "command": "presentation.register",
+        "title": "Presentation: Register"
       },
       {
         "command": "presentation.shareProject",

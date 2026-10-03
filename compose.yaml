@@ -10,8 +10,8 @@ services:
     environment:
       COLLAB_DATA_DIR: /app/.data/collaboration
       PROJECTS_DATA_DIR: /app/.data/projects
-      # No built-in accounts. Required comma-separated username:password pairs.
-      AUTH_DEMO_USER: ${AUTH_DEMO_USER:?Set AUTH_DEMO_USER to comma-separated username:password pairs}
+      # Optional. Empty starts with no accounts; username:password pairs only seed missing users.
+      AUTH_DEMO_USER: ${AUTH_DEMO_USER:-}
       # AUTH_JWT_SECRET: ${AUTH_JWT_SECRET:-change-me}
     healthcheck:
       test:

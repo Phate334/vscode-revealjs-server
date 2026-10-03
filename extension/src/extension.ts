@@ -6,7 +6,7 @@ import { bindCollaborativeDocuments, type DocumentsBinding } from "./documentBin
 import { getAccessToken, initAuth, saveSession } from "./auth";
 import {
   collabWsUrl, configuredServer, acceptShare, createProject, createShare, parseInviteInput,
-  extractSnapshot, fetchSnapshot, listMembers, listProjects, login, previewInvite,
+  extractSnapshot, fetchSnapshot, listMembers, listProjects, login, openSession, previewInvite, register,
   publishRelease, readWorkspaceMeta, writeWorkspaceMeta, type ProjectInfo, type WorkspaceMeta,
 } from "./projectClient";
 import { atomicWrite, hash, localPath } from "./localState";
@@ -27,17 +27,47 @@ function setStatus(status: string): void {
   statusItem.show();
 }
 
-async function signIn(server: string): Promise<boolean> {
-  const username = await vscode.window.showInputBox({ title: "Presentation: Sign In", prompt: `Username · ${server}`, ignoreFocusOut: true });
-  if (!username) return false;
-  const password = await vscode.window.showInputBox({ title: "Presentation: Sign In", prompt: "Password", password: true, ignoreFocusOut: true });
-  if (!password) return false;
-  const session = await login(server, username.trim(), password);
+async function promptCredentials(title: string, server: string): Promise<{ username: string; password: string } | undefined> {
+  const username = await vscode.window.showInputBox({ title, prompt: `Username · ${server}`, ignoreFocusOut: true });
+  if (!username?.trim()) return undefined;
+  const password = await vscode.window.showInputBox({ title, prompt: "Password", password: true, ignoreFocusOut: true });
+  if (!password) return undefined;
+  return { username: username.trim(), password };
+}
+
+async function storeLogin(server: string, session: { access_token: string; refresh_token: string; user: { username: string } }): Promise<void> {
   await saveSession(server, { access_token: session.access_token, refresh_token: session.refresh_token, username: session.user.username });
+}
+
+async function signIn(server: string): Promise<boolean> {
+  const creds = await promptCredentials("Presentation: Sign In", server);
+  if (!creds) return false;
+  await storeLogin(server, await login(server, creds.username, creds.password));
   return true;
 }
+
+async function registerAccount(server: string): Promise<boolean> {
+  const creds = await promptCredentials("Presentation: Register", server);
+  if (!creds) return false;
+  await storeLogin(server, await register(server, creds.username, creds.password));
+  return true;
+}
+
+/** No session yet: Sign In offers Register, then the same username and masked-password boxes. */
+async function signInOrRegister(server: string): Promise<boolean> {
+  const choice = await vscode.window.showQuickPick(
+    [
+      { label: "Sign in", description: "Existing account" },
+      { label: "Register", description: "Create an account" },
+    ],
+    { title: "Presentation: Sign In", ignoreFocusOut: true },
+  );
+  if (!choice) return false;
+  return choice.label === "Register" ? registerAccount(server) : signIn(server);
+}
+
 async function requireSession(server: string): Promise<boolean> {
-  return !!(await getAccessToken(server)) || await signIn(server);
+  return !!(await getAccessToken(server)) || await signInOrRegister(server);
 }
 
 async function connect(interactive = true): Promise<void> {
@@ -162,8 +192,12 @@ async function acceptInvitation(server = configuredServer()): Promise<void> {
   const parsed = parseInviteInput(input, server);
   server = parsed.server;
   const token = parsed.token;
-  // Same floating input boxes as Sign In: username, then masked password. Does not create an account.
-  if (!(await requireSession(server))) return;
+  // Not logged in: username, then masked password. New name registers; existing name signs in.
+  if (!(await getAccessToken(server))) {
+    const creds = await promptCredentials("Presentation: Accept Invitation", server);
+    if (!creds) return;
+    await storeLogin(server, await openSession(server, creds.username, creds.password));
+  }
   const info = await previewInvite(server, token);
   const choice = await vscode.window.showQuickPick(
     [{ label: "Accept and Open", description: `${info.project_name} · ${info.role}` }],
@@ -197,7 +231,14 @@ export function activate(context: vscode.ExtensionContext): void {
     command("presentation.resolveConflict", () => sync?.resolveConflict()),
     command("presentation.signIn", async () => {
       const meta = await readWorkspaceMeta();
-      if (await signIn(meta?.server ?? configuredServer())) { if (meta) await connect(false); }
+      const server = meta?.server ?? configuredServer();
+      const ok = (await getAccessToken(server)) ? await signIn(server) : await signInOrRegister(server);
+      if (ok && meta) await connect(false);
+    }),
+    command("presentation.register", async () => {
+      const meta = await readWorkspaceMeta();
+      const server = meta?.server ?? configuredServer();
+      if (await registerAccount(server) && meta) await connect(false);
     }),
     command("presentation.createProject", create), command("presentation.openProject", open),
     command("presentation.acceptInvitation", () => acceptInvitation()),
@@ -207,7 +248,7 @@ export function activate(context: vscode.ExtensionContext): void {
       const invite = await createShare(meta.server, meta.projectId, role as "viewer" | "editor");
       const link = invite.url ?? `${meta.server.replace(/\/$/, "")}/join#${encodeURIComponent(invite.token)}`;
       await vscode.env.clipboard.writeText(link);
-      void vscode.window.showInformationMessage("Invite link copied. The other person signs in, then runs Accept Invitation and pastes the link.");
+      void vscode.window.showInformationMessage("Invite link copied. They run Accept Invitation, paste the link, then enter a username and password.");
     })),
     command("presentation.projectMembers", () => workspaceAction(async (meta) => {
       const members = await listMembers(meta.server, meta.projectId);

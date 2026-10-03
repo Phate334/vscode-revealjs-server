@@ -237,18 +237,33 @@ export type LoginResult = {
   user: { id: string; username: string };
 };
 
-export async function login(
+async function postCredentials(
   server: string,
+  path: string,
   username: string,
   password: string,
+  failed: string,
 ): Promise<LoginResult> {
   const base = server.replace(/\/$/, "");
-  const response = await fetch(`${base}/api/auth/login`, {
+  const response = await fetch(`${base}${path}`, {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ username, password }),
   });
-  if (!response.ok) throw new Error(`Sign In failed (${response.status})`);
+  if (!response.ok) throw new Error(`${failed} (${response.status})`);
   return await response.json() as LoginResult;
+}
+
+export async function login(server: string, username: string, password: string): Promise<LoginResult> {
+  return postCredentials(server, "/api/auth/login", username, password, "Sign In failed");
+}
+
+export async function register(server: string, username: string, password: string): Promise<LoginResult> {
+  return postCredentials(server, "/api/auth/register", username, password, "Register failed");
+}
+
+/** New username registers; existing username logs in. Wrong password does not create an account. */
+export async function openSession(server: string, username: string, password: string): Promise<LoginResult> {
+  return postCredentials(server, "/api/auth/session", username, password, "Sign In failed");
 }
 
 export type ShareInvite = {

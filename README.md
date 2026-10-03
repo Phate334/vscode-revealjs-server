@@ -10,12 +10,12 @@ Collaborative Reveal.js presentations. The FastAPI server holds the shared works
 
 ## Start the server
 
-There are no built-in accounts. Set `AUTH_DEMO_USER` to one or more `username:password` pairs, separated by commas. Compose will not start without it.
+Compose starts with no accounts. Register the first user from VS Code. Optional `AUTH_DEMO_USER` (`username:password`, comma-separated) only seeds users that do not exist yet; passwords are stored as hashes.
 
 ```bash
 docker login ghcr.io   # if the package is private
 docker compose pull
-AUTH_DEMO_USER='ada:choose-a-password,bob:choose-another' docker compose up -d
+docker compose up -d
 ```
 
 Health check: `http://127.0.0.1:8000/health`
@@ -35,11 +35,11 @@ Or in VS Code: **Extensions → … → Install from VSIX…**
 ## Use it
 
 1. Set **presentation.serverUrl** (default `http://127.0.0.1:8000`).
-2. **Presentation: Create Presentation** or **Open Presentation**. Sign in with a username and password from `AUTH_DEMO_USER`. Open lists presentations you own and ones shared with you.
+2. **Presentation: Register** (or **Sign In**, then **Register** when there is no session). Username, then a masked password. **Create Presentation** or **Open Presentation** asks the same way. Open lists presentations you own and ones shared with you.
 3. Pick a parent directory and a new child-folder name. Existing folders are not overwritten.
 4. Edit local files. Text synchronizes through Yjs and is saved locally even with Auto Save off. **Disconnect** keeps local editing and saving.
 5. **Open Preview** opens a private, short-lived preview session.
-6. **Share Presentation** copies an invite link (`{server}/join#{token}`). The other person signs in with their own account, runs **Accept Invitation**, and pastes that link in the quick input. **Project Members** lists who has joined. Details: [account and invites](docs/account-invite.md).
+6. **Share Presentation** copies an invite link (`{server}/join#{token}`). The other person runs **Accept Invitation**, pastes the link, then enters a username and password: a new name registers and joins; an existing name signs in and joins. **Project Members** lists who has joined. Details: [account and invites](docs/account-invite.md).
 7. **Publish** freezes a public, immutable release and copies its link.
 8. **Resolve Conflict**, **Synchronization Details**, and **Retry Synchronization** cover preserved differences and queued work.
 

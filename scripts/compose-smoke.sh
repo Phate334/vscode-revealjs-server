@@ -2,7 +2,7 @@
 # Live smoke against compose-published port (AGENTS: no host uvicorn for live checks).
 # Covers: health, auth, JWT-gated projects/snapshot/assets/members, private preview sessions,
 # project-local runtime, chapter-relative rewrite, collaboration WS token gate,
-# share invite/accept, publish self-contained release + presentation slug.
+# share invite/accept, register-via-invite, publish self-contained release + presentation slug.
 # CRDT unsaved-edit visibility: real VS Code EDH only.
 set -euo pipefail
 BASE="${1:-http://127.0.0.1:8000}"
@@ -18,35 +18,14 @@ json_login() {
   python3 -c 'import json,sys; print(json.dumps({"username":sys.argv[1],"password":sys.argv[2]}))' "$1" "$2"
 }
 
-# Same AUTH_DEMO_USER the Compose server was started with. At least two
-# username:password pairs; there are no built-in accounts.
-: "${AUTH_DEMO_USER:?Set AUTH_DEMO_USER to the comma-separated username:password pairs the server was started with (at least two)}"
-eval "$(python3 - <<'PY'
-import os, shlex
-raw = os.environ["AUTH_DEMO_USER"]
-pairs = []
-for part in raw.split(","):
-    item = part.strip()
-    if not item:
-        continue
-    if ":" not in item:
-        raise SystemExit("AUTH_DEMO_USER entries must be username:password")
-    name, password = item.split(":", 1)
-    name = name.strip()
-    if not name or not password:
-        raise SystemExit("AUTH_DEMO_USER entries must be username:password")
-    pairs.append((name, password))
-if len(pairs) < 2:
-    raise SystemExit("AUTH_DEMO_USER needs at least two username:password pairs for smoke")
-for key, value in (
-    ("SMOKE_USER", pairs[0][0]),
-    ("SMOKE_PASS", pairs[0][1]),
-    ("SMOKE_GUEST", pairs[1][0]),
-    ("SMOKE_GUEST_PASS", pairs[1][1]),
-):
-    print(f"{key}={shlex.quote(value)}")
-PY
-)"
+# Empty server: first user registers. No AUTH_DEMO_USER required.
+STAMP="$(date +%s)"
+SMOKE_USER="smoke-${STAMP}"
+SMOKE_PASS="smoke-pass-${STAMP}"
+SMOKE_GUEST="guest-${STAMP}"
+SMOKE_GUEST_PASS="guest-pass-${STAMP}"
+SMOKE_JOIN="join-${STAMP}"
+SMOKE_JOIN_PASS="join-pass-${STAMP}"
 
 echo "=== compose smoke @ ${BASE} ==="
 
@@ -55,6 +34,13 @@ HEALTH="$(curl -sfS "${BASE}/health")" || fail "health"
 echo "${HEALTH}" | grep -q '"status":"ok"' || fail "health body: ${HEALTH}"
 pass "health"
 
+echo "POST /api/auth/register (${SMOKE_USER}) without a seed account"
+LOGIN="$(curl -sfS -X POST "${BASE}/api/auth/register" \
+  -H 'Content-Type: application/json' \
+  -d "$(json_login "${SMOKE_USER}" "${SMOKE_PASS}")")" || fail "auth register"
+CODE="$(curl -sS -o /dev/null -w '%{http_code}' -X POST "${BASE}/api/auth/register" \
+  -H 'Content-Type: application/json' -d "$(json_login "${SMOKE_USER}" "${SMOKE_PASS}")" || true)"
+[[ "${CODE}" == "409" ]] || fail "expected 409 duplicate register, got ${CODE}"
 echo "POST /api/auth/login (${SMOKE_USER})"
 LOGIN="$(curl -sfS -X POST "${BASE}/api/auth/login" \
   -H 'Content-Type: application/json' \
@@ -96,10 +82,10 @@ MEMBERS="$(curl -sfS "${BASE}/api/projects/${PID}/members" -H "$(auth_hdr)")" ||
 echo "${MEMBERS}" | grep -q "${ME_ID}" || fail "members missing owner: ${MEMBERS}"
 pass "list members"
 
-echo "guest is not a member until they accept an invite"
-GUEST_LOGIN="$(curl -sfS -X POST "${BASE}/api/auth/login" \
+echo "guest registers (not a member until they accept an invite)"
+GUEST_LOGIN="$(curl -sfS -X POST "${BASE}/api/auth/register" \
   -H 'Content-Type: application/json' \
-  -d "$(json_login "${SMOKE_GUEST}" "${SMOKE_GUEST_PASS}")")" || fail "guest login"
+  -d "$(json_login "${SMOKE_GUEST}" "${SMOKE_GUEST_PASS}")")" || fail "guest register"
 GUEST_ACCESS="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])' <<<"${GUEST_LOGIN}")"
 CODE="$(curl -sS -o /dev/null -w '%{http_code}' \
   "${BASE}/api/projects/${PID}" \
@@ -292,6 +278,26 @@ ACC="$(curl -sfS -X POST "${BASE}/api/invites/${TOKEN}/accept" \
   -d "{\"token\":\"${TOKEN}\"}")" || fail "accept share"
 echo "${ACC}" | grep -q '"role":"viewer"' || fail "accept role: ${ACC}"
 echo "${ACC}" | grep -q '"already_member":false' || fail "expected new member: ${ACC}"
+echo "register-via-invite: new username on /api/auth/session then accept"
+JOIN="$(curl -sfS -X POST "${BASE}/api/auth/session" \
+  -H 'Content-Type: application/json' \
+  -d "$(json_login "${SMOKE_JOIN}" "${SMOKE_JOIN_PASS}")")" || fail "session register"
+python3 -c 'import json,sys; d=json.load(sys.stdin); assert d.get("created") is True, d' <<<"${JOIN}" \
+  || fail "session did not create user: ${JOIN}"
+JOIN_ACCESS="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])' <<<"${JOIN}")"
+CODE="$(curl -sS -o /dev/null -w '%{http_code}' -X POST "${BASE}/api/auth/session" \
+  -H 'Content-Type: application/json' -d "$(json_login "${SMOKE_JOIN}" "wrong")" || true)"
+[[ "${CODE}" == "401" ]] || fail "expected 401 bad session password, got ${CODE}"
+AGAIN="$(curl -sfS -X POST "${BASE}/api/auth/session" \
+  -H 'Content-Type: application/json' \
+  -d "$(json_login "${SMOKE_JOIN}" "${SMOKE_JOIN_PASS}")")" || fail "session login"
+python3 -c 'import json,sys; d=json.load(sys.stdin); assert d.get("created") is False, d' <<<"${AGAIN}" \
+  || fail "existing session created a user: ${AGAIN}"
+JOINED="$(curl -sfS -X POST "${BASE}/api/invites/${TOKEN}/accept" \
+  -H 'Content-Type: application/json' -H "Authorization: Bearer ${JOIN_ACCESS}" \
+  -d "{\"token\":\"${TOKEN}\"}")" || fail "join accept"
+echo "${JOINED}" | grep -q '"role":"viewer"' || fail "join role: ${JOINED}"
+echo "${JOINED}" | grep -q '"already_member":false' || fail "expected join new member: ${JOINED}"
 OWN="$(curl -sfS -X POST "${BASE}/api/invites/${TOKEN}/accept" \
   -H 'Content-Type: application/json' -H "$(auth_hdr)" \
   -d "{\"token\":\"${TOKEN}\"}")" || fail "owner accept"

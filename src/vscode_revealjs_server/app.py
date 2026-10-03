@@ -74,10 +74,36 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.post("/api/auth/register", status_code=201)
+def auth_register(body: LoginBody) -> dict:
+    """Create an account. Does not overwrite an existing username."""
+    try:
+        return auth_service.register(body.username, body.password)
+    except auth_service.UserExists:
+        raise HTTPException(status_code=409, detail="username already registered")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
 @app.post("/api/auth/login")
 def auth_login(body: LoginBody) -> dict:
-    """Sign in with a user seeded by AUTH_DEMO_USER. No built-in accounts."""
-    got = auth_service.login(body.username, body.password)
+    """Sign in. Unknown username and wrong password are both 401."""
+    try:
+        got = auth_service.login(body.username, body.password)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    if got is None:
+        raise HTTPException(status_code=401, detail="invalid credentials")
+    return got
+
+
+@app.post("/api/auth/session")
+def auth_session(body: LoginBody) -> dict:
+    """Accept-invitation credentials: register a new username, or log in an existing one."""
+    try:
+        got = auth_service.open_session(body.username, body.password)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     if got is None:
         raise HTTPException(status_code=401, detail="invalid credentials")
     return got
@@ -277,7 +303,7 @@ def join_hint() -> HTMLResponse:
     return HTMLResponse(
         "<!doctype html><meta charset=utf-8><title>Join presentation</title>"
         "<p>In VS Code, run <strong>Presentation: Accept Invitation</strong> and paste this link. "
-        "Sign in with your existing account. This page does not create an account.</p>"
+        "Enter a username and password there: a new name creates an account and joins.</p>"
     )
 
 

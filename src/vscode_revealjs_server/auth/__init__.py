@@ -1,1 +1,1 @@
-"""Auth Service stub (M3): login / refresh / me with HS256 JWT."""
+"""Accounts: register, login, refresh. Passwords are PBKDF2 hashes on disk."""
