@@ -8,4 +8,4 @@ Set `presentation.serverUrl` (default `http://127.0.0.1:8000`). **Presentation: 
 
 Create and Open always make a new child folder under the parent you pick. **Disconnect** keeps local editing and saving. **Open Preview** is a private ten-minute session. **Publish** copies a public release link. The status bar shows Synced, Syncing, Offline, or Conflict.
 
-Keep `.presentation/`. Git metadata, VS Code preferences, and `node_modules/` are not synchronized. Server and extension both need protocol v2 (stable release `0.1.2`).
+Keep `.presentation/`. Git metadata, VS Code preferences, and `node_modules/` are not synchronized. Server and extension both need protocol v2 (stable release `0.1.3`).

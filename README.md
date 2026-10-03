@@ -27,7 +27,7 @@ The image is `ghcr.io/phate334/vscode-revealjs-server:<version>` (stable tags al
 Download `vscode-revealjs-collaboration-*.vsix` from the [latest release](https://github.com/Phate334/vscode-revealjs-server/releases), then install it:
 
 ```bash
-code --install-extension path/to/vscode-revealjs-collaboration-0.1.2.vsix
+code --install-extension path/to/vscode-revealjs-collaboration-0.1.3.vsix
 ```
 
 Or in VS Code: **Extensions → … → Install from VSIX…**

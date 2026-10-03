@@ -61,4 +61,4 @@ Account invites use `POST /api/account-invites` and `POST /api/account-invites/{
 
 ## Versioning
 
-Canonical package version is `pyproject.toml` (currently `0.1.2`). Compose and the VS Code extension manifest use the same stable `X.Y.Z`. Tag `v0.1.2` publishes the VSIX and image tags `0.1.2` and `latest`. RC builds (when used) keep the `rcN` suffix in tags/filenames, use `--pre-release`, and must not move stable `latest`. See `AGENTS.md` for release rules.
+Canonical package version is `pyproject.toml` (currently `0.1.3`). Compose and the VS Code extension manifest use the same stable `X.Y.Z`. Tag `v0.1.3` publishes the VSIX and image tags `0.1.3` and `latest`. RC builds (when used) keep the `rcN` suffix in tags/filenames, use `--pre-release`, and must not move stable `latest`. See `AGENTS.md` for release rules.
