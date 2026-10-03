@@ -249,7 +249,17 @@ async function postCredentials(
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ username, password }),
   });
-  if (!response.ok) throw new Error(`${failed} (${response.status})`);
+  if (!response.ok) {
+    let detail = "";
+    try {
+      const body = await response.json() as { detail?: unknown };
+      if (typeof body.detail === "string") detail = body.detail;
+    } catch { /* status is enough */ }
+    if (response.status === 403 && path === "/api/auth/register") {
+      throw new Error("Registration is closed. Use an account invite (Presentation: Accept Invitation).");
+    }
+    throw new Error(detail ? `${failed} (${response.status}): ${detail}` : `${failed} (${response.status})`);
+  }
   return await response.json() as LoginResult;
 }
 
@@ -288,6 +298,20 @@ export async function registerWithInvite(server: string, token: string, username
 
 export async function previewAccountInvite(server: string, token: string): Promise<{ valid: boolean }> {
   return httpJson(`${server.replace(/\/$/, "")}/api/account-invites/${encodeURIComponent(token)}`);
+}
+
+export type ProjectInvite = { project_id: string; name: string; role: string; url: string };
+
+/** Owner-only. URL is `{origin}/open#{token}` and adds an editor when accepted. */
+export async function createProjectInvite(server: string, projectId: string): Promise<ProjectInvite> {
+  const base = server.replace(/\/$/, "");
+  return httpJson<ProjectInvite>(`${base}/api/projects/${encodeURIComponent(projectId)}/invites`, { method: "POST" });
+}
+
+/** Idempotent. Returns the project, including when the caller is already owner or editor. */
+export async function acceptProjectInvite(server: string, token: string): Promise<ProjectInfo> {
+  const base = server.replace(/\/$/, "");
+  return httpJson<ProjectInfo>(`${base}/api/project-invites/${encodeURIComponent(token)}/accept`, { method: "POST" });
 }
 
 /** Invite link, legacy JSON `{server, token}`, or a bare token (uses fallbackServer). */
@@ -373,27 +397,18 @@ export async function sendOperations(server: string, projectId: string, base: nu
   return body;
 }
 
-export async function getProject(server: string, projectId: string): Promise<ProjectInfo> {
-  const base = server.replace(/\/$/, "");
-  return httpJson<ProjectInfo>(`${base}/api/projects/${encodeURIComponent(projectId)}`);
-}
-
-/** `{origin}/open#{projectId}`, or a bare project id (uses fallbackServer). */
-export function parsePresentationLink(input: string, fallbackServer: string): { server: string; projectId: string } {
+/** `{origin}/open#{token}`, `?token=`, or a bare invite token (uses fallbackServer). */
+export function parsePresentationLink(input: string, fallbackServer: string): { server: string; token: string } {
   const raw = input.trim();
   if (!raw) throw new Error("Presentation link required");
-  const idFrom = (value: string) => {
-    const projectId = value.trim();
-    if (!/^prj_[0-9a-f]+$/i.test(projectId)) throw new Error("Presentation link is missing a project id");
-    return projectId;
-  };
   if (/^[a-z][a-z0-9+.-]*:\/\//i.test(raw)) {
     const url = new URL(raw);
     const fromHash = url.hash.length > 1 ? decodeURIComponent(url.hash.slice(1)) : "";
-    const projectId = idFrom(fromHash || url.searchParams.get("project") || "");
-    return { server: normalizeServer(url.origin), projectId };
+    const token = (fromHash || url.searchParams.get("token") || "").trim();
+    if (!token) throw new Error("Presentation link is missing a token");
+    return { server: normalizeServer(url.origin), token };
   }
-  return { server: normalizeServer(fallbackServer), projectId: idFrom(raw) };
+  return { server: normalizeServer(fallbackServer), token: raw };
 }
 
 export async function previewSession(server: string, projectId: string): Promise<{ url: string; expires_at: number }> {

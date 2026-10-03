@@ -29,7 +29,7 @@ Single-node PoC ceilings remain: local filesystem storage, process-local locks, 
 
 ## Onboarding and authentication
 
-Create and Open both select a parent, exclusively reserve a new child directory, download the snapshot and write workspace metadata last. Existing children are refused. Open Presentation lists owned projects and existing members, and can open `{origin}/open#{project_id}`. Any signed-in user who opens that project can edit. An account invite only registers a user.
+Create and Open both select a parent, exclusively reserve a new child directory, download the snapshot and write workspace metadata last. Existing children are refused. Open Presentation lists owned projects and projects shared with you, and can open `{origin}/open#{invite_token}`. That link adds the signed-in user as an editor. An account invite only registers a user. A project id alone is not access.
 
 `presentation.serverUrl` is the server origin for new actions. Existing workspaces use their recorded origin. Sessions and refresh operations are isolated by origin; commands sign in and resume the original action when needed.
 
@@ -61,4 +61,4 @@ Account invites use `POST /api/account-invites` and `POST /api/account-invites/{
 
 ## Versioning
 
-Canonical package version is `pyproject.toml` (currently `0.1.3`). Compose and the VS Code extension manifest use the same stable `X.Y.Z`. Tag `v0.1.3` publishes the VSIX and image tags `0.1.3` and `latest`. RC builds (when used) keep the `rcN` suffix in tags/filenames, use `--pre-release`, and must not move stable `latest`. See `AGENTS.md` for release rules.
+Canonical package version is `pyproject.toml` (currently `0.1.4rc1`). Compose image tags use that full version. The VS Code manifest uses numeric `0.1.4`; RC VSIX filenames keep the `rcN` suffix. Tag `v0.1.3` published the VSIX and image tags `0.1.3` and `latest`. RC builds keep the `rcN` suffix in tags/filenames, use `--pre-release`, and must not move stable `latest`. See `AGENTS.md` for release rules.

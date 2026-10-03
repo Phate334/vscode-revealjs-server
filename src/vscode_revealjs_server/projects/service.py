@@ -8,10 +8,12 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
 import threading
 import json
 import os
 import re
+import secrets
 import shutil
 import uuid
 from datetime import datetime, timezone
@@ -225,7 +227,7 @@ class ProjectService:
         user_id: str | None = None,
         scope: str | None = None,
     ) -> list[dict[str, Any]]:
-        """List projects; when user_id set, only membership (or legacy open) projects.
+        """List projects the user owns or is a member of.
 
         scope: None/all, "owned" (owner_id == user), "shared" (member, not owner).
         """
@@ -718,19 +720,18 @@ class ProjectService:
 
     @staticmethod
     def _role_in_meta(meta: dict[str, Any], user_id: str) -> str | None:
-        """Role for user, or None if not a member.
-
-        ponytail: pre-M3 meta without members → any authenticated caller is editor.
-        """
+        """Owner (including legacy owner_id) or editor. Anyone else is not a member."""
+        owner = meta.get("owner_id")
+        if isinstance(owner, str) and owner == user_id:
+            return ROLE_OWNER
         members = meta.get("members")
-        if members is None:
-            return ROLE_EDITOR
         if not isinstance(members, list):
             return None
         for row in members:
             if isinstance(row, dict) and row.get("user_id") == user_id:
                 role = row.get("role")
-                return role if isinstance(role, str) else None
+                if role in (ROLE_OWNER, ROLE_EDITOR):
+                    return role
         return None
 
     def member_role(self, project_id: str, user_id: str) -> str | None:
@@ -740,16 +741,93 @@ class ProjectService:
         return self._role_in_meta(meta, user_id)
 
     def can_read(self, project_id: str, user_id: str) -> bool:
-        """Any authenticated caller who knows the project. Membership is not required.
-
-        user_id is unused; callers must already have authenticated.
-        """
-        del user_id
-        return self._read_meta(project_id) is not None
+        return self.member_role(project_id, user_id) in (ROLE_OWNER, ROLE_EDITOR)
 
     def can_write(self, project_id: str, user_id: str) -> bool:
-        """Opening the project is enough to edit."""
+        """Owner and editor can edit. Not a member cannot."""
         return self.can_read(project_id, user_id)
+
+    def is_owner(self, project_id: str, user_id: str) -> bool:
+        return self.member_role(project_id, user_id) == ROLE_OWNER
+
+    def create_project_invite(self, project_id: str, created_by: str) -> dict[str, str]:
+        """Reusable editor invite. Raw token is returned once; only its hash is stored.
+
+        ponytail: no expiry, same as account invites. revoked_at is stored but there is
+        no revoke API until account invites have one.
+        """
+        token = secrets.token_urlsafe(24)
+        row: dict[str, Any] = {
+            "token_hash": hashlib.sha256(token.encode("utf-8")).hexdigest(),
+            "project_id": project_id,
+            "role": ROLE_EDITOR,
+            "created_by": created_by,
+            "created_at": _now(),
+            "expires_at": None,
+            "revoked_at": None,
+        }
+        with self._mut:
+            meta = self._read_meta(project_id)
+            if meta is None:
+                raise FsRejected("project not found")
+            invites = meta.get("project_invites")
+            if not isinstance(invites, list):
+                invites = []
+                meta["project_invites"] = invites
+            invites.append(row)
+            self._write_meta(meta)
+        return {"token": token, "role": ROLE_EDITOR, "project_id": project_id}
+
+    def accept_project_invite(self, token: str, user_id: str, username: str) -> dict[str, Any] | None:
+        """Add the signed-in user as editor. Idempotent. Does not downgrade an owner.
+
+        Returns None when the token is unknown or revoked.
+        """
+        token = (token or "").strip()
+        if not token or not user_id or not username:
+            return None
+        digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        with self._mut:
+            found = self._find_invite_unlocked(digest)
+            if found is None:
+                return None
+            meta, invite = found
+            if invite.get("revoked_at"):
+                return None
+            role = self._grant_editor_unlocked(meta, user_id, username)
+            public = self._public(meta, user_id=user_id)
+            public["role"] = role
+            return public
+
+    def _find_invite_unlocked(self, digest: str) -> tuple[dict[str, Any], dict[str, Any]] | None:
+        if not self.root.is_dir():
+            return None
+        for child in self.root.iterdir():
+            if not child.is_dir():
+                continue
+            meta = self._read_meta(child.name)
+            if not meta:
+                continue
+            invites = meta.get("project_invites")
+            if not isinstance(invites, list):
+                continue
+            for row in invites:
+                stored = row.get("token_hash") if isinstance(row, dict) else None
+                if isinstance(stored, str) and len(stored) == len(digest) and hmac.compare_digest(stored, digest):
+                    return meta, row
+        return None
+
+    def _grant_editor_unlocked(self, meta: dict[str, Any], user_id: str, username: str) -> str:
+        existing = self._role_in_meta(meta, user_id)
+        if existing in (ROLE_OWNER, ROLE_EDITOR):
+            return existing
+        members = meta.get("members")
+        if not isinstance(members, list):
+            members = []
+            meta["members"] = members
+        members.append({"user_id": user_id, "username": username, "role": ROLE_EDITOR})
+        self._write_meta(meta)
+        return ROLE_EDITOR
 
     def list_members(self, project_id: str) -> list[dict[str, str]] | None:
         meta = self._read_meta(project_id)

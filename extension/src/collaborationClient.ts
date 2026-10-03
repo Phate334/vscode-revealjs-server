@@ -1,7 +1,7 @@
 import * as Y from "yjs";
 import { REMOTE_SYNC } from "./origins";
 
-export type CollabStatus = "offline" | "connecting" | "syncing" | "connected";
+export type CollabStatus = "offline" | "connecting" | "syncing" | "connected" | "auth-required" | "forbidden";
 export type FsOperation = {
   id: string;
   kind: "create" | "delete" | "rename" | "move" | "mkdir" | "write";
@@ -34,6 +34,8 @@ export class CollaborationClient {
   private ws?: WebSocket;
   private status: CollabStatus = "offline";
   private intentionalClose = false;
+  /** Auth and membership failures must not retry. Cleared by an explicit connect(). */
+  private stopRetry = false;
   private reconnectAttempt = 0;
   private reconnectTimer?: ReturnType<typeof setTimeout>;
   private awaitingSnapshot = false;
@@ -72,11 +74,18 @@ export class CollaborationClient {
 
   async connect(): Promise<void> {
     this.intentionalClose = false;
+    this.stopRetry = false;
     if (this.ws || this.status === "connecting") return;
     this.setStatus("connecting");
     try {
       const url = await this.socketUrl();
       if (this.intentionalClose) return;
+      if (!/[?&]access_token=/.test(url)) {
+        this.stopRetry = true;
+        this.setStatus("auth-required");
+        this.onError?.(new Error("Sign in required"));
+        return;
+      }
       const ws = new WebSocket(url);
       this.ws = ws;
       ws.binaryType = "arraybuffer";
@@ -113,20 +122,31 @@ export class CollaborationClient {
         } catch (error) { this.onError?.(error); this.disconnect(); }
       };
       ws.onerror = () => { /* onclose schedules retry; URLs may contain credentials. */ };
-      ws.onclose = () => {
+      ws.onclose = (event) => {
         if (this.ws !== ws) return;
         this.ws = undefined;
         this.readyFlushed = false;
         this.awaitingSnapshot = false;
         for (const barrier of this.barriers.values()) barrier.reject(new Error("Connection closed"));
         this.barriers.clear();
+        if (event.code === 4401 || event.code === 4403) {
+          this.stopRetry = true;
+          this.setStatus(event.code === 4401 ? "auth-required" : "forbidden");
+          this.onError?.(new Error(event.code === 4401
+            ? "Sign in required"
+            : "You do not have access to this presentation"));
+          return;
+        }
         this.setStatus("offline");
         this.scheduleReconnect();
       };
     } catch (error) {
-      this.setStatus("offline");
+      const message = error instanceof Error ? error.message : String(error);
+      const auth = /sign in required/i.test(message);
+      if (auth) this.stopRetry = true;
+      this.setStatus(auth ? "auth-required" : "offline");
       this.onError?.(error);
-      this.scheduleReconnect();
+      if (!auth) this.scheduleReconnect();
     }
   }
 
@@ -154,7 +174,7 @@ export class CollaborationClient {
   }
 
   private scheduleReconnect(): void {
-    if (this.intentionalClose || this.reconnectTimer) return;
+    if (this.intentionalClose || this.stopRetry || this.reconnectTimer) return;
     const delay = BACKOFF_MS[Math.min(this.reconnectAttempt++, BACKOFF_MS.length - 1)];
     this.reconnectTimer = setTimeout(() => { this.reconnectTimer = undefined; void this.connect(); }, delay);
   }

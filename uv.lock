@@ -411,7 +411,7 @@ wheels = [
 
 [[package]]
 name = "vscode-revealjs-server"
-version = "0.1.3"
+version = "0.1.4rc1"
 source = { editable = "." }
 dependencies = [
     { name = "fastapi" },

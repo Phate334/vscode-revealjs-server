@@ -52,7 +52,12 @@ export class SyncController {
     client.onRemoteStructure = () => this.reconcileFromServer("remote change");
     client.onStatus = (value) => {
       this.online = value === "connected";
-      this.showStatus(value === "connected" ? "Syncing…" : value === "offline" ? "Offline · Local changes saved" : "Syncing…");
+      const label = value === "auth-required" ? "Sign in required"
+        : value === "forbidden" ? "No access"
+        : value === "connected" ? "Syncing…"
+        : value === "offline" ? "Offline · Local changes saved"
+        : "Syncing…";
+      this.showStatus(label);
     };
     client.onError = (error) => this.report(error);
     client.onReplacedText = (rel, content) => {
@@ -82,7 +87,13 @@ export class SyncController {
     atomicWrite(this.conflictPath, JSON.stringify([...this.conflicts]));
   }
   private report(error: unknown): void {
-    this.output.appendLine(String(error));
+    const text = error instanceof Error ? error.message : String(error);
+    this.output.appendLine(text);
+    if (text === "Sign in required" || text === "You do not have access to this presentation") {
+      this.showStatus(text === "Sign in required" ? "Sign in required" : "No access");
+      void vscode.window.showWarningMessage(text);
+      return;
+    }
     this.showStatus(this.online ? "Sync interrupted" : "Offline · Local changes saved");
   }
   private enqueue(action: () => Promise<void>): Promise<void> {

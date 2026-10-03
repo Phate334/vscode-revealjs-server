@@ -29,6 +29,13 @@ class UserExists(Exception):
     """Register called for a username that is already stored."""
 
 
+class RegistrationClosed(Exception):
+    """Direct register is only for the first account."""
+
+
+_MIN_PASSWORD = 8
+
+
 def _users_path() -> Path:
     explicit = os.environ.get("AUTH_USERS_PATH", "").strip()
     if explicit:
@@ -79,6 +86,11 @@ def _check(username: str, password: str) -> tuple[str, str]:
     if not isinstance(password, str) or not password or len(password) > 200:
         raise ValueError("invalid password")
     return name, password
+
+
+def _check_new_password(password: str) -> None:
+    if len(password) < _MIN_PASSWORD:
+        raise ValueError("password must be at least 8 characters")
 
 
 def _load() -> dict[str, dict[str, str]]:
@@ -167,10 +179,16 @@ def _tokens(name: str, row: dict[str, str], *, created: bool | None = None) -> d
 
 
 def register(username: str, password: str) -> dict[str, Any]:
-    """Create a user. Raises UserExists if the username is taken."""
+    """Create the first account. Later accounts use an invite.
+
+    Raises RegistrationClosed when any user already exists, UserExists if the name is taken.
+    """
     name, password = _check(username, password)
+    _check_new_password(password)
     with _LOCK:
         users = _load()
+        if users:
+            raise RegistrationClosed()
         if name in users:
             raise UserExists(name)
         row = _insert(name, password)
@@ -221,6 +239,7 @@ def register_with_invite(token: str, username: str, password: str) -> dict[str, 
     The invite stays valid so the same link can register more than one account.
     """
     name, password = _check(username, password)
+    _check_new_password(password)
     token = (token or "").strip()
     with _LOCK:
         if not token or not any(row["token"] == token for row in _load_invites()):

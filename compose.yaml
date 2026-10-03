@@ -1,7 +1,7 @@
 services:
   server:
     # Keep tag in sync with pyproject.toml [project].version (see AGENTS.md Releases).
-    image: ghcr.io/phate334/vscode-revealjs-server:0.1.3
+    image: ghcr.io/phate334/vscode-revealjs-server:0.1.4rc1
     ports:
       - "8000:8000"
     volumes:

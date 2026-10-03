@@ -24,9 +24,24 @@ def _b64url_decode(data: str) -> bytes:
     return base64.urlsafe_b64decode(data + pad)
 
 
+_DEV_JWT_SECRET = "ponytail-dev-jwt-secret-change-me"
+
+
 def jwt_secret() -> str:
     # ponytail: env override for compose; default is local-dev only.
-    return os.environ.get("AUTH_JWT_SECRET", "ponytail-dev-jwt-secret-change-me")
+    return os.environ.get("AUTH_JWT_SECRET", _DEV_JWT_SECRET)
+
+
+def refuse_default_secret_in_production() -> None:
+    """Production must not boot with the dev JWT secret. Local/compose leave ENV unset."""
+    mode = (os.environ.get("ENV") or os.environ.get("ENVIRONMENT") or "").strip().lower()
+    if mode not in {"production", "prod"}:
+        return
+    secret = os.environ.get("AUTH_JWT_SECRET", "")
+    if not secret.strip() or secret == _DEV_JWT_SECRET:
+        raise RuntimeError(
+            "AUTH_JWT_SECRET must be set to a non-default value when ENV=production"
+        )
 
 
 def encode_jwt(payload: dict[str, Any], *, secret: str | None = None) -> str:

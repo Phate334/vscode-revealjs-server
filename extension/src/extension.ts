@@ -5,8 +5,8 @@ import { CollaborationClient } from "./collaborationClient";
 import { bindCollaborativeDocuments, type DocumentsBinding } from "./documentBinding";
 import { clearSession, getAccessToken, initAuth, saveSession } from "./auth";
 import {
-  collabWsUrl, configuredServer, createAccountInvite, createProject, getProject, parseInviteInput,
-  parsePresentationLink, previewAccountInvite, registerWithInvite,
+  collabWsUrl, configuredServer, createAccountInvite, createProject, parseInviteInput,
+  parsePresentationLink, previewAccountInvite, registerWithInvite, acceptProjectInvite, createProjectInvite,
   extractSnapshot, fetchSnapshot, listMembers, listProjects, login, register,
   publishRelease, readWorkspaceMeta, writeWorkspaceMeta, type ProjectInfo, type WorkspaceMeta,
 } from "./projectClient";
@@ -28,10 +28,14 @@ function setStatus(status: string): void {
   statusItem.show();
 }
 
-async function promptCredentials(title: string, server: string): Promise<{ username: string; password: string } | undefined> {
+async function promptCredentials(title: string, server: string, minPassword = 1): Promise<{ username: string; password: string } | undefined> {
   const username = await vscode.window.showInputBox({ title, prompt: `Username · ${server}`, ignoreFocusOut: true });
   if (!username?.trim()) return undefined;
-  const password = await vscode.window.showInputBox({ title, prompt: "Password", password: true, ignoreFocusOut: true });
+  const password = await vscode.window.showInputBox({
+    title, prompt: minPassword > 1 ? `Password (at least ${minPassword} characters)` : "Password",
+    password: true, ignoreFocusOut: true,
+    validateInput: (value) => value.length >= minPassword ? undefined : `Password must be at least ${minPassword} characters`,
+  });
   if (!password) return undefined;
   return { username: username.trim(), password };
 }
@@ -48,7 +52,7 @@ async function signIn(server: string): Promise<boolean> {
 }
 
 async function registerAccount(server: string): Promise<boolean> {
-  const creds = await promptCredentials("Presentation: Register", server);
+  const creds = await promptCredentials("Presentation: Register", server, 8);
   if (!creds) return false;
   await storeLogin(server, await register(server, creds.username, creds.password));
   return true;
@@ -76,13 +80,13 @@ async function connect(interactive = true): Promise<void> {
   const meta = await readWorkspaceMeta();
   const folder = vscode.workspace.workspaceFolders?.[0]?.uri;
   if (!meta || !folder) throw new Error("Open a presentation workspace first");
-  if (client) {
-    if (interactive && !(await requireSession(meta.server))) return;
-    await client.connect(); return;
+  if (!(await getAccessToken(meta.server))) {
+    setStatus("Sign in required");
+    if (!interactive || !(await signInOrRegister(meta.server))) return;
   }
+  if (client) { await client.connect(); return; }
   connecting = true;
   try {
-    if (interactive && !(await requireSession(meta.server))) return;
     if (!loadState(folder, meta)) {
       // Migration preserves every local file. Differing text is kept in recovery, not treated as server-wins.
       const snap = await fetchSnapshot(meta.server, meta.projectId);
@@ -186,13 +190,14 @@ async function openFromLink(server = configuredServer()): Promise<void> {
   const input = await vscode.window.showInputBox({
     title: "Presentation: Open Presentation",
     prompt: "Paste presentation link",
-    placeHolder: "http://host/open#prj_…",
+    placeHolder: "http://host/open#…",
     ignoreFocusOut: true,
   });
   if (!input) return;
   const parsed = parsePresentationLink(input, server);
   if (!(await requireSession(parsed.server))) return;
-  await downloadProject(parsed.server, await getProject(parsed.server, parsed.projectId));
+  const project = await acceptProjectInvite(parsed.server, parsed.token);
+  await downloadProject(parsed.server, project);
 }
 
 async function acceptInvitation(server = configuredServer()): Promise<void> {
@@ -210,7 +215,7 @@ async function acceptInvitation(server = configuredServer()): Promise<void> {
     void vscode.window.showInformationMessage("This link only creates an account. You are already signed in.");
     return;
   }
-  const creds = await promptCredentials("Presentation: Accept Invitation", server);
+  const creds = await promptCredentials("Presentation: Accept Invitation", server, 8);
   if (!creds) return;
   await storeLogin(server, await registerWithInvite(server, parsed.token, creds.username, creds.password));
   void vscode.window.showInformationMessage("Account created and signed in.");
@@ -280,9 +285,9 @@ export function activate(context: vscode.ExtensionContext): void {
     command("presentation.acceptInvitation", () => acceptInvitation()),
     command("presentation.shareProject", () => createInviteLink()),
     command("presentation.copyLink", () => workspaceAction(async (meta) => {
-      const link = `${meta.server.replace(/\/$/, "")}/open#${encodeURIComponent(meta.projectId)}`;
-      await vscode.env.clipboard.writeText(link);
-      void vscode.window.showInformationMessage("Presentation link copied. Anyone signed in can open it and edit.");
+      const invite = await createProjectInvite(meta.server, meta.projectId);
+      await vscode.env.clipboard.writeText(invite.url);
+      void vscode.window.showInformationMessage("Presentation link copied. They sign in, then Open from link… to join as an editor.");
     })),
     command("presentation.projectMembers", () => workspaceAction(async (meta) => {
       const members = await listMembers(meta.server, meta.projectId);

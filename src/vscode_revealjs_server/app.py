@@ -9,7 +9,11 @@ from pydantic import BaseModel, Field
 
 from vscode_revealjs_server.auth import service as auth_service
 from vscode_revealjs_server.auth.deps import require_user, user_from_websocket
-from vscode_revealjs_server.auth.tokens import encode_jwt, decode_jwt
+from vscode_revealjs_server.auth.tokens import (
+    decode_jwt,
+    encode_jwt,
+    refuse_default_secret_in_production,
+)
 from vscode_revealjs_server.collaboration.manager import manager
 from vscode_revealjs_server.presentation import preview as preview_service
 from vscode_revealjs_server.presentation.publish import publish as publish_release
@@ -52,15 +56,26 @@ class RefreshBody(BaseModel):
 
 
 def _forbid_unless_member(project_id: str, user_id: str) -> None:
-    """Any signed-in user. Membership is not required; unknown projects are 404."""
-    del user_id
+    """Member (owner or editor). Missing project is 404; everyone else is 403."""
     if project_service.get(project_id) is None:
         raise HTTPException(status_code=404, detail="project not found")
+    if not project_service.can_read(project_id, user_id):
+        raise HTTPException(status_code=403, detail="not a project member")
 
 
 def _forbid_unless_writer(project_id: str, user_id: str) -> None:
-    """Edit does not require a member role."""
+    """Owner and editor may write."""
     _forbid_unless_member(project_id, user_id)
+    if not project_service.can_write(project_id, user_id):
+        raise HTTPException(status_code=403, detail="not a project member")
+
+
+def _forbid_unless_owner(project_id: str, user_id: str) -> None:
+    """Share and publish. Missing project is 404."""
+    if project_service.get(project_id) is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    if not project_service.is_owner(project_id, user_id):
+        raise HTTPException(status_code=403, detail="only the owner can do that")
 
 
 @app.get("/health")
@@ -70,9 +85,11 @@ def health() -> dict[str, str]:
 
 @app.post("/api/auth/register", status_code=201)
 def auth_register(body: LoginBody) -> dict:
-    """Create an account. Does not overwrite an existing username."""
+    """Create the first account only. Later accounts use an account invite."""
     try:
         return auth_service.register(body.username, body.password)
+    except auth_service.RegistrationClosed:
+        raise HTTPException(status_code=403, detail="registration is closed")
     except auth_service.UserExists:
         raise HTTPException(status_code=409, detail="username already registered")
     except ValueError as e:
@@ -268,6 +285,10 @@ async def collaboration_ws(
         await websocket.accept()
         await websocket.close(code=4404, reason="project not found")
         return
+    if not project_service.can_read(project_id, user["id"]):
+        await websocket.accept()
+        await websocket.close(code=4403, reason="not a project member")
+        return
     can_write = project_service.can_write(project_id, user["id"])
     await manager.handle(websocket, project_id, user_id=user["id"], can_write=can_write)
 
@@ -279,9 +300,10 @@ def _invite_url(request: Request, token: str) -> str:
     return f"{base}/join#{quote(token, safe='')}"
 
 
-def _presentation_url(request: Request, project_id: str) -> str:
+def _presentation_url(request: Request, token: str) -> str:
+    """Presentation invite. Token stays in the fragment so a browser does not send it."""
     base = str(request.base_url).rstrip("/")
-    return f"{base}/open#{quote(project_id, safe='')}"
+    return f"{base}/open#{quote(token, safe='')}"
 
 
 @app.get("/join", response_class=HTMLResponse)
@@ -302,7 +324,7 @@ def open_hint() -> HTMLResponse:
         "<!doctype html><meta charset=utf-8><title>Open presentation</title>"
         "<p>In VS Code, run <strong>Presentation: Open Presentation</strong>, choose "
         "<strong>Open from link…</strong>, and paste this link. "
-        "Sign in first. Any signed-in user can edit.</p>"
+        "Sign in first. The link adds you as an editor.</p>"
     )
 
 
@@ -340,17 +362,48 @@ def register_account_invite(token: str, body: LoginBody) -> dict:
     return got
 
 
+def _mint_presentation_link(project_id: str, request: Request, user: dict[str, str]) -> dict:
+    """Owner mints a reusable editor invite. The URL carries the token, not the project id."""
+    _forbid_unless_owner(project_id, user["id"])
+    minted = project_service.create_project_invite(project_id, created_by=user["id"])
+    meta = project_service.get(project_id)
+    assert meta is not None
+    return {
+        "project_id": project_id,
+        "name": meta["name"],
+        "role": minted["role"],
+        "url": _presentation_url(request, minted["token"]),
+    }
+
+
+@app.post("/api/projects/{project_id}/invites", status_code=201)
+def post_project_invite(
+    project_id: str,
+    request: Request,
+    user: Annotated[dict[str, str], Depends(require_user)],
+) -> dict:
+    return _mint_presentation_link(project_id, request, user)
+
+
 @app.get("/api/projects/{project_id}/link")
 def get_project_link(
     project_id: str,
     request: Request,
     user: Annotated[dict[str, str], Depends(require_user)],
 ) -> dict:
-    """Link any signed-in user can open and edit. Does not add members."""
-    _forbid_unless_member(project_id, user["id"])
-    meta = project_service.get(project_id)
-    assert meta is not None
-    return {"project_id": project_id, "name": meta["name"], "url": _presentation_url(request, project_id)}
+    return _mint_presentation_link(project_id, request, user)
+
+
+@app.post("/api/project-invites/{token}/accept")
+def accept_project_invite(
+    token: str,
+    user: Annotated[dict[str, str], Depends(require_user)],
+) -> dict:
+    """Signed-in user becomes an editor. Idempotent; an owner is not downgraded."""
+    got = project_service.accept_project_invite(token, user["id"], user["username"])
+    if got is None:
+        raise HTTPException(status_code=404, detail="invite not found")
+    return got
 
 
 @app.post("/api/projects/{project_id}/publish")
@@ -358,8 +411,8 @@ def post_publish(
     project_id: str,
     user: Annotated[dict[str, str], Depends(require_user)],
 ) -> dict:
-    """Publish command: snapshot collaborative state into an immutable release."""
-    _forbid_unless_writer(project_id, user["id"])
+    """Publish command: snapshot collaborative state into an immutable release. Owner only."""
+    _forbid_unless_owner(project_id, user["id"])
     try:
         return publish_release(project_id)
     except FsRejected as e:
@@ -477,6 +530,9 @@ def _preview_auth(project_id: str, request: Request, token: str | None = None) -
         raise HTTPException(status_code=401, detail="preview session expired or invalid") from exc
     if project_service.get(project_id) is None:
         raise HTTPException(status_code=404, detail="project not found")
+    sub = claims.get("sub")
+    if not isinstance(sub, str) or not project_service.can_read(project_id, sub):
+        raise HTTPException(status_code=403, detail="not a project member")
     return claims
 
 
@@ -546,3 +602,5 @@ def preview_path(project_id: str, preview_path: str, request: Request) -> Respon
     if got is None:
         raise HTTPException(status_code=404, detail="preview path not found")
     return _private_preview_response(got.body, got.media_type)
+
+refuse_default_secret_in_production()
