@@ -1,7 +1,7 @@
 """In-memory demo users + login/refresh/me (M3 auth stub).
 
-ponytail: no Postgres / OAuth. Ceiling: single-node demo users from env.
-Upgrade: real IdP or user table (M3 members follow-on).
+ponytail: no Postgres / OAuth. Ceiling: single-node users from AUTH_DEMO_USER.
+Upgrade: real IdP or user table.
 """
 
 from __future__ import annotations
@@ -14,39 +14,42 @@ from vscode_revealjs_server.auth.tokens import decode_jwt, issue_tokens
 
 
 def _demo_users() -> dict[str, dict[str, str]]:
-    """username → {id, password}.
+    """username → {id, password} from AUTH_DEMO_USER.
 
-    Built-ins: demo/demo, alice/alice. Optional AUTH_DEMO_USER=name:pass.
+    Comma-separated username:password pairs. No built-in accounts.
+    Unset or empty → nobody can sign in. A non-empty value that does not
+    parse raises RuntimeError so a bad seed fails instead of silently
+    dropping accounts.
     """
-    users = {
-        "demo": {"id": "usr_demo", "password": "demo"},
-        "alice": {"id": "usr_alice", "password": "alice"},
-    }
-    extra = os.environ.get("AUTH_DEMO_USER", "").strip()
-    if extra and ":" in extra:
-        name, pw = extra.split(":", 1)
+    raw = os.environ.get("AUTH_DEMO_USER", "").strip()
+    if not raw:
+        return {}
+    users: dict[str, dict[str, str]] = {}
+    for part in raw.split(","):
+        item = part.strip()
+        if not item:
+            continue
+        if ":" not in item:
+            raise RuntimeError(
+                "AUTH_DEMO_USER must be comma-separated username:password pairs"
+            )
+        name, password = item.split(":", 1)
         name = name.strip()
-        if name:
-            uid = "usr_" + hashlib.sha256(name.encode()).hexdigest()[:12]
-            users[name] = {"id": uid, "password": pw}
+        if not name or not password:
+            raise RuntimeError(
+                "AUTH_DEMO_USER must be comma-separated username:password pairs"
+            )
+        if name in users:
+            raise RuntimeError(f"AUTH_DEMO_USER repeats username {name}")
+        users[name] = {
+            "id": "usr_" + hashlib.sha256(name.encode()).hexdigest()[:12],
+            "password": password,
+        }
+    if not users:
+        raise RuntimeError(
+            "AUTH_DEMO_USER must be comma-separated username:password pairs"
+        )
     return users
-
-
-def find_user(*, username: str | None = None, user_id: str | None = None) -> dict[str, str] | None:
-    """Return {id, username} from demo store, or None."""
-    users = _demo_users()
-    if username is not None:
-        name = username.strip()
-        row = users.get(name)
-        if row is None:
-            return None
-        return {"id": row["id"], "username": name}
-    if user_id is not None:
-        for name, row in users.items():
-            if row["id"] == user_id:
-                return {"id": row["id"], "username": name}
-        return None
-    return None
 
 
 def login(username: str, password: str) -> dict[str, Any] | None:
@@ -70,7 +73,6 @@ def refresh(refresh_token: str) -> dict[str, Any] | None:
     username = payload.get("username")
     if not isinstance(user_id, str) or not isinstance(username, str):
         return None
-    # Ensure user still exists in demo store
     if username not in _demo_users():
         return None
     tokens = issue_tokens(user_id=user_id, username=username)
@@ -98,3 +100,7 @@ def bearer_token(authorization: str | None) -> str | None:
     if len(parts) != 2 or parts[0].lower() != "bearer":
         return None
     return parts[1].strip() or None
+
+
+# Fail at import when the operator set a seed that cannot be parsed.
+_demo_users()

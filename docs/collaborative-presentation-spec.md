@@ -368,8 +368,6 @@ PATCH  /api/projects/{project_id}
 DELETE /api/projects/{project_id}
 
 GET    /api/projects/{project_id}/members
-POST   /api/projects/{project_id}/members
-DELETE /api/projects/{project_id}/members/{user_id}
 ```
 
 建立 project 時：
@@ -1792,8 +1790,6 @@ GET    /api/projects/{project_id}
 PATCH  /api/projects/{project_id}
 
 GET    /api/projects/{project_id}/members
-POST   /api/projects/{project_id}/members
-DELETE /api/projects/{project_id}/members/{user_id}
 
 GET    /api/projects/{project_id}/snapshot
 

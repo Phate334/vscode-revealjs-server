@@ -14,6 +14,39 @@ pass() { echo "PASS: $*"; }
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
 auth_hdr() { echo "Authorization: Bearer ${ACCESS}"; }
+json_login() {
+  python3 -c 'import json,sys; print(json.dumps({"username":sys.argv[1],"password":sys.argv[2]}))' "$1" "$2"
+}
+
+# Same AUTH_DEMO_USER the Compose server was started with. At least two
+# username:password pairs; there are no built-in accounts.
+: "${AUTH_DEMO_USER:?Set AUTH_DEMO_USER to the comma-separated username:password pairs the server was started with (at least two)}"
+eval "$(python3 - <<'PY'
+import os, shlex
+raw = os.environ["AUTH_DEMO_USER"]
+pairs = []
+for part in raw.split(","):
+    item = part.strip()
+    if not item:
+        continue
+    if ":" not in item:
+        raise SystemExit("AUTH_DEMO_USER entries must be username:password")
+    name, password = item.split(":", 1)
+    name = name.strip()
+    if not name or not password:
+        raise SystemExit("AUTH_DEMO_USER entries must be username:password")
+    pairs.append((name, password))
+if len(pairs) < 2:
+    raise SystemExit("AUTH_DEMO_USER needs at least two username:password pairs for smoke")
+for key, value in (
+    ("SMOKE_USER", pairs[0][0]),
+    ("SMOKE_PASS", pairs[0][1]),
+    ("SMOKE_GUEST", pairs[1][0]),
+    ("SMOKE_GUEST_PASS", pairs[1][1]),
+):
+    print(f"{key}={shlex.quote(value)}")
+PY
+)"
 
 echo "=== compose smoke @ ${BASE} ==="
 
@@ -22,21 +55,22 @@ HEALTH="$(curl -sfS "${BASE}/health")" || fail "health"
 echo "${HEALTH}" | grep -q '"status":"ok"' || fail "health body: ${HEALTH}"
 pass "health"
 
-echo "POST /api/auth/login (demo/demo)"
+echo "POST /api/auth/login (${SMOKE_USER})"
 LOGIN="$(curl -sfS -X POST "${BASE}/api/auth/login" \
   -H 'Content-Type: application/json' \
-  -d '{"username":"demo","password":"demo"}')" || fail "auth login"
+  -d "$(json_login "${SMOKE_USER}" "${SMOKE_PASS}")")" || fail "auth login"
 ACCESS="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])' <<<"${LOGIN}")"
 REFRESH="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["refresh_token"])' <<<"${LOGIN}")"
 [[ -n "${ACCESS}" && -n "${REFRESH}" ]] || fail "login missing tokens"
 ME="$(curl -sfS "${BASE}/api/auth/me" -H "$(auth_hdr)")" || fail "auth me"
-echo "${ME}" | grep -q '"username":"demo"' || fail "me body: ${ME}"
+echo "${ME}" | grep -Fq "\"username\":\"${SMOKE_USER}\"" || fail "me body: ${ME}"
+ME_ID="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' <<<"${ME}")"
 REF="$(curl -sfS -X POST "${BASE}/api/auth/refresh" \
   -H 'Content-Type: application/json' \
   -d "{\"refresh_token\":\"${REFRESH}\"}")" || fail "auth refresh"
 echo "${REF}" | grep -q 'access_token' || fail "refresh body"
 CODE="$(curl -sS -o /dev/null -w '%{http_code}' -X POST "${BASE}/api/auth/login" \
-  -H 'Content-Type: application/json' -d '{"username":"demo","password":"wrong"}' || true)"
+  -H 'Content-Type: application/json' -d "$(json_login "${SMOKE_USER}" "wrong")" || true)"
 [[ "${CODE}" == "401" ]] || fail "expected 401 bad login, got ${CODE}"
 pass "auth login/me/refresh"
 
@@ -54,39 +88,36 @@ CREATE="$(curl -sfS -X POST "${BASE}/api/projects" \
 PID="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' <<<"${CREATE}")"
 OWNER="$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("owner_id",""))' <<<"${CREATE}")"
 [[ -n "${PID}" ]] || fail "no project id in ${CREATE}"
-[[ "${OWNER}" == "usr_demo" ]] || fail "expected owner usr_demo, got ${OWNER}"
+[[ "${OWNER}" == "${ME_ID}" ]] || fail "expected owner ${ME_ID}, got ${OWNER}"
 pass "create project ${PID} owner=${OWNER}"
 
 echo "GET /api/projects/{id}/members"
 MEMBERS="$(curl -sfS "${BASE}/api/projects/${PID}/members" -H "$(auth_hdr)")" || fail "list members"
-echo "${MEMBERS}" | grep -q 'usr_demo' || fail "members missing owner: ${MEMBERS}"
+echo "${MEMBERS}" | grep -q "${ME_ID}" || fail "members missing owner: ${MEMBERS}"
 pass "list members"
 
-echo "POST members alice as editor"
-ADD="$(curl -sfS -X POST "${BASE}/api/projects/${PID}/members" \
+echo "guest is not a member until they accept an invite"
+GUEST_LOGIN="$(curl -sfS -X POST "${BASE}/api/auth/login" \
   -H 'Content-Type: application/json' \
-  -H "$(auth_hdr)" \
-  -d '{"username":"alice","role":"editor"}')" || fail "add member"
-echo "${ADD}" | grep -q 'usr_alice' || fail "add member body: ${ADD}"
-pass "add member alice"
-
-echo "alice can GET project; stranger token cannot"
-ALICE_LOGIN="$(curl -sfS -X POST "${BASE}/api/auth/login" \
-  -H 'Content-Type: application/json' \
-  -d '{"username":"alice","password":"alice"}')" || fail "alice login"
-ALICE_ACCESS="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])' <<<"${ALICE_LOGIN}")"
-curl -sfS "${BASE}/api/projects/${PID}" -H "Authorization: Bearer ${ALICE_ACCESS}" >/dev/null \
-  || fail "alice get project"
-# bob is not a built-in — use a forged path: login as alice on a project she is not on
-# Create second project as demo; alice must 403
+  -d "$(json_login "${SMOKE_GUEST}" "${SMOKE_GUEST_PASS}")")" || fail "guest login"
+GUEST_ACCESS="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])' <<<"${GUEST_LOGIN}")"
+CODE="$(curl -sS -o /dev/null -w '%{http_code}' \
+  "${BASE}/api/projects/${PID}" \
+  -H "Authorization: Bearer ${GUEST_ACCESS}" || true)"
+[[ "${CODE}" == "403" ]] || fail "expected 403 guest before invite, got ${CODE}"
 OTHER="$(curl -sfS -X POST "${BASE}/api/projects" \
   -H 'Content-Type: application/json' -H "$(auth_hdr)" \
   -d '{"name":"other-smoke"}')" || fail "create other"
 OTHER_PID="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' <<<"${OTHER}")"
 CODE="$(curl -sS -o /dev/null -w '%{http_code}' \
   "${BASE}/api/projects/${OTHER_PID}/snapshot" \
-  -H "Authorization: Bearer ${ALICE_ACCESS}" || true)"
-[[ "${CODE}" == "403" ]] || fail "expected 403 alice on other project, got ${CODE}"
+  -H "Authorization: Bearer ${GUEST_ACCESS}" || true)"
+[[ "${CODE}" == "403" ]] || fail "expected 403 guest on other project, got ${CODE}"
+CODE="$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
+  "${BASE}/api/projects/${PID}/members" \
+  -H 'Content-Type: application/json' -H "$(auth_hdr)" \
+  -d '{"username":"guest","role":"editor"}' || true)"
+[[ "${CODE}" == "404" || "${CODE}" == "405" ]] || fail "expected POST /members removed, got ${CODE}"
 pass "membership 403 for non-member"
 
 echo "GET snapshot with token"
@@ -242,25 +273,18 @@ asyncio.run(main())
 PY
 pass "WS hello with access_token"
 
-echo "DELETE member alice"
-DEL="$(curl -sfS -X DELETE "${BASE}/api/projects/${PID}/members/usr_alice" \
-  -H "$(auth_hdr)")" || fail "delete member"
-echo "${DEL}" | grep -q 'usr_demo' || fail "delete body: ${DEL}"
-echo "${DEL}" | grep -q 'usr_alice' && fail "alice still present after delete"
-pass "delete member alice"
-
-echo "POST share (owner) + alice accept as viewer"
+echo "POST share (owner) + guest accept as viewer"
 SHARE="$(curl -sfS -X POST "${BASE}/api/projects/${PID}/invites" \
   -H 'Content-Type: application/json' -H "$(auth_hdr)" \
   -d '{"role":"viewer"}')" || fail "create share"
 TOKEN="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])' <<<"${SHARE}")"
 SHARE_ID="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' <<<"${SHARE}")"
 [[ -n "${TOKEN}" && -n "${SHARE_ID}" ]] || fail "share body: ${SHARE}"
-PREV_SHARE="$(curl -sfS "${BASE}/api/invites/${TOKEN}" -H "Authorization: Bearer ${ALICE_ACCESS}")" \
+PREV_SHARE="$(curl -sfS "${BASE}/api/invites/${TOKEN}" -H "Authorization: Bearer ${GUEST_ACCESS}")" \
   || fail "preview share"
 echo "${PREV_SHARE}" | grep -q "${PID}" || fail "preview share body: ${PREV_SHARE}"
 ACC="$(curl -sfS -X POST "${BASE}/api/invites/${TOKEN}/accept" \
-  -H 'Content-Type: application/json' -H "Authorization: Bearer ${ALICE_ACCESS}" \
+  -H 'Content-Type: application/json' -H "Authorization: Bearer ${GUEST_ACCESS}" \
   -d "{\"token\":\"${TOKEN}\"}")" || fail "accept share"
 echo "${ACC}" | grep -q '"role":"viewer"' || fail "accept role: ${ACC}"
 echo "${ACC}" | grep -q '"already_member":false' || fail "expected new member: ${ACC}"
@@ -271,29 +295,29 @@ echo "${OWN}" | grep -q '"already_member":true' || fail "owner already member: $
 echo "${OWN}" | grep -q '"role":"owner"' || fail "owner role changed: ${OWN}"
 pass "share create/accept"
 
-echo "alice scope=shared includes project; scope=owned does not"
-SHARED="$(curl -sfS "${BASE}/api/projects?scope=shared" -H "Authorization: Bearer ${ALICE_ACCESS}")" \
+echo "guest scope=shared includes project; scope=owned does not"
+SHARED="$(curl -sfS "${BASE}/api/projects?scope=shared" -H "Authorization: Bearer ${GUEST_ACCESS}")" \
   || fail "list shared"
 echo "${SHARED}" | grep -q "${PID}" || fail "shared list missing ${PID}: ${SHARED}"
-OWNED="$(curl -sfS "${BASE}/api/projects?scope=owned" -H "Authorization: Bearer ${ALICE_ACCESS}")" \
-  || fail "list owned alice"
+OWNED="$(curl -sfS "${BASE}/api/projects?scope=owned" -H "Authorization: Bearer ${GUEST_ACCESS}")" \
+  || fail "list owned guest"
 if echo "${OWNED}" | grep -q "${PID}"; then
   fail "owned list should not include shared ${PID}: ${OWNED}"
 fi
-DEMO_OWNED="$(curl -sfS "${BASE}/api/projects?scope=owned" -H "$(auth_hdr)")" || fail "list owned demo"
-echo "${DEMO_OWNED}" | grep -q "${PID}" || fail "owner missing from owned: ${DEMO_OWNED}"
+OWNER_LIST="$(curl -sfS "${BASE}/api/projects?scope=owned" -H "$(auth_hdr)")" || fail "list owned owner"
+echo "${OWNER_LIST}" | grep -q "${PID}" || fail "owner missing from owned: ${OWNER_LIST}"
 CODE="$(curl -sS -o /dev/null -w '%{http_code}' "${BASE}/api/projects?scope=nope" -H "$(auth_hdr)" || true)"
 [[ "${CODE}" == "400" ]] || fail "expected 400 bad scope, got ${CODE}"
 pass "project scope owned/shared"
 
 echo "viewer cannot publish; anonymous 401"
 CODE="$(curl -sS -o /dev/null -w '%{http_code}' -X POST "${BASE}/api/projects/${PID}/publish" \
-  -H "Authorization: Bearer ${ALICE_ACCESS}" || true)"
+  -H "Authorization: Bearer ${GUEST_ACCESS}" || true)"
 [[ "${CODE}" == "403" ]] || fail "expected 403 viewer publish, got ${CODE}"
 CODE="$(curl -sS -o /dev/null -w '%{http_code}' -X POST "${BASE}/api/projects/${PID}/publish" || true)"
 [[ "${CODE}" == "401" ]] || fail "expected 401 publish no token, got ${CODE}"
 CODE="$(curl -sS -o /dev/null -w '%{http_code}' -X POST "${BASE}/api/projects/${PID}/invites" \
-  -H 'Content-Type: application/json' -H "Authorization: Bearer ${ALICE_ACCESS}" \
+  -H 'Content-Type: application/json' -H "Authorization: Bearer ${GUEST_ACCESS}" \
   -d '{"role":"editor"}' || true)"
 [[ "${CODE}" == "403" ]] || fail "expected 403 viewer share, got ${CODE}"
 pass "publish/share permission gates"
@@ -449,7 +473,7 @@ echo "${LIST}" | grep -q "${REL1}" || fail "history missing rel1"
 echo "${LIST}" | grep -q "${REL2}" || fail "history missing rel2"
 ONE="$(curl -sfS "${BASE}/api/projects/${PID}/releases/${REL1}" -H "$(auth_hdr)")" || fail "get release meta"
 echo "${ONE}" | grep -q '"current":false' || fail "rel1 should not be current: ${ONE}"
-TWO="$(curl -sfS "${BASE}/api/releases/${REL2}" -H "Authorization: Bearer ${ALICE_ACCESS}")" \
+TWO="$(curl -sfS "${BASE}/api/releases/${REL2}" -H "Authorization: Bearer ${GUEST_ACCESS}")" \
   || fail "viewer get release meta via /api/releases"
 echo "${TWO}" | grep -q '"current":true' || fail "rel2 current: ${TWO}"
 CODE="$(curl -sS -o /dev/null -w '%{http_code}' --path-as-is \
@@ -464,7 +488,7 @@ if echo "${REV}" | grep -q "${SHARE_ID}"; then
   fail "revoked share still listed: ${REV}"
 fi
 CODE="$(curl -sS -o /dev/null -w '%{http_code}' -X POST "${BASE}/api/invites/${TOKEN}/accept" \
-  -H 'Content-Type: application/json' -H "Authorization: Bearer ${ALICE_ACCESS}" \
+  -H 'Content-Type: application/json' -H "Authorization: Bearer ${GUEST_ACCESS}" \
   -d "{\"token\":\"${TOKEN}\"}" || true)"
 [[ "${CODE}" == "404" ]] || fail "expected 404 revoked share, got ${CODE}"
 pass "revoke share"

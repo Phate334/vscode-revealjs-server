@@ -1,16 +1,11 @@
 # RevealJS Collaboration
 
-A VS Code client for the collaborative presentation server. Work in real local folders while collaborative text merges through Yjs and persists across restarts.
+VS Code client for the collaborative presentation server. You edit a real local folder; text merges through Yjs and stays on disk across restarts.
 
-- Configure `presentation.serverUrl`, then run **Presentation: Create Presentation** or **Open Presentation**. Sign-in resumes the original action.
-- Create/Open always create a dedicated child inside the parent you select; existing children are refused.
-- Open Presentation includes owned and shared presentations. Accept Invitation opens the joined presentation directly.
-- Edit text with Auto Save on or off. Disconnect keeps local editing and persistence active. Filesystem operations and binary updates are journaled and replayed through HTTP.
-- Open Preview creates a private ten-minute session. Publish creates an immutable public release.
-- The status bar shows Synced, Syncing, Offline or Conflict. Use Synchronization Details, Retry Synchronization and Resolve Conflict as needed.
+Set `presentation.serverUrl` (default `http://127.0.0.1:8000`). **Create Presentation** and **Open Presentation** sign you in when needed. The server has no built-in accounts: use a username and password from the server’s `AUTH_DEMO_USER`. How to start the server is in the repository README.
 
-Keep `.presentation/`: it contains the local Yjs state, saved-disk baselines, pending journal and recovery copies. Git metadata, VS Code preferences and node_modules are excluded from synchronization. Legacy local differences are preserved for explicit conflict resolution.
+Create and Open always make a new child folder under the parent you pick. Open lists presentations you own and ones shared with you. **Share Presentation** copies an invitation; **Accept Invitation** joins and opens that presentation. **Project Members** lists who has access.
 
-Server and extension must both support protocol v2. The stable release version is `0.1.2` for both components.
+**Disconnect** keeps local editing and saving. **Open Preview** is a private ten-minute session. **Publish** copies a public release link. The status bar shows Synced, Syncing, Offline, or Conflict.
 
-See the repository `docs/workspace-architecture.md` for protocol and recovery behavior.
+Keep `.presentation/`. Git metadata, VS Code preferences, and `node_modules/` are not synchronized. Server and extension both need protocol v2 (stable release `0.1.2`).

@@ -15,7 +15,6 @@ from vscode_revealjs_server.presentation.publish import publish as publish_relea
 from vscode_revealjs_server.presentation.publish import read_published
 from vscode_revealjs_server.projects import project_service
 from vscode_revealjs_server.projects.service import (
-    ROLE_EDITOR,
     ROLE_VIEWER,
     AssetConflict,
     FsRejected,
@@ -56,14 +55,6 @@ class CreateShareBody(BaseModel):
     role: str = Field(default=ROLE_VIEWER, min_length=1, max_length=32)
 
 
-class AddMemberBody(BaseModel):
-    """Add by username (demo store) or user_id; role editor|viewer."""
-
-    username: str | None = Field(default=None, min_length=1, max_length=120)
-    user_id: str | None = Field(default=None, min_length=1, max_length=120)
-    role: str = Field(default=ROLE_EDITOR, min_length=1, max_length=32)
-
-
 def _forbid_unless_member(project_id: str, user_id: str) -> None:
     if project_service.get(project_id) is None:
         raise HTTPException(status_code=404, detail="project not found")
@@ -84,7 +75,7 @@ def health() -> dict[str, str]:
 
 @app.post("/api/auth/login")
 def auth_login(body: LoginBody) -> dict:
-    """Demo users: demo/demo, alice/alice (+ AUTH_DEMO_USER)."""
+    """Sign in with a user seeded by AUTH_DEMO_USER. No built-in accounts."""
     got = auth_service.login(body.username, body.password)
     if got is None:
         raise HTTPException(status_code=401, detail="invalid credentials")
@@ -179,52 +170,6 @@ def get_members(
     if members is None:
         raise HTTPException(status_code=404, detail="project not found")
     return members
-
-
-@app.post("/api/projects/{project_id}/members")
-def post_member(
-    project_id: str,
-    body: AddMemberBody,
-    user: Annotated[dict[str, str], Depends(require_user)],
-) -> list[dict]:
-    _forbid_unless_member(project_id, user["id"])
-    if not project_service.can_manage_members(project_id, user["id"]):
-        raise HTTPException(status_code=403, detail="owner permission required")
-    if body.role not in (ROLE_EDITOR, ROLE_VIEWER):
-        raise HTTPException(status_code=400, detail="role must be editor or viewer")
-    if not body.username and not body.user_id:
-        raise HTTPException(status_code=400, detail="username or user_id required")
-    target = auth_service.find_user(username=body.username, user_id=body.user_id)
-    if target is None:
-        raise HTTPException(status_code=404, detail="user not found")
-    try:
-        return project_service.add_member(
-            project_id,
-            user_id=target["id"],
-            username=target["username"],
-            role=body.role,
-        )
-    except FsRejected as e:
-        raise HTTPException(status_code=404, detail=str(e)) from e
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
-
-
-@app.delete("/api/projects/{project_id}/members/{member_user_id}")
-def delete_member(
-    project_id: str,
-    member_user_id: str,
-    user: Annotated[dict[str, str], Depends(require_user)],
-) -> list[dict]:
-    _forbid_unless_member(project_id, user["id"])
-    if not project_service.can_manage_members(project_id, user["id"]):
-        raise HTTPException(status_code=403, detail="owner permission required")
-    try:
-        return project_service.remove_member(project_id, member_user_id)
-    except FsRejected as e:
-        raise HTTPException(status_code=404, detail=str(e)) from e
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
 
 
 @app.put("/api/projects/{project_id}/assets/{asset_path:path}")

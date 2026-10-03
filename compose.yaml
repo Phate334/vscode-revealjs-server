@@ -10,9 +10,9 @@ services:
     environment:
       COLLAB_DATA_DIR: /app/.data/collaboration
       PROJECTS_DATA_DIR: /app/.data/projects
-      # Optional auth (defaults: demo/demo + alice/alice; see README)
-      # AUTH_JWT_SECRET: change-me
-      # AUTH_DEMO_USER: bob:bobpass
+      # No built-in accounts. Required comma-separated username:password pairs.
+      AUTH_DEMO_USER: ${AUTH_DEMO_USER:?Set AUTH_DEMO_USER to comma-separated username:password pairs}
+      # AUTH_JWT_SECRET: ${AUTH_JWT_SECRET:-change-me}
     healthcheck:
       test:
         [

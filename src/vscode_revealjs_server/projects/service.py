@@ -798,58 +798,6 @@ class ProjectService:
                 out.append({"user_id": uid, "username": uname, "role": role})
         return out
 
-    def add_member(
-        self,
-        project_id: str,
-        *,
-        user_id: str,
-        username: str,
-        role: str,
-    ) -> list[dict[str, str]]:
-        if role not in ROLES:
-            raise ValueError(f"invalid role: {role}")
-        if role == ROLE_OWNER:
-            raise ValueError("cannot add another owner; transfer not supported")
-        with self._mut:
-            meta = self._read_meta(project_id)
-            if meta is None:
-                raise FsRejected("project not found")
-            members = meta.get("members")
-            if members is None:
-                members = []
-                meta["members"] = members
-            if not isinstance(members, list):
-                raise ValueError("corrupt members")
-            for row in members:
-                if isinstance(row, dict) and row.get("user_id") == user_id:
-                    raise ValueError("already a member")
-            members.append({"user_id": user_id, "username": username, "role": role})
-            self._write_meta(meta)
-            return self.list_members(project_id) or []
-
-    def remove_member(self, project_id: str, user_id: str) -> list[dict[str, str]]:
-        with self._mut:
-            meta = self._read_meta(project_id)
-            if meta is None:
-                raise FsRejected("project not found")
-            members = meta.get("members")
-            if not isinstance(members, list):
-                raise ValueError("no members to remove")
-            target = None
-            for row in members:
-                if isinstance(row, dict) and row.get("user_id") == user_id:
-                    target = row
-                    break
-            if target is None:
-                raise ValueError("member not found")
-            if target.get("role") == ROLE_OWNER:
-                owners = [r for r in members if isinstance(r, dict) and r.get("role") == ROLE_OWNER]
-                if len(owners) <= 1:
-                    raise ValueError("cannot remove the last owner")
-            meta["members"] = [r for r in members if not (isinstance(r, dict) and r.get("user_id") == user_id)]
-            self._write_meta(meta)
-            return self.list_members(project_id) or []
-
     def _alloc_slug(self, name: str) -> str:
         """Unique public slug from project name.
 
