@@ -19,7 +19,7 @@ Mark intentional PoC shortcuts with a `ponytail:` comment naming the ceiling and
 
 # Scope
 
-- Implement only the requested / current milestone scope. Do not implement later phases "while you're here."
+- Implement only the requested / current GitHub Milestone (or explicitly requested) scope. Do not implement later phases "while you're here."
 - MVP non-goals in `docs/non-goals.md` stay out of scope unless the user overrides.
 
 # Repo constraints
@@ -36,7 +36,8 @@ Mark intentional PoC shortcuts with a `ponytail:` comment naming the ceiling and
 # Git
 
 - Do not invent or change the local git author identity.
-- Do not commit local-only progress / process files if they exist and are gitignored (e.g. milestone progress trackers).
+- Do not commit development plans, progress logs, milestone checklists, open decisions, roadmaps, or todos. Those belong in GitHub Issues and Milestones (or local gitignored notes under `docs/archived/`, `docs/milestones/`, `docs/improvement-roadmap.md`, etc.), not in the tracked tree.
+- Product docs that describe behavior (`README`, `docs/non-goals.md`, architecture / product specs) may stay in git; strip process diary and acceptance checklists from them when editing.
 
 # Releases
 

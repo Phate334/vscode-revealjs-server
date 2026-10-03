@@ -2,7 +2,7 @@
 
 > Source: Part VII of [`collaborative-presentation-spec.md`](./collaborative-presentation-spec.md)
 
-MVP **刻意不做**下列項目。實作與驗收時勿將其當成缺口補上；若未來要做，需另開 milestone／規格修訂。
+MVP **刻意不做**下列項目。實作與驗收時勿將其當成缺口補上；若未來要做，需另開 GitHub Issue／Milestone 或規格修訂。
 
 ## 清單
 

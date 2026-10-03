@@ -13,4 +13,4 @@ Keep `.presentation/`: it contains the local Yjs state, saved-disk baselines, pe
 
 Server and extension must both support protocol v2. The stable release version is `0.1.2` for both components.
 
-The maintainer has completed validation for `0.1.2`. See the repository's `docs/workspace-architecture.md` for the protocol and operating limits.
+See the repository `docs/workspace-architecture.md` for protocol and recovery behavior.

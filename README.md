@@ -76,6 +76,6 @@ API and collaboration WebSocket require a signed-in access token (`Authorization
 
 Canonical version is `pyproject.toml`. Release tags must match it exactly (including `rcN`). RC builds use a derived numeric VS Code manifest version with `--pre-release`, are marked prerelease on GitHub, and do not update the stable `latest` image tag.
 
-**0.1.2 is the stable release.** The maintainer has completed validation before promoting this version from RC. Existing 0.1.1 clients must be upgraded together with the server because synchronization now uses protocol v2. Tag `v0.1.2` publishes the stable VSIX and versioned image, and updates the image's `latest` tag.
+Current stable release is `0.1.2`. Existing 0.1.1 clients must be upgraded together with the server because synchronization now uses protocol v2. Tag `v0.1.2` publishes the stable VSIX and versioned image, and updates the image's `latest` tag.
 
 See [workspace architecture and recovery behavior](docs/workspace-architecture.md) and `AGENTS.md`.
