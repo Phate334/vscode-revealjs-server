@@ -29,7 +29,7 @@ Single-node PoC ceilings remain: local filesystem storage, process-local locks, 
 
 ## Onboarding and authentication
 
-Create and Open both select a parent, exclusively reserve a new child directory, download the snapshot and write workspace metadata last. Existing children are refused. Open Presentation lists owned projects and projects shared with you, and can open `{origin}/open#{invite_token}`. That link adds the signed-in user as an editor. An account invite only registers a user. A project id alone is not access.
+Create and Open both select a parent, exclusively reserve a new child directory, download the snapshot and write workspace metadata last. Existing children are refused. Open Presentation lists owned projects and projects shared with you, and can open `{origin}/open#{invite_token}`. That link adds the signed-in user as an editor. An account invite (`{origin}/join#{token}`) only registers a user. `POST /api/auth/register` works only while there are zero users (password at least 8 characters) and returns 403 after that. The owner can read, write, share, and publish; an editor can read, write, and preview. A project id alone is not access. The collaboration socket is not opened without a session; close codes 4401 and 4403 do not reconnect.
 
 `presentation.serverUrl` is the server origin for new actions. Existing workspaces use their recorded origin. Sessions and refresh operations are isolated by origin; commands sign in and resume the original action when needed.
 
