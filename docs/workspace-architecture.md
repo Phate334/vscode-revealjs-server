@@ -29,11 +29,11 @@ Single-node PoC ceilings remain: local filesystem storage, process-local locks, 
 
 ## Onboarding and authentication
 
-Create and Open both select a parent, exclusively reserve a new child directory, download the snapshot and write workspace metadata last. Existing children are refused. Open Presentation groups My Presentations and Shared with Me. Accepting an invite opens the returned project directly.
+Create and Open both select a parent, exclusively reserve a new child directory, download the snapshot and write workspace metadata last. Existing children are refused. Open Presentation lists owned projects and existing members, and can open `{origin}/open#{project_id}`. Any signed-in user who opens that project can edit. An account invite only registers a user.
 
 `presentation.serverUrl` is the server origin for new actions. Existing workspaces use their recorded origin. Sessions and refresh operations are isolated by origin; commands sign in and resume the original action when needed.
 
-Preview requires a ten-minute project-scoped session. The signed URL bootstraps an HttpOnly, path-scoped cookie, then redirects to remove the token from the URL. HTML, assets, runtime files and the preview fingerprint endpoint all require the session and current membership. Responses use `private, no-store`; preview polling stops when authorization expires. Published releases and slug URLs remain public and immutable.
+Preview requires a ten-minute project-scoped session. The signed URL bootstraps an HttpOnly, path-scoped cookie, then redirects to remove the token from the URL. HTML, assets, runtime files and the preview fingerprint endpoint all require that session. Responses use `private, no-store`; preview polling stops when authorization expires. Published releases and slug URLs remain public and immutable.
 
 ## Protocol v2
 
@@ -57,7 +57,7 @@ Commands support `mkdir`, `create`, `delete`, `rename`, `move` and `write` (exis
 
 A successful response contains `structure_revision` and ordered `results`. A rejected batch returns HTTP 409 with `detail.results` containing the committed prefix and `detail.failed` naming the first failed index. The suffix is not applied. Committed operations are broadcast to all connected clients. Binary PUT/GET remains HTTP with asset revisions and `asset.changed` notifications.
 
-Invites use `/api/projects/{id}/invites`, `/api/invites/{token}` and `/api/invites/{token}/accept`. Private preview sessions use `POST /api/projects/{id}/preview-session`.
+Account invites use `POST /api/account-invites` and `POST /api/account-invites/{token}/register`. Presentation links use `GET /api/projects/{id}/link`. Private preview sessions use `POST /api/projects/{id}/preview-session`.
 
 ## Versioning
 

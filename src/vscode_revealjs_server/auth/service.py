@@ -10,7 +10,10 @@ import hashlib
 import hmac
 import json
 import os
+import secrets
 import threading
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +22,7 @@ from vscode_revealjs_server.auth.tokens import decode_jwt, issue_tokens
 _PBKDF2_ROUNDS = 200_000
 _LOCK = threading.Lock()
 _USERS: dict[str, dict[str, str]] | None = None
+_INVITES: list[dict[str, str]] | None = None
 
 
 class UserExists(Exception):
@@ -36,6 +40,10 @@ def _users_path() -> Path:
     if collab:
         return Path(collab).parent / "users.json"
     return Path.cwd() / ".data" / "users.json"
+
+
+def _invites_path() -> Path:
+    return _users_path().with_name("account-invites.json")
 
 
 def _hash_password(password: str) -> str:
@@ -109,6 +117,39 @@ def _save() -> None:
     os.chmod(path, 0o600)
 
 
+def _load_invites() -> list[dict[str, str]]:
+    global _INVITES
+    if _INVITES is not None:
+        return _INVITES
+    path = _invites_path()
+    rows: list[dict[str, str]] = []
+    if path.is_file():
+        data = json.loads(path.read_text(encoding="utf-8"))
+        raw = data.get("invites", [])
+        if not isinstance(raw, list):
+            raise RuntimeError("account invites file must contain an invites list")
+        for row in raw:
+            if not isinstance(row, dict):
+                raise RuntimeError("account invites file has an invalid record")
+            invite_id, token, created = row.get("id"), row.get("token"), row.get("created_at")
+            if not all(isinstance(x, str) and x for x in (invite_id, token, created)):
+                raise RuntimeError("account invites record missing id, token, or created_at")
+            rows.append({"id": invite_id, "token": token, "created_at": created})
+    _INVITES = rows
+    return rows
+
+
+def _save_invites() -> None:
+    path = _invites_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"invites": _INVITES or []}
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+    os.chmod(path, 0o600)
+
+
 def _insert(name: str, password: str) -> dict[str, str]:
     """Caller holds _LOCK. Does not save."""
     users = _load()
@@ -147,26 +188,49 @@ def login(username: str, password: str) -> dict[str, Any] | None:
     return _tokens(name, snapshot)
 
 
-def open_session(username: str, password: str) -> dict[str, Any] | None:
-    """Register when the username is new; otherwise require the existing password.
+def create_account_invite() -> dict[str, str]:
+    """Reusable account-registration token. Not tied to a project or role.
 
-    Returns None when the username exists and the password does not match.
-    Response includes created=True only for a new user.
+    ponytail: JSON file beside users, no expiry. Ceiling: leaked link registers
+    anyone until the file is edited. Upgrade: expiry and revoke.
+    """
+    row = {
+        "id": f"ain_{uuid.uuid4().hex[:12]}",
+        "token": secrets.token_urlsafe(24),
+        "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    with _LOCK:
+        invites = _load_invites()
+        invites.append(row)
+        _save_invites()
+    return dict(row)
+
+
+def account_invite_exists(token: str) -> bool:
+    token = (token or "").strip()
+    if not token:
+        return False
+    with _LOCK:
+        return any(row["token"] == token for row in _load_invites())
+
+
+def register_with_invite(token: str, username: str, password: str) -> dict[str, Any] | None:
+    """Create an account for a valid invite. Does not join a project.
+
+    Returns None when the token is unknown. Raises UserExists when the name is taken.
+    The invite stays valid so the same link can register more than one account.
     """
     name, password = _check(username, password)
+    token = (token or "").strip()
     with _LOCK:
-        users = _load()
-        row = users.get(name)
-        if row is None:
-            row = _insert(name, password)
-            _save()
-            created = True
-        elif not _verify_password(password, row["password_hash"]):
+        if not token or not any(row["token"] == token for row in _load_invites()):
             return None
-        else:
-            created = False
+        if name in _load():
+            raise UserExists(name)
+        row = _insert(name, password)
+        _save()
         snapshot = dict(row)
-    return _tokens(name, snapshot, created=created)
+    return _tokens(name, snapshot)
 
 
 def refresh(refresh_token: str) -> dict[str, Any] | None:

@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import secrets
 import threading
 import json
 import os
@@ -58,13 +57,9 @@ _BINARY_EXT = frozenset({
 # MVP roles (§18.1 project_members.role)
 ROLE_OWNER = "owner"
 ROLE_EDITOR = "editor"
-ROLE_VIEWER = "viewer"
-ROLES = frozenset({ROLE_OWNER, ROLE_EDITOR, ROLE_VIEWER})
-WRITE_ROLES = frozenset({ROLE_OWNER, ROLE_EDITOR})
 
 _RELEASE_ID = re.compile(r"^rel_[0-9a-f]{12}$")
 _SLUG = re.compile(r"^[a-z0-9][a-z0-9-]{0,60}$")
-_SHARE_ID = re.compile(r"^shr_[0-9a-f]{12}$")
 
 
 def _slugify(name: str) -> str:
@@ -72,32 +67,6 @@ def _slugify(name: str) -> str:
     if not s or not s[0].isalnum():
         return "deck"
     return s
-
-
-def _share_rows(shares: object) -> list[dict[str, str]]:
-    out: list[dict[str, str]] = []
-    if not isinstance(shares, list):
-        return out
-    for row in shares:
-        if not isinstance(row, dict):
-            continue
-        sid, token, role, created = (
-            row.get("id"),
-            row.get("token"),
-            row.get("role"),
-            row.get("created_at"),
-        )
-        if all(isinstance(x, str) for x in (sid, token, role, created)):
-            out.append(
-                {
-                    "id": sid,
-                    "token": token,
-                    "role": role,
-                    "created_at": created,
-                }
-            )
-    return out
-
 
 
 def is_binary_rel(rel: str) -> bool:
@@ -310,7 +279,6 @@ class ProjectService:
             "slug": self._alloc_slug(name),
             "published_release_id": None,
             "releases": [],
-            "shares": [],
             "members": [
                 {
                     "user_id": owner_id,
@@ -772,14 +740,16 @@ class ProjectService:
         return self._role_in_meta(meta, user_id)
 
     def can_read(self, project_id: str, user_id: str) -> bool:
-        return self.member_role(project_id, user_id) is not None
+        """Any authenticated caller who knows the project. Membership is not required.
+
+        user_id is unused; callers must already have authenticated.
+        """
+        del user_id
+        return self._read_meta(project_id) is not None
 
     def can_write(self, project_id: str, user_id: str) -> bool:
-        role = self.member_role(project_id, user_id)
-        return role in WRITE_ROLES if role else False
-
-    def can_manage_members(self, project_id: str, user_id: str) -> bool:
-        return self.member_role(project_id, user_id) == ROLE_OWNER
+        """Opening the project is enough to edit."""
+        return self.can_read(project_id, user_id)
 
     def list_members(self, project_id: str) -> list[dict[str, str]] | None:
         meta = self._read_meta(project_id)
@@ -842,118 +812,6 @@ class ProjectService:
             meta["slug"] = slug
             self._write_meta(meta)
             return slug
-
-    def create_share(self, project_id: str, *, role: str) -> dict[str, str]:
-        """Reusable invite token. Owner adds members by handing the token out.
-
-        ponytail: token stored in meta.json, no expiry, multi-use until revoked.
-        Ceiling: leaked token. Upgrade: expiry + single-use (post-MVP).
-        """
-        if role not in (ROLE_EDITOR, ROLE_VIEWER):
-            raise ValueError("role must be editor or viewer")
-        with self._mut:
-            meta = self._read_meta(project_id)
-            if meta is None:
-                raise FsRejected("project not found")
-            shares = meta.get("shares")
-            if not isinstance(shares, list):
-                shares = []
-                meta["shares"] = shares
-            row = {
-                "id": f"shr_{uuid.uuid4().hex[:12]}",
-                "token": secrets.token_urlsafe(24),
-                "role": role,
-                "created_at": _now(),
-            }
-            shares.append(row)
-            self._write_meta(meta)
-            return {
-                "id": row["id"],
-                "token": row["token"],
-                "role": role,
-                "project_id": project_id,
-                "created_at": row["created_at"],
-            }
-
-    def list_shares(self, project_id: str) -> list[dict[str, str]] | None:
-        meta = self._read_meta(project_id)
-        if meta is None:
-            return None
-        return _share_rows(meta.get("shares"))
-
-    def revoke_share(self, project_id: str, share_id: str) -> list[dict[str, str]]:
-        if not _SHARE_ID.match(share_id):
-            raise ValueError("share not found")
-        with self._mut:
-            meta = self._read_meta(project_id)
-            if meta is None:
-                raise FsRejected("project not found")
-            shares = meta.get("shares")
-            if not isinstance(shares, list):
-                raise ValueError("share not found")
-            kept = [r for r in shares if not (isinstance(r, dict) and r.get("id") == share_id)]
-            if len(kept) == len(shares):
-                raise ValueError("share not found")
-            meta["shares"] = kept
-            self._write_meta(meta)
-            return _share_rows(kept)
-
-    def _find_share(self, token: str) -> tuple[dict[str, Any], dict[str, Any]] | None:
-        """ponytail: linear scan of project metas. Ceiling: many projects.
-        Upgrade: token → project index.
-        """
-        if not token or not self.root.is_dir():
-            return None
-        for child in self.root.iterdir():
-            if not child.is_dir():
-                continue
-            meta = self._read_meta(child.name)
-            if not meta:
-                continue
-            shares = meta.get("shares")
-            if not isinstance(shares, list):
-                continue
-            for row in shares:
-                if isinstance(row, dict) and row.get("token") == token:
-                    return meta, row
-        return None
-
-    def preview_share(self, token: str) -> dict[str, str] | None:
-        found = self._find_share(token)
-        if found is None:
-            return None
-        meta, row = found
-        role = row.get("role")
-        return {
-            "project_id": meta["id"],
-            "project_name": meta["name"],
-            "role": role if isinstance(role, str) else ROLE_VIEWER,
-            "share_id": str(row.get("id") or ""),
-        }
-
-    def accept_share(self, token: str, *, user_id: str, username: str) -> dict[str, Any]:
-        """Add caller as member at the share's role. Existing members keep their role."""
-        with self._mut:
-            found = self._find_share(token)
-            if found is None:
-                raise FsRejected("share not found")
-            meta, row = found
-            project_id = meta["id"]
-            share_role = row.get("role")
-            if share_role not in (ROLE_EDITOR, ROLE_VIEWER):
-                raise ValueError("invalid share role")
-            existing = self._role_in_meta(meta, user_id)
-            already = existing is not None
-            if not already:
-                members = meta.get("members")
-                if not isinstance(members, list):
-                    members = []
-                    meta["members"] = members
-                members.append({"user_id": user_id, "username": username, "role": share_role})
-                self._write_meta(meta)
-                meta = self._read_meta(project_id) or meta
-            pub = self._public(meta, user_id=user_id)
-            return {"project": pub, "already_member": already}
 
     def capture_workspace(self, project_id: str) -> dict[str, Any] | None:
         """Use the snapshot builder, including frozen binary bodies, for Publish."""

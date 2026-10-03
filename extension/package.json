@@ -19,6 +19,7 @@
     "onCommand:presentation.signIn",
     "onCommand:presentation.register",
     "onCommand:presentation.shareProject",
+    "onCommand:presentation.copyLink",
     "onCommand:presentation.projectMembers",
     "onCommand:presentation.publish",
     "onCommand:presentation.acceptInvitation"
@@ -60,7 +61,11 @@
       },
       {
         "command": "presentation.shareProject",
-        "title": "Presentation: Share Presentation"
+        "title": "Presentation: Create Account Invite"
+      },
+      {
+        "command": "presentation.copyLink",
+        "title": "Presentation: Copy Presentation Link"
       },
       {
         "command": "presentation.projectMembers",

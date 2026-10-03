@@ -2,7 +2,7 @@
 # Live smoke against compose-published port (AGENTS: no host uvicorn for live checks).
 # Covers: health, auth, JWT-gated projects/snapshot/assets/members, private preview sessions,
 # project-local runtime, chapter-relative rewrite, collaboration WS token gate,
-# share invite/accept, register-via-invite, publish self-contained release + presentation slug.
+# account invite register, open-by-id without membership, publish self-contained release + presentation slug.
 # CRDT unsaved-edit visibility: real VS Code EDH only.
 set -euo pipefail
 BASE="${1:-http://127.0.0.1:8000}"
@@ -82,7 +82,7 @@ MEMBERS="$(curl -sfS "${BASE}/api/projects/${PID}/members" -H "$(auth_hdr)")" ||
 echo "${MEMBERS}" | grep -q "${ME_ID}" || fail "members missing owner: ${MEMBERS}"
 pass "list members"
 
-echo "guest registers (not a member until they accept an invite)"
+echo "guest registers and can open a project without being a member"
 GUEST_LOGIN="$(curl -sfS -X POST "${BASE}/api/auth/register" \
   -H 'Content-Type: application/json' \
   -d "$(json_login "${SMOKE_GUEST}" "${SMOKE_GUEST_PASS}")")" || fail "guest register"
@@ -90,7 +90,7 @@ GUEST_ACCESS="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["access_
 CODE="$(curl -sS -o /dev/null -w '%{http_code}' \
   "${BASE}/api/projects/${PID}" \
   -H "Authorization: Bearer ${GUEST_ACCESS}" || true)"
-[[ "${CODE}" == "403" ]] || fail "expected 403 guest before invite, got ${CODE}"
+[[ "${CODE}" == "200" ]] || fail "expected 200 guest read, got ${CODE}"
 OTHER="$(curl -sfS -X POST "${BASE}/api/projects" \
   -H 'Content-Type: application/json' -H "$(auth_hdr)" \
   -d '{"name":"other-smoke"}')" || fail "create other"
@@ -98,13 +98,13 @@ OTHER_PID="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' <<<
 CODE="$(curl -sS -o /dev/null -w '%{http_code}' \
   "${BASE}/api/projects/${OTHER_PID}/snapshot" \
   -H "Authorization: Bearer ${GUEST_ACCESS}" || true)"
-[[ "${CODE}" == "403" ]] || fail "expected 403 guest on other project, got ${CODE}"
+[[ "${CODE}" == "200" ]] || fail "expected 200 guest snapshot, got ${CODE}"
 CODE="$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
   "${BASE}/api/projects/${PID}/members" \
   -H 'Content-Type: application/json' -H "$(auth_hdr)" \
   -d '{"username":"guest","role":"editor"}' || true)"
 [[ "${CODE}" == "404" || "${CODE}" == "405" ]] || fail "expected POST /members removed, got ${CODE}"
-pass "membership 403 for non-member"
+pass "authenticated read does not require membership"
 
 echo "GET snapshot with token"
 curl -sfS "${BASE}/api/projects/${PID}/snapshot" -H "$(auth_hdr)" >/dev/null || fail "snapshot"
@@ -259,60 +259,42 @@ asyncio.run(main())
 PY
 pass "WS hello with access_token"
 
-echo "POST share (owner) + guest accept as viewer"
-SHARE="$(curl -sfS -X POST "${BASE}/api/projects/${PID}/invites" \
-  -H 'Content-Type: application/json' -H "$(auth_hdr)" \
-  -d '{"role":"viewer"}')" || fail "create share"
-TOKEN="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])' <<<"${SHARE}")"
-SHARE_ID="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' <<<"${SHARE}")"
-INVITE_URL="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["url"])' <<<"${SHARE}")"
-[[ -n "${TOKEN}" && -n "${SHARE_ID}" ]] || fail "share body: ${SHARE}"
+echo "account invite registers a new user and does not require a project"
+INVITE="$(curl -sfS -X POST "${BASE}/api/account-invites" -H "$(auth_hdr)")" || fail "create account invite"
+TOKEN="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])' <<<"${INVITE}")"
+INVITE_URL="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["url"])' <<<"${INVITE}")"
+[[ -n "${TOKEN}" ]] || fail "invite body: ${INVITE}"
 echo "${INVITE_URL}" | grep -Fq "/join#${TOKEN}" || fail "invite url missing token: ${INVITE_URL}"
 CODE="$(curl -sS -o /dev/null -w '%{http_code}' "${BASE}/join" || true)"
 [[ "${CODE}" == "200" ]] || fail "expected 200 GET /join, got ${CODE}"
-PREV_SHARE="$(curl -sfS "${BASE}/api/invites/${TOKEN}" -H "Authorization: Bearer ${GUEST_ACCESS}")" \
-  || fail "preview share"
-echo "${PREV_SHARE}" | grep -q "${PID}" || fail "preview share body: ${PREV_SHARE}"
-ACC="$(curl -sfS -X POST "${BASE}/api/invites/${TOKEN}/accept" \
-  -H 'Content-Type: application/json' -H "Authorization: Bearer ${GUEST_ACCESS}" \
-  -d "{\"token\":\"${TOKEN}\"}")" || fail "accept share"
-echo "${ACC}" | grep -q '"role":"viewer"' || fail "accept role: ${ACC}"
-echo "${ACC}" | grep -q '"already_member":false' || fail "expected new member: ${ACC}"
-echo "register-via-invite: new username on /api/auth/session then accept"
-JOIN="$(curl -sfS -X POST "${BASE}/api/auth/session" \
+CODE="$(curl -sS -o /dev/null -w '%{http_code}' -X POST "${BASE}/api/account-invites" || true)"
+[[ "${CODE}" == "401" ]] || fail "expected 401 create invite without auth, got ${CODE}"
+CODE="$(curl -sS -o /dev/null -w '%{http_code}' "${BASE}/api/account-invites/not-a-token" || true)"
+[[ "${CODE}" == "404" ]] || fail "expected 404 unknown invite, got ${CODE}"
+JOIN="$(curl -sfS -X POST "${BASE}/api/account-invites/${TOKEN}/register" \
   -H 'Content-Type: application/json' \
-  -d "$(json_login "${SMOKE_JOIN}" "${SMOKE_JOIN_PASS}")")" || fail "session register"
-python3 -c 'import json,sys; d=json.load(sys.stdin); assert d.get("created") is True, d' <<<"${JOIN}" \
-  || fail "session did not create user: ${JOIN}"
+  -d "$(json_login "${SMOKE_JOIN}" "${SMOKE_JOIN_PASS}")")" || fail "register via invite"
 JOIN_ACCESS="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])' <<<"${JOIN}")"
-CODE="$(curl -sS -o /dev/null -w '%{http_code}' -X POST "${BASE}/api/auth/session" \
-  -H 'Content-Type: application/json' -d "$(json_login "${SMOKE_JOIN}" "wrong")" || true)"
-[[ "${CODE}" == "401" ]] || fail "expected 401 bad session password, got ${CODE}"
-AGAIN="$(curl -sfS -X POST "${BASE}/api/auth/session" \
-  -H 'Content-Type: application/json' \
-  -d "$(json_login "${SMOKE_JOIN}" "${SMOKE_JOIN_PASS}")")" || fail "session login"
-python3 -c 'import json,sys; d=json.load(sys.stdin); assert d.get("created") is False, d' <<<"${AGAIN}" \
-  || fail "existing session created a user: ${AGAIN}"
-JOINED="$(curl -sfS -X POST "${BASE}/api/invites/${TOKEN}/accept" \
-  -H 'Content-Type: application/json' -H "Authorization: Bearer ${JOIN_ACCESS}" \
-  -d "{\"token\":\"${TOKEN}\"}")" || fail "join accept"
-echo "${JOINED}" | grep -q '"role":"viewer"' || fail "join role: ${JOINED}"
-echo "${JOINED}" | grep -q '"already_member":false' || fail "expected join new member: ${JOINED}"
-OWN="$(curl -sfS -X POST "${BASE}/api/invites/${TOKEN}/accept" \
-  -H 'Content-Type: application/json' -H "$(auth_hdr)" \
-  -d "{\"token\":\"${TOKEN}\"}")" || fail "owner accept"
-echo "${OWN}" | grep -q '"already_member":true' || fail "owner already member: ${OWN}"
-echo "${OWN}" | grep -q '"role":"owner"' || fail "owner role changed: ${OWN}"
-pass "share create/accept"
+[[ -n "${JOIN_ACCESS}" ]] || fail "invite register body: ${JOIN}"
+CODE="$(curl -sS -o /dev/null -w '%{http_code}' -X POST "${BASE}/api/account-invites/${TOKEN}/register" \
+  -H 'Content-Type: application/json' -d "$(json_login "${SMOKE_JOIN}" "${SMOKE_JOIN_PASS}")" || true)"
+[[ "${CODE}" == "409" ]] || fail "expected 409 existing username, got ${CODE}"
+LINK="$(curl -sfS "${BASE}/api/projects/${PID}/link" -H "$(auth_hdr)")" || fail "project link"
+echo "${LINK}" | grep -Fq "/open#${PID}" || fail "presentation link: ${LINK}"
+curl -sfS "${BASE}/api/projects/${PID}/snapshot" -H "Authorization: Bearer ${JOIN_ACCESS}" >/dev/null \
+  || fail "new account could not read project"
+pass "account invite + presentation link"
 
-echo "guest scope=shared includes project; scope=owned does not"
+echo "guest is not listed as owner or member of the project"
 SHARED="$(curl -sfS "${BASE}/api/projects?scope=shared" -H "Authorization: Bearer ${GUEST_ACCESS}")" \
   || fail "list shared"
-echo "${SHARED}" | grep -q "${PID}" || fail "shared list missing ${PID}: ${SHARED}"
+if echo "${SHARED}" | grep -q "${PID}"; then
+  fail "shared list should not include ${PID}: ${SHARED}"
+fi
 OWNED="$(curl -sfS "${BASE}/api/projects?scope=owned" -H "Authorization: Bearer ${GUEST_ACCESS}")" \
   || fail "list owned guest"
 if echo "${OWNED}" | grep -q "${PID}"; then
-  fail "owned list should not include shared ${PID}: ${OWNED}"
+  fail "owned list should not include ${PID}: ${OWNED}"
 fi
 OWNER_LIST="$(curl -sfS "${BASE}/api/projects?scope=owned" -H "$(auth_hdr)")" || fail "list owned owner"
 echo "${OWNER_LIST}" | grep -q "${PID}" || fail "owner missing from owned: ${OWNER_LIST}"
@@ -320,17 +302,13 @@ CODE="$(curl -sS -o /dev/null -w '%{http_code}' "${BASE}/api/projects?scope=nope
 [[ "${CODE}" == "400" ]] || fail "expected 400 bad scope, got ${CODE}"
 pass "project scope owned/shared"
 
-echo "viewer cannot publish; anonymous 401"
-CODE="$(curl -sS -o /dev/null -w '%{http_code}' -X POST "${BASE}/api/projects/${PID}/publish" \
-  -H "Authorization: Bearer ${GUEST_ACCESS}" || true)"
-[[ "${CODE}" == "403" ]] || fail "expected 403 viewer publish, got ${CODE}"
+echo "anonymous publish is 401; a signed-in non-member may read the project"
 CODE="$(curl -sS -o /dev/null -w '%{http_code}' -X POST "${BASE}/api/projects/${PID}/publish" || true)"
 [[ "${CODE}" == "401" ]] || fail "expected 401 publish no token, got ${CODE}"
-CODE="$(curl -sS -o /dev/null -w '%{http_code}' -X POST "${BASE}/api/projects/${PID}/invites" \
-  -H 'Content-Type: application/json' -H "Authorization: Bearer ${GUEST_ACCESS}" \
-  -d '{"role":"editor"}' || true)"
-[[ "${CODE}" == "403" ]] || fail "expected 403 viewer share, got ${CODE}"
-pass "publish/share permission gates"
+CODE="$(curl -sS -o /dev/null -w '%{http_code}' "${BASE}/api/projects/${PID}" \
+  -H "Authorization: Bearer ${JOIN_ACCESS}" || true)"
+[[ "${CODE}" == "200" ]] || fail "expected 200 invite user read, got ${CODE}"
+pass "publish auth gate"
 
 echo "POST publish from server collaborative state"
 REL1_JSON="$(curl -sfS -X POST "${BASE}/api/projects/${PID}/publish" -H "$(auth_hdr)")" || fail "publish 1"
@@ -490,17 +468,5 @@ CODE="$(curl -sS -o /dev/null -w '%{http_code}' --path-as-is \
   "${BASE}/releases/${REL2}/../${REL1}/index.html" || true)"
 [[ "${CODE}" == "400" || "${CODE}" == "404" ]] || fail "expected 400/404 traversal, got ${CODE}"
 pass "immutable release + presentation slug pointer"
-
-echo "revoke share; accept fails"
-REV="$(curl -sfS -X DELETE "${BASE}/api/projects/${PID}/invites/${SHARE_ID}" -H "$(auth_hdr)")" \
-  || fail "revoke share"
-if echo "${REV}" | grep -q "${SHARE_ID}"; then
-  fail "revoked share still listed: ${REV}"
-fi
-CODE="$(curl -sS -o /dev/null -w '%{http_code}' -X POST "${BASE}/api/invites/${TOKEN}/accept" \
-  -H 'Content-Type: application/json' -H "Authorization: Bearer ${GUEST_ACCESS}" \
-  -d "{\"token\":\"${TOKEN}\"}" || true)"
-[[ "${CODE}" == "404" ]] || fail "expected 404 revoked share, got ${CODE}"
-pass "revoke share"
 
 echo "=== all compose smoke checks passed ==="

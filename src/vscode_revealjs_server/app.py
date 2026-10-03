@@ -16,7 +16,6 @@ from vscode_revealjs_server.presentation.publish import publish as publish_relea
 from vscode_revealjs_server.presentation.publish import read_published
 from vscode_revealjs_server.projects import project_service
 from vscode_revealjs_server.projects.service import (
-    ROLE_VIEWER,
     AssetConflict,
     FsRejected,
 )
@@ -52,21 +51,16 @@ class RefreshBody(BaseModel):
     refresh_token: str = Field(min_length=1)
 
 
-class CreateShareBody(BaseModel):
-    role: str = Field(default=ROLE_VIEWER, min_length=1, max_length=32)
-
-
 def _forbid_unless_member(project_id: str, user_id: str) -> None:
+    """Any signed-in user. Membership is not required; unknown projects are 404."""
+    del user_id
     if project_service.get(project_id) is None:
         raise HTTPException(status_code=404, detail="project not found")
-    if not project_service.can_read(project_id, user_id):
-        raise HTTPException(status_code=403, detail="not a project member")
 
 
 def _forbid_unless_writer(project_id: str, user_id: str) -> None:
+    """Edit does not require a member role."""
     _forbid_unless_member(project_id, user_id)
-    if not project_service.can_write(project_id, user_id):
-        raise HTTPException(status_code=403, detail="write permission required")
 
 
 @app.get("/health")
@@ -90,18 +84,6 @@ def auth_login(body: LoginBody) -> dict:
     """Sign in. Unknown username and wrong password are both 401."""
     try:
         got = auth_service.login(body.username, body.password)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
-    if got is None:
-        raise HTTPException(status_code=401, detail="invalid credentials")
-    return got
-
-
-@app.post("/api/auth/session")
-def auth_session(body: LoginBody) -> dict:
-    """Accept-invitation credentials: register a new username, or log in an existing one."""
-    try:
-        got = auth_service.open_session(body.username, body.password)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     if got is None:
@@ -282,9 +264,9 @@ async def collaboration_ws(
         await websocket.accept()
         await websocket.close(code=4401, reason="missing or invalid access token")
         return
-    if project_service.get(project_id) is None or not project_service.can_read(project_id, user["id"]):
+    if project_service.get(project_id) is None:
         await websocket.accept()
-        await websocket.close(code=4403, reason="project membership required")
+        await websocket.close(code=4404, reason="project not found")
         return
     can_write = project_service.can_write(project_id, user["id"])
     await manager.handle(websocket, project_id, user_id=user["id"], can_write=can_write)
@@ -292,102 +274,83 @@ async def collaboration_ws(
 
 
 def _invite_url(request: Request, token: str) -> str:
-    """Canonical invite link. Token stays in the fragment so a browser does not send it."""
+    """Account-invite link. Token stays in the fragment so a browser does not send it."""
     base = str(request.base_url).rstrip("/")
     return f"{base}/join#{quote(token, safe='')}"
 
 
+def _presentation_url(request: Request, project_id: str) -> str:
+    base = str(request.base_url).rstrip("/")
+    return f"{base}/open#{quote(project_id, safe='')}"
+
+
 @app.get("/join", response_class=HTMLResponse)
 def join_hint() -> HTMLResponse:
-    """Hint page for an invite link. Joining happens in VS Code, not here."""
+    """Hint page for an account invite. Registration happens in VS Code, not here."""
     return HTMLResponse(
-        "<!doctype html><meta charset=utf-8><title>Join presentation</title>"
+        "<!doctype html><meta charset=utf-8><title>Create an account</title>"
         "<p>In VS Code, run <strong>Presentation: Accept Invitation</strong> and paste this link. "
-        "Enter a username and password there: a new name creates an account and joins.</p>"
+        "Enter a username and password to create an account and sign in. "
+        "This link does not add you to a presentation.</p>"
     )
 
 
-@app.post("/api/projects/{project_id}/invites")
-def post_share(
-    project_id: str,
-    body: CreateShareBody,
+@app.get("/open", response_class=HTMLResponse)
+def open_hint() -> HTMLResponse:
+    """Hint page for a presentation link. Opening happens in VS Code."""
+    return HTMLResponse(
+        "<!doctype html><meta charset=utf-8><title>Open presentation</title>"
+        "<p>In VS Code, run <strong>Presentation: Open Presentation</strong>, choose "
+        "<strong>Open from link…</strong>, and paste this link. "
+        "Sign in first. Any signed-in user can edit.</p>"
+    )
+
+
+@app.post("/api/account-invites", status_code=201)
+def post_account_invite(
     request: Request,
     user: Annotated[dict[str, str], Depends(require_user)],
 ) -> dict:
-    """Owner creates a reusable invite link (Presentation: Share Presentation)."""
-    _forbid_unless_member(project_id, user["id"])
-    if not project_service.can_manage_members(project_id, user["id"]):
-        raise HTTPException(status_code=403, detail="owner permission required")
-    try:
-        share = project_service.create_share(project_id, role=body.role)
-    except FsRejected as e:
-        raise HTTPException(status_code=404, detail=str(e)) from e
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
-    share["url"] = _invite_url(request, share["token"])
-    return share
-
-
-@app.get("/api/projects/{project_id}/invites")
-def get_shares(
-    project_id: str,
-    user: Annotated[dict[str, str], Depends(require_user)],
-) -> list[dict]:
-    _forbid_unless_member(project_id, user["id"])
-    if not project_service.can_manage_members(project_id, user["id"]):
-        raise HTTPException(status_code=403, detail="owner permission required")
-    shares = project_service.list_shares(project_id)
-    if shares is None:
-        raise HTTPException(status_code=404, detail="project not found")
-    return shares
-
-
-@app.delete("/api/projects/{project_id}/invites/{share_id}")
-def delete_share(
-    project_id: str,
-    share_id: str,
-    user: Annotated[dict[str, str], Depends(require_user)],
-) -> list[dict]:
-    _forbid_unless_member(project_id, user["id"])
-    if not project_service.can_manage_members(project_id, user["id"]):
-        raise HTTPException(status_code=403, detail="owner permission required")
-    try:
-        return project_service.revoke_share(project_id, share_id)
-    except FsRejected as e:
-        raise HTTPException(status_code=404, detail=str(e)) from e
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
-
-
-@app.get("/api/invites/{token}")
-def preview_share(
-    token: str,
-    user: Annotated[dict[str, str], Depends(require_user)],
-) -> dict:
-    """Invite preview for Open Shared (does not join)."""
+    """Signed-in user creates a reusable account-registration link. No project required."""
     _ = user
-    got = project_service.preview_share(token)
+    invite = auth_service.create_account_invite()
+    invite["url"] = _invite_url(request, invite["token"])
+    return invite
+
+
+@app.get("/api/account-invites/{token}")
+def get_account_invite(token: str) -> dict:
+    """Confirm an account invite before prompting for a username. Does not register."""
+    if not auth_service.account_invite_exists(token):
+        raise HTTPException(status_code=404, detail="invite not found")
+    return {"valid": True}
+
+
+@app.post("/api/account-invites/{token}/register", status_code=201)
+def register_account_invite(token: str, body: LoginBody) -> dict:
+    """Create an account from an invite and sign in. Does not join a project."""
+    try:
+        got = auth_service.register_with_invite(token, body.username, body.password)
+    except auth_service.UserExists:
+        raise HTTPException(status_code=409, detail="username already registered")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     if got is None:
-        raise HTTPException(status_code=404, detail="share not found")
+        raise HTTPException(status_code=404, detail="invite not found")
     return got
 
 
-@app.post("/api/invites/{token}/accept")
-def accept_share(
-    token: str,
+@app.get("/api/projects/{project_id}/link")
+def get_project_link(
+    project_id: str,
+    request: Request,
     user: Annotated[dict[str, str], Depends(require_user)],
 ) -> dict:
-    """Join the project at the share role (no-op if already a member)."""
-    try:
-        return project_service.accept_share(
-            token,
-            user_id=user["id"],
-            username=user["username"],
-        )
-    except FsRejected as e:
-        raise HTTPException(status_code=404, detail=str(e)) from e
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
+    """Link any signed-in user can open and edit. Does not add members."""
+    _forbid_unless_member(project_id, user["id"])
+    meta = project_service.get(project_id)
+    assert meta is not None
+    return {"project_id": project_id, "name": meta["name"], "url": _presentation_url(request, project_id)}
 
 
 @app.post("/api/projects/{project_id}/publish")
@@ -512,8 +475,8 @@ def _preview_auth(project_id: str, request: Request, token: str | None = None) -
             raise ValueError("invalid preview session")
     except (ValueError, TypeError) as exc:
         raise HTTPException(status_code=401, detail="preview session expired or invalid") from exc
-    if not project_service.can_read(project_id, str(claims.get("sub", ""))):
-        raise HTTPException(status_code=403, detail="project membership required")
+    if project_service.get(project_id) is None:
+        raise HTTPException(status_code=404, detail="project not found")
     return claims
 
 

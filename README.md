@@ -35,11 +35,11 @@ Or in VS Code: **Extensions → … → Install from VSIX…**
 ## Use it
 
 1. Set **presentation.serverUrl** (default `http://127.0.0.1:8000`).
-2. **Presentation: Register** (or **Sign In**, then **Register** when there is no session). Username, then a masked password. **Create Presentation** or **Open Presentation** asks the same way. Open lists presentations you own and ones shared with you.
+2. **Presentation: Register** (or **Sign In**, then **Register** when there is no session). Username, then a masked password. **Create Presentation** or **Open Presentation** asks the same way. Open lists presentations you own and ones already on the member list, or **Open from link…**.
 3. Pick a parent directory and a new child-folder name. Existing folders are not overwritten.
 4. Edit local files. Text synchronizes through Yjs and is saved locally even with Auto Save off. **Disconnect** keeps local editing and saving.
 5. **Open Preview** opens a private, short-lived preview session.
-6. **Share Presentation** copies an invite link (`{server}/join#{token}`). The other person runs **Accept Invitation**, pastes the link, then enters a username and password: a new name registers and joins; an existing name signs in and joins. **Project Members** lists who has joined. Details: [account and invites](docs/account-invite.md).
+6. **Create Account Invite** copies `{server}/join#{token}` without a presentation open. **Accept Invitation** pastes it and registers a new account. **Copy Presentation Link** copies `{server}/open#{id}`; any signed-in user can open that link and edit. Details: [account and invites](docs/account-invite.md).
 7. **Publish** freezes a public, immutable release and copies its link.
 8. **Resolve Conflict**, **Synchronization Details**, and **Retry Synchronization** cover preserved differences and queued work.
 

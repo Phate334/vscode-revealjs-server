@@ -261,19 +261,34 @@ export async function register(server: string, username: string, password: strin
   return postCredentials(server, "/api/auth/register", username, password, "Register failed");
 }
 
-/** New username registers; existing username logs in. Wrong password does not create an account. */
-export async function openSession(server: string, username: string, password: string): Promise<LoginResult> {
-  return postCredentials(server, "/api/auth/session", username, password, "Sign In failed");
-}
-
-export type ShareInvite = {
+export type AccountInvite = {
   id: string;
   token: string;
-  role: string;
-  project_id: string;
+  created_at: string;
   /** `{origin}/join#{token}` when the server built it. */
-  url?: string;
+  url: string;
 };
+
+export async function createAccountInvite(server: string): Promise<AccountInvite> {
+  const base = server.replace(/\/$/, "");
+  return httpJson<AccountInvite>(`${base}/api/account-invites`, { method: "POST" });
+}
+
+/** Invite token creates a new account only. Existing usernames are rejected. */
+export async function registerWithInvite(server: string, token: string, username: string, password: string): Promise<LoginResult> {
+  const base = server.replace(/\/$/, "");
+  return postCredentials(
+    base,
+    `/api/account-invites/${encodeURIComponent(token)}/register`,
+    username,
+    password,
+    "Register failed",
+  );
+}
+
+export async function previewAccountInvite(server: string, token: string): Promise<{ valid: boolean }> {
+  return httpJson(`${server.replace(/\/$/, "")}/api/account-invites/${encodeURIComponent(token)}`);
+}
 
 /** Invite link, legacy JSON `{server, token}`, or a bare token (uses fallbackServer). */
 export function parseInviteInput(input: string, fallbackServer: string): { server: string; token: string } {
@@ -292,34 +307,6 @@ export function parseInviteInput(input: string, fallbackServer: string): { serve
     return { server: normalizeServer(url.origin), token };
   }
   return { server: normalizeServer(fallbackServer), token: raw };
-}
-
-export async function createShare(
-  server: string,
-  projectId: string,
-  role: "editor" | "viewer",
-): Promise<ShareInvite> {
-  const base = server.replace(/\/$/, "");
-  return httpJson<ShareInvite>(
-    `${base}/api/projects/${encodeURIComponent(projectId)}/invites`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ role }),
-    },
-  );
-}
-
-export async function acceptShare(
-  server: string,
-  token: string,
-): Promise<{ project: ProjectInfo; already_member: boolean }> {
-  const base = server.replace(/\/$/, "");
-  return httpJson(`${base}/api/invites/${encodeURIComponent(token)}/accept`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ token }),
-  });
 }
 
 export type MemberInfo = { user_id: string; username: string; role: string };
@@ -386,8 +373,27 @@ export async function sendOperations(server: string, projectId: string, base: nu
   return body;
 }
 
-export async function previewInvite(server: string, token: string): Promise<{ project_name: string; role: string }> {
-  return httpJson(`${server}/api/invites/${encodeURIComponent(token)}`);
+export async function getProject(server: string, projectId: string): Promise<ProjectInfo> {
+  const base = server.replace(/\/$/, "");
+  return httpJson<ProjectInfo>(`${base}/api/projects/${encodeURIComponent(projectId)}`);
+}
+
+/** `{origin}/open#{projectId}`, or a bare project id (uses fallbackServer). */
+export function parsePresentationLink(input: string, fallbackServer: string): { server: string; projectId: string } {
+  const raw = input.trim();
+  if (!raw) throw new Error("Presentation link required");
+  const idFrom = (value: string) => {
+    const projectId = value.trim();
+    if (!/^prj_[0-9a-f]+$/i.test(projectId)) throw new Error("Presentation link is missing a project id");
+    return projectId;
+  };
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(raw)) {
+    const url = new URL(raw);
+    const fromHash = url.hash.length > 1 ? decodeURIComponent(url.hash.slice(1)) : "";
+    const projectId = idFrom(fromHash || url.searchParams.get("project") || "");
+    return { server: normalizeServer(url.origin), projectId };
+  }
+  return { server: normalizeServer(fallbackServer), projectId: idFrom(raw) };
 }
 
 export async function previewSession(server: string, projectId: string): Promise<{ url: string; expires_at: number }> {

@@ -5,8 +5,9 @@ import { CollaborationClient } from "./collaborationClient";
 import { bindCollaborativeDocuments, type DocumentsBinding } from "./documentBinding";
 import { getAccessToken, initAuth, saveSession } from "./auth";
 import {
-  collabWsUrl, configuredServer, acceptShare, createProject, createShare, parseInviteInput,
-  extractSnapshot, fetchSnapshot, listMembers, listProjects, login, openSession, previewInvite, register,
+  collabWsUrl, configuredServer, createAccountInvite, createProject, getProject, parseInviteInput,
+  parsePresentationLink, previewAccountInvite, registerWithInvite,
+  extractSnapshot, fetchSnapshot, listMembers, listProjects, login, register,
   publishRelease, readWorkspaceMeta, writeWorkspaceMeta, type ProjectInfo, type WorkspaceMeta,
 } from "./projectClient";
 import { atomicWrite, hash, localPath } from "./localState";
@@ -169,43 +170,59 @@ async function open(): Promise<void> {
   const server = configuredServer();
   if (!(await requireSession(server))) return;
   const projects = await listProjects(server);
-  type Pick = vscode.QuickPickItem & { project?: ProjectInfo; invite?: boolean };
-  const picks: Pick[] = [{ label: "Accept invitation…", invite: true }];
+  type Pick = vscode.QuickPickItem & { project?: ProjectInfo; fromLink?: boolean };
+  const picks: Pick[] = [{ label: "Open from link…", fromLink: true }];
   for (const [title, owned] of [["My Presentations", true], ["Shared with Me", false]] as const) {
     picks.push({ label: title, kind: vscode.QuickPickItemKind.Separator });
     picks.push(...projects.filter((project) => (project.role === "owner") === owned)
       .map((project) => ({ label: project.name, description: project.role, project })));
   }
   const chosen = await vscode.window.showQuickPick(picks, { title: "Presentation: Open Presentation" });
-  if (chosen?.invite) await acceptInvitation(server);
+  if (chosen?.fromLink) await openFromLink(server);
   else if (chosen?.project) await downloadProject(server, chosen.project);
+}
+
+async function openFromLink(server = configuredServer()): Promise<void> {
+  const input = await vscode.window.showInputBox({
+    title: "Presentation: Open Presentation",
+    prompt: "Paste presentation link",
+    placeHolder: "http://host/open#prj_…",
+    ignoreFocusOut: true,
+  });
+  if (!input) return;
+  const parsed = parsePresentationLink(input, server);
+  if (!(await requireSession(parsed.server))) return;
+  await downloadProject(parsed.server, await getProject(parsed.server, parsed.projectId));
 }
 
 async function acceptInvitation(server = configuredServer()): Promise<void> {
   const input = await vscode.window.showInputBox({
     title: "Presentation: Accept Invitation",
-    prompt: "Paste invite link",
+    prompt: "Paste account invite link",
     placeHolder: "http://host/join#token",
     ignoreFocusOut: true,
   });
   if (!input) return;
   const parsed = parseInviteInput(input, server);
   server = parsed.server;
-  const token = parsed.token;
-  // Not logged in: username, then masked password. New name registers; existing name signs in.
-  if (!(await getAccessToken(server))) {
-    const creds = await promptCredentials("Presentation: Accept Invitation", server);
-    if (!creds) return;
-    await storeLogin(server, await openSession(server, creds.username, creds.password));
+  await previewAccountInvite(server, parsed.token);
+  if (await getAccessToken(server)) {
+    void vscode.window.showInformationMessage("This link only creates an account. You are already signed in.");
+    return;
   }
-  const info = await previewInvite(server, token);
-  const choice = await vscode.window.showQuickPick(
-    [{ label: "Accept and Open", description: `${info.project_name} · ${info.role}` }],
-    { title: "Presentation: Accept Invitation", placeHolder: `${info.project_name} · ${info.role}` },
-  );
-  if (choice?.label !== "Accept and Open") return;
-  const result = await acceptShare(server, token);
-  await downloadProject(server, result.project);
+  const creds = await promptCredentials("Presentation: Accept Invitation", server);
+  if (!creds) return;
+  await storeLogin(server, await registerWithInvite(server, parsed.token, creds.username, creds.password));
+  void vscode.window.showInformationMessage("Account created and signed in.");
+}
+
+async function createInviteLink(): Promise<void> {
+  const server = configuredServer();
+  if (!(await requireSession(server))) return;
+  const invite = await createAccountInvite(server);
+  const link = invite.url ?? `${server.replace(/\/$/, "")}/join#${encodeURIComponent(invite.token)}`;
+  await vscode.env.clipboard.writeText(link);
+  void vscode.window.showInformationMessage("Account invite link copied. They run Accept Invitation, paste the link, then choose a username and password.");
 }
 
 async function workspaceAction(action: (meta: WorkspaceMeta) => Promise<void>): Promise<void> {
@@ -242,13 +259,11 @@ export function activate(context: vscode.ExtensionContext): void {
     }),
     command("presentation.createProject", create), command("presentation.openProject", open),
     command("presentation.acceptInvitation", () => acceptInvitation()),
-    command("presentation.shareProject", () => workspaceAction(async (meta) => {
-      const role = await vscode.window.showQuickPick(["viewer", "editor"], { title: "Presentation: Share Presentation" });
-      if (!role) return;
-      const invite = await createShare(meta.server, meta.projectId, role as "viewer" | "editor");
-      const link = invite.url ?? `${meta.server.replace(/\/$/, "")}/join#${encodeURIComponent(invite.token)}`;
+    command("presentation.shareProject", () => createInviteLink()),
+    command("presentation.copyLink", () => workspaceAction(async (meta) => {
+      const link = `${meta.server.replace(/\/$/, "")}/open#${encodeURIComponent(meta.projectId)}`;
       await vscode.env.clipboard.writeText(link);
-      void vscode.window.showInformationMessage("Invite link copied. They run Accept Invitation, paste the link, then enter a username and password.");
+      void vscode.window.showInformationMessage("Presentation link copied. Anyone signed in can open it and edit.");
     })),
     command("presentation.projectMembers", () => workspaceAction(async (meta) => {
       const members = await listMembers(meta.server, meta.projectId);
