@@ -3,7 +3,7 @@ import * as vscode from "vscode";
 import { randomUUID } from "node:crypto";
 import { CollaborationClient } from "./collaborationClient";
 import { bindCollaborativeDocuments, type DocumentsBinding } from "./documentBinding";
-import { getAccessToken, initAuth, saveSession } from "./auth";
+import { clearSession, getAccessToken, initAuth, saveSession } from "./auth";
 import {
   collabWsUrl, configuredServer, createAccountInvite, createProject, getProject, parseInviteInput,
   parsePresentationLink, previewAccountInvite, registerWithInvite,
@@ -225,6 +225,24 @@ async function createInviteLink(): Promise<void> {
   void vscode.window.showInformationMessage("Account invite link copied. They run Accept Invitation, paste the link, then choose a username and password.");
 }
 
+
+async function signOut(): Promise<void> {
+  const meta = await readWorkspaceMeta();
+  const server = meta?.server ?? configuredServer();
+  const choice = await vscode.window.showQuickPick(
+    [
+      { label: "Yes", description: "Clear the saved session and disconnect" },
+      { label: "No" },
+    ],
+    { title: "Presentation: Sign Out", ignoreFocusOut: true },
+  );
+  if (choice?.label !== "Yes") return;
+  await clearSession(server);
+  dispose();
+  setStatus("Signed out");
+  void vscode.window.showInformationMessage("Signed out.");
+}
+
 async function workspaceAction(action: (meta: WorkspaceMeta) => Promise<void>): Promise<void> {
   const meta = await readWorkspaceMeta();
   if (!meta) throw new Error("Open a presentation workspace first");
@@ -257,6 +275,7 @@ export function activate(context: vscode.ExtensionContext): void {
       const server = meta?.server ?? configuredServer();
       if (await registerAccount(server) && meta) await connect(false);
     }),
+    command("presentation.signOut", () => signOut()),
     command("presentation.createProject", create), command("presentation.openProject", open),
     command("presentation.acceptInvitation", () => acceptInvitation()),
     command("presentation.shareProject", () => createInviteLink()),

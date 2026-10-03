@@ -17,6 +17,7 @@
     "onCommand:presentation.openProject",
     "onCommand:presentation.openPreview",
     "onCommand:presentation.signIn",
+    "onCommand:presentation.signOut",
     "onCommand:presentation.register",
     "onCommand:presentation.shareProject",
     "onCommand:presentation.copyLink",
@@ -54,6 +55,10 @@
       {
         "command": "presentation.signIn",
         "title": "Presentation: Sign In"
+      },
+      {
+        "command": "presentation.signOut",
+        "title": "Presentation: Sign Out"
       },
       {
         "command": "presentation.register",

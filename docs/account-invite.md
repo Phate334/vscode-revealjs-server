@@ -14,6 +14,8 @@
 
 `presentation.serverUrl`（預設 `http://127.0.0.1:8000`）是新動作的 origin。已開啟的簡報用自己的 origin。登入狀態依 origin 分開。
 
+**Presentation: Sign Out** 先選 Yes／No，確認後清除這個 origin 存在 Secret Storage 的 session，並中斷協作連線。
+
 ## 帳號邀請連結
 
 邀請只用來建立帳號，不加入簡報，也沒有 editor／viewer。
