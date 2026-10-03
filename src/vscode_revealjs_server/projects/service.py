@@ -20,12 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from vscode_revealjs_server.presentation.render import (
-    default_agents_md,
-    default_index_html,
-    default_theme_css,
-)
-from vscode_revealjs_server.presentation.runtime import copy_seed_into
+from vscode_revealjs_server.presentation.runtime import copy_seed_into, copy_template_into
 
 # Sibling of collaboration under .data/
 _PROJECTS_DIR = Path(
@@ -129,28 +124,6 @@ class AssetConflict(Exception):
 
 def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def _default_template(title: str) -> dict[str, str]:
-    """Relative path → utf-8 text content (static Reveal site)."""
-    index = default_index_html(title)
-    slide = (
-        f"# {title}\n"
-        "\n"
-        "First slide.\n"
-        "\n"
-        "---\n"
-        "\n"
-        "## Second slide\n"
-        "\n"
-        "Edit this chapter in `01-introduction/slide.md`.\n"
-    )
-    return {
-        "index.html": index,
-        "theme.css": default_theme_css(),
-        "AGENTS.md": default_agents_md(),
-        "01-introduction/slide.md": slide,
-    }
 
 
 def _is_under(root: Path, path: Path) -> bool:
@@ -265,12 +238,7 @@ class ProjectService:
         project_id = f"prj_{uuid.uuid4().hex[:12]}"
         ws = self._workspace(project_id)
         ws.mkdir(parents=True, exist_ok=True)
-        for rel, content in _default_template(name).items():
-            if not _SAFE_REL.match(rel):
-                raise RuntimeError(f"template path rejected: {rel}")
-            dest = ws / rel
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            _atomic_write_text(dest, content)
+        copy_template_into(ws, title=name)
         copy_seed_into(ws)
         meta = {
             "id": project_id,

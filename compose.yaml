@@ -7,6 +7,8 @@ services:
     volumes:
       # Optional persistence for CRDT + project workspaces across restarts
       - ./.data:/app/.data
+      # Optional: override the new-presentation template shipped in the image
+      # - ./my-template:/app/.venv/lib/python3.12/site-packages/vscode_revealjs_server/runtimes/template
     environment:
       COLLAB_DATA_DIR: /app/.data/collaboration
       PROJECTS_DATA_DIR: /app/.data/projects

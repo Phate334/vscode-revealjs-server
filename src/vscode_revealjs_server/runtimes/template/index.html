@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>{{title}}</title>
+  <link rel="stylesheet" href="runtime/reset.css" />
+  <link rel="stylesheet" href="runtime/reveal.css" />
+  <link rel="stylesheet" href="runtime/theme/black.css" />
+  <link rel="stylesheet" href="theme.css" />
+</head>
+<body>
+  <div class="reveal">
+    <div class="slides">
+      <section data-markdown="01-introduction/slide.md"
+               data-separator="^\n---\n$"
+               data-separator-vertical="^\n--\n$"
+               data-charset="utf-8"></section>
+    </div>
+  </div>
+  <script src="runtime/reveal.js"></script>
+  <script src="runtime/markdown/markdown.js"></script>
+  <script>
+    Reveal.initialize({
+      hash: true,
+      transition: "slide",
+      controls: true,
+      progress: true,
+      plugins: [RevealMarkdown]
+    });
+  </script>
+</body>
+</html>
